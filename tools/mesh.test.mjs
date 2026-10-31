@@ -22,7 +22,7 @@ const F32 = 4;
 // net.js uses `location` and `WebSocket` in the Mesh constructor and nothing
 // else until a message arrives, so stubs are enough. net.test.mjs installs the
 // same two.
-globalThis.location = { protocol: 'http:', host: 'localhost:8000' };
+globalThis.location = { origin: 'http://localhost:8000' };
 globalThis.WebSocket = class { addEventListener() {} send() {} close() {} readyState = 1; };
 // route.js mints session keys with Web Crypto, which is a global in browsers
 // and in Node 19+. Older Node versions have it in node:crypto.

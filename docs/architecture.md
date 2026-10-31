@@ -40,7 +40,9 @@ signal-server.js      sockets, the join, rooms, TURN credentials
 signal-room.js        one mesh on the server: ids' claims, placement, roster, SDP relay
 web/room.js           which mesh: invite links, join token, the seal on offers/answers
 web/split.js          positions, depth, coverage, placement, cost model (shared by both sides)
-web/net.js            Mesh: signaling socket, link set, message framing
+web/net.js            Mesh: signaling socket, link set, message framing. Takes the server's
+                      origin and the WebSocket and RTCPeerConnection constructors, the
+                      page's own by default, so the same code runs in Node
 web/route.js          the router: one peer's share of the protocol
 web/draft.js          speculative decoding's drafter (prompt lookup) and depth picker
 web/engine.js         Engine: connect / serve / grow / generate, no DOM

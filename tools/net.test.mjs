@@ -25,10 +25,10 @@ const eq = (name, got, want) => ok(name, JSON.stringify(got) === JSON.stringify(
 
 // --- Mesh getters ---
 //
-// net.js uses `location` and `WebSocket` in the constructor and nothing else
-// until a message arrives, so stubs are enough to reach the getters.
+// net.js reads `location` and `WebSocket` in the constructor (as defaults) and
+// nothing else until a message arrives, so stubs are enough to reach the getters.
 
-globalThis.location = { protocol: 'http:', host: 'localhost:8000' };
+globalThis.location = { origin: 'http://localhost:8000' };
 globalThis.WebSocket = class { addEventListener() {} send() {} close() {} readyState = 1; };
 
 const { Mesh, hasTurn, pack, unpack, fragment, reassemble, wireLimit,
@@ -453,7 +453,7 @@ console.log('\nMesh.ready: retries a failed or hung first connect, never gives u
         static made = 0;
         // readyState 1 = OPEN. Mesh does not send in any other state: a real
         // WebSocket throws once it is CLOSING or CLOSED.
-        constructor() { this.listeners = {}; this.sent = []; this.readyState = 1; FakeWS.made++; }
+        constructor(url) { this.url = url; this.listeners = {}; this.sent = []; this.readyState = 1; FakeWS.made++; }
         addEventListener(type, fn) { (this.listeners[type] ??= []).push(fn); }
         send(m) { this.sent.push(JSON.parse(m)); }
         close() { this.readyState = 3; }
@@ -469,6 +469,17 @@ console.log('\nMesh.ready: retries a failed or hung first connect, never gives u
         ok('resolves on welcome', await m.ready.then(() => true, () => false));
         eq('and carries the model depth the server is splitting', m.blocks, 30);
         eq('a peer holds nothing until it is placed', m.range, null);
+    }
+    {
+        // Outside a page: the server and the WebSocket are passed in.
+        class OtherWS extends FakeWS {}
+        const m = new Mesh({ server: 'https://example.test', WebSocket: OtherWS });
+        ok('an injected WebSocket is used', m.ws instanceof OtherWS);
+        eq('on the given server', m.ws.url, 'wss://example.test/ws');
+        m.ws.emit('message', { data: JSON.stringify({ ...welcome, weightsUrl: '/weights/tiny' }) });
+        await m.ready;
+        eq('a relative weights URL is on that server', m.weightsUrl, 'https://example.test/weights/tiny');
+        m.stop();
     }
     // Whether a promise has settled, checked without waiting for it.
     const settled = async (p) => {

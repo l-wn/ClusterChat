@@ -30,7 +30,7 @@ if (!existsSync(TOKENIZER)) {
     process.exit(0);
 }
 
-globalThis.location = { protocol: 'http:', host: 'localhost:8000' };
+globalThis.location = { origin: 'http://localhost:8000' };
 globalThis.WebSocket = class { addEventListener() {} send() {} close() {} readyState = 1; };
 // route.js mints session keys with Web Crypto, which is a global in browsers
 // and in Node 19+. Older Node versions have it in node:crypto.

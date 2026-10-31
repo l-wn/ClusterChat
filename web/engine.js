@@ -155,8 +155,13 @@ export class Engine {
     // peer sees this tab's address (see web/net.js). `chats` is the limit on
     // replies at once, `sessions` the chats each peer keeps in memory and
     // `ctx` the context window, to ask for if this join creates a private mesh.
-    async connect({ room, relayOnly = true, chats = null, sessions = null, ctx = null } = {}) {
+    //
+    // `platform` is `{ server, WebSocket, RTCPeerConnection }`, for running
+    // outside a page (see net.js). A page leaves it out.
+    async connect({ room, relayOnly = true, chats = null, sessions = null, ctx = null,
+                    platform = {} } = {}) {
         const net = new Mesh({
+            ...platform,
             room,
             chats,
             sessions,

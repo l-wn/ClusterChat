@@ -13,7 +13,7 @@ import { makeGpu, D, L, N, weightsFor, pieceFor } from './stub-gpu.mjs';
 import { Mesh } from '../web/net.js';
 import { DEFAULT_CTX as N_MAX, SLOTS, positions } from '../web/split.js';
 
-globalThis.location = { protocol: 'http:', host: 'localhost:8000' };
+globalThis.location = { origin: 'http://localhost:8000' };
 globalThis.WebSocket = class { addEventListener() {} send() {} close() {} readyState = 1; };
 // A growth step that gets past the limit goes on to download its position. No
 // weights are served here, and a 404 is permanent, so the attempt fails at once

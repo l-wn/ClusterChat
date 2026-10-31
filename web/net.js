@@ -11,6 +11,9 @@
 // each other's addresses. `relayOnly: false` (peer.html's `?direct=1`) allows
 // direct links.
 //
+// The page's own server, WebSocket and RTCPeerConnection are the defaults.
+// Outside a page (Node), pass them in.
+//
 // See docs/architecture.md (Joining, Private meshes, Links, Wire format).
 
 import { holders, holding, covers, minDepth, served, coverage, PROTOCOL } from './split.js';
@@ -286,8 +289,13 @@ export class Mesh {
     // address. `rate`, `linkWait`, `readyTimeout`, `linkRetry`, `linkOpen`
     // and `fullRetry` override RATE, LINK_WAIT_MS, READY_TIMEOUT_MS,
     // LINK_RETRY_MS, LINK_OPEN_MS and FULL_RETRY_MS, for tests.
+    // `server` is the signaling server's origin, e.g. 'https://clusterchat.io'.
+    // `WebSocket` and `RTCPeerConnection` are the constructors to use.
     constructor({ onMessage, onChange, rate = RATE, room = GLOBAL, chats = null, sessions = null,
                   ctx = null, relayOnly = true,
+                  server = location.origin,
+                  WebSocket = globalThis.WebSocket,
+                  RTCPeerConnection = globalThis.RTCPeerConnection,
                   linkWait = LINK_WAIT_MS, readyTimeout = READY_TIMEOUT_MS,
                   linkRetry = LINK_RETRY_MS, linkOpen = LINK_OPEN_MS,
                   fullRetry = FULL_RETRY_MS } = {}) {
@@ -317,6 +325,9 @@ export class Mesh {
         // the server sends none (split.js's runnerCtx() then picks the default).
         this.ctx = null;
         this.relayOnly = relayOnly;
+        this.server = server;
+        this.#WebSocket = WebSocket;
+        this.#RTCPeerConnection = RTCPeerConnection;
         this.linkWait = linkWait;
         this.readyTimeout = readyTimeout;
         this.linkRetry = linkRetry;
@@ -353,6 +364,8 @@ export class Mesh {
 
     #welcomed;
     #refuse;
+    #WebSocket;
+    #RTCPeerConnection;
     #hang = null;               // this socket's wait for its welcome
     #retries = new Map();       // peer id -> { delay, timer }: re-offering a failed link
     #assigned = null;
@@ -372,8 +385,7 @@ export class Mesh {
     // must not open two replacements: the extra one would join the mesh as a
     // peer nothing controls.
     #connect() {
-        const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-        const ws = new WebSocket(`${proto}://${location.host}/ws`);
+        const ws = new this.#WebSocket(new URL('/ws', this.server.replace(/^http/, 'ws')).href);
         this.ws = ws;
         let gone = false;
         const drop = (why) => {
@@ -873,8 +885,8 @@ export class Mesh {
                 id: m.id, blocks: m.blocks, positions: m.positions ?? 0,
                 minBlocks: m.minBlocks, ice: m.ice ?? ICE,
                 // Null if the server does not send one. The loader then uses
-                // /checkpoint.json.
-                weightsUrl: m.weightsUrl ?? null,
+                // /checkpoint.json. A relative URL is on the server.
+                weightsUrl: m.weightsUrl ? new URL(m.weightsUrl, this.server).href : null,
                 maxChats: m.maxChats ?? null,
                 sessions: this.sessions ?? sessions,
                 ctx: this.ctx ?? ctx,
@@ -1099,7 +1111,7 @@ export class Mesh {
     }
 
     async #offer(to) {
-        const pc = new RTCPeerConnection(this.#rtcConfig());
+        const pc = new this.#RTCPeerConnection(this.#rtcConfig());
         const link = { pc, ch: null, offerer: true, id: to };
         this.links.set(to, link);                 // before any await, so #sync cannot offer twice
         this.#watch(link);
@@ -1163,7 +1175,7 @@ export class Mesh {
             existing.pc.close();
         }
 
-        const pc = new RTCPeerConnection(this.#rtcConfig());
+        const pc = new this.#RTCPeerConnection(this.#rtcConfig());
         const link = { pc, ch: null, offerer: false, id: from };
         this.links.set(from, link);
         this.#watch(link);
