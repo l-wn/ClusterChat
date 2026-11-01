@@ -155,7 +155,7 @@ const waitReady = async ({ timeout }) => {
     for (;;) {
         const now = performance.now();
         const status = $('status').textContent;
-        if (joined === null && /^peer \d+/.test($('role').textContent)) joined = now;
+        if (joined === null && /^peer \d+/.test($('peerid').textContent)) joined = now;
         if (status === 'ready' && !$('send').disabled) {
             return { outcome: 'ok', joinMs: joined ?? now, readyMs: now, status };
         }
@@ -172,12 +172,16 @@ const waitReady = async ({ timeout }) => {
 
 // For a contributor: the page's VRAM limit field, as typed into it. The page
 // applies it to its engine, which exists once the tab holds a range, so it
-// waits for that first.
+// waits for that first. #role's data-held is the positions downloaded so far,
+// which the page keeps for this and does not word into a sentence.
 const setVram = async (limit) => {
     const until = performance.now() + 300000;
-    while (!/ · blocks /.test(document.getElementById('role').textContent) && performance.now() < until) {
+    const held = () => Number(document.getElementById('role').dataset.held || 0);
+    while (!held() && performance.now() < until) {
         await new Promise((r) => setTimeout(r, 500));
     }
+    // The field is behind the drawer's slider but is still what the page
+    // reads, and an `input` on it moves the slider to match.
     const el = document.getElementById('vramlimit');
     el.value = limit;
     el.dispatchEvent(new Event('input', { bubbles: true }));
@@ -187,9 +191,8 @@ const setVram = async (limit) => {
 // For a contributor: wait until the roster shows every position held.
 const waitCovered = async ({ timeout }) => {
     for (;;) {
-        const text = document.getElementById('covered').textContent;
-        const m = /^(\d+)\/(\d+) held/.exec(text);
-        if (m && m[1] === m[2]) return true;
+        const { covered, total } = document.getElementById('covered').dataset;
+        if (covered && covered === total) return true;
         if (performance.now() > timeout) return false;
         await new Promise((r) => setTimeout(r, 200));
     }
@@ -272,10 +275,11 @@ const turn = async ({ text, tokens, timeout, spec, greedy }) => {
         prefillMs: mm ? Number(mm[3]) : null,
         stopped: mm ? mm[5].trim() : null,
         // A peer on this chat's path left. Either this tab rebuilt the
-        // context, or the peer before the gap replayed it (the two notes in
-        // peer.js).
-        rebuilds: told.filter((t) => /Rebuilding/.test(t)).length,
-        fixes: told.filter((t) => /replayed/.test(t)).length,
+        // context, or the peer before the gap replayed it. Both are matched
+        // against the notes peer.js actually writes to the transcript; the
+        // `fix` line it logs to the console is not one of them.
+        rebuilds: told.filter((t) => /Picking it back up|Re-reading the conversation/.test(t)).length,
+        fixes: told.filter((t) => /restored from a neighbouring computer/.test(t)).length,
     };
 };
 

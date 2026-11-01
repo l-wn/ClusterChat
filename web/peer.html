@@ -21,6 +21,13 @@
   <script type="module" src="./peer-start.js"></script>
 </head>
 <body>
+  <!-- What tools/load.mjs touches on this page, so a rename here is a
+       deliberate change: it answers the setup screen (#welcome, #lendHandle,
+       #welcomeYes, #lobbyLine), reads #status by its exact wording, drives
+       #vramlimit as a text field, waits on #peerid, #role's data-held and
+       #covered's data-covered/data-total, sends with
+       #input/#send/#stop/#maxtok/#spec and the sampling fields, and reads
+       #messages' .msg classes, data-code and the .meta title. -->
   <header>
     <button id="chatsBtn" class="icon" aria-label="Chats" title="Chats" aria-expanded="false" aria-controls="chats">
       <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round">
@@ -35,13 +42,19 @@
     <span class="model" id="model" hidden></span>
     <span class="spacer"></span>
     <span class="pill err" id="authfail" hidden title="Offers to link with this tab that were not sealed with this cluster's invite. They were refused; nothing was sent to them. A steady count means someone without the invite is trying to connect."></span>
-    <!-- The cluster this tab is in: the public demo, or a private cluster with
-         the tag its members can compare. -->
-    <span class="pill" id="mesh">public demo</span>
+    <!-- The cluster this tab is in — the public demo, or a private cluster with
+         the tag its members can compare — and everything you can do to it. The
+         exits live in the menu, not loose in the header beside Invite. -->
+    <span class="menu-wrap">
+      <button class="chip" id="mesh" aria-expanded="false" aria-controls="meshMenu" aria-haspopup="menu">
+        <span id="meshName">public demo</span><span class="caret" aria-hidden="true">▾</span>
+      </button>
+      <div class="menu" id="meshMenu" role="menu" hidden>
+        <button id="newmesh" type="button" role="menuitem">Start a private cluster</button>
+        <a id="leave" role="menuitem" hidden>Leave this cluster</a>
+      </div>
+    </span>
     <button id="invite" class="primary" hidden title="Copy this cluster's invite link. Anyone with it can join and run its chats. Send it only to people you trust.">Invite</button>
-    <button id="newmesh" class="primary" title="Start a private cluster and move this tab into it. Only people you send its link to can join, and only their computers run your chats.">Start a private cluster</button>
-    <a id="leave" class="button quiet" hidden title="Leave this private cluster and join the public demo">Leave</a>
-    <button id="contribBtn" aria-expanded="false" aria-controls="contrib" title="Lend your GPU, and see what this tab holds">Contribute</button>
     <button id="settingsBtn" class="icon" aria-label="Settings" title="Settings" aria-expanded="false" aria-controls="settings">
       <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
         <circle cx="12" cy="12" r="3"/>
@@ -50,32 +63,31 @@
     </button>
   </header>
 
-  <!-- The model bar, as on the setup screen: one cell per piece of the
-       model, shaded by how many computers hold it, this tab's own pieces in
-       violet. Under it, one sentence on the cluster's health. #status is this
-       tab's work in progress; tools/load.mjs reads it. -->
+  <!-- The strip is bars and nothing else: the model, then one line per
+       computer lending its GPU, each under the pieces it holds. Above them,
+       one sentence on the cluster's health. #status is this tab's work in
+       progress, shown only during a reply and on an error. -->
   <div id="mapstrip">
     <div class="strip">
-      <!-- Three columns, the sides the same width so the bar is centred:
-           names on the left, pieces in the middle, numbers on the right. -->
-      <div class="lane-grid flag-row">
-        <span></span>
-        <div class="strip-row">
-          <span id="health" data-state="">Joining…</span>
-          <span id="status" hidden>booting…</span>
-          <span class="spacer"></span>
-          <button id="lanesBtn" class="toggle" type="button" aria-expanded="false" aria-controls="lanes">People</button>
-        </div>
-        <span></span>
+      <div class="strip-head">
+        <span id="health" data-state="">Joining…</span>
+        <span id="status" hidden>booting…</span>
+        <span class="spacer"></span>
+        <button id="lanesBtn" class="toggle" type="button" aria-expanded="false" aria-controls="lanes">People</button>
       </div>
+      <!-- Three columns, the sides the same width so the bar is centred:
+           names on the left, pieces in the middle, numbers on the right.
+           Every line below shares them, so each bar sits under the pieces it
+           stands for. -->
       <div class="lane-grid model-row">
         <span class="strip-label" id="stripModel">The model</span>
         <div id="map" class="map" title="The model, one cell per piece"></div>
         <span class="strip-nums"><span class="strip-num" id="modelHeld">—</span><span class="strip-gb" id="modelGb"></span></span>
       </div>
       <!-- One line per computer lending its GPU: its name, a line under the
-           pieces it holds, and its speed, in a fixed-height box that
-           scrolls. A click opens its details. -->
+           pieces it holds, and how much of the model that is, in a
+           fixed-height box that scrolls. This tab is first. A click opens a
+           line's details, which carry its speed and how much has arrived. -->
       <div class="lanes" id="lanes" role="list" aria-label="Computers in this cluster"></div>
       <!-- Everyone only chatting, one person icon each. -->
       <div class="lane-grid chatters" id="chatters" hidden>
@@ -85,14 +97,28 @@
     </div>
   </div>
 
-  <div id="transcript">
-    <div class="inner" id="messages">
-      <div id="boot">
-        <div id="bootwhat">Joining the cluster…</div>
-        <div class="bar"><div id="bootbar"></div></div>
-        <div id="bootnote"></div>
+  <!-- What this tab is downloading, across the top of the chat. It continues
+       the strip's grid, so its bar starts and ends with the bars above it,
+       and it is out of the transcript entirely: the conversation no longer
+       moves when a download starts, pauses under a VRAM limit, or ends.
+       peer.js's showDownload() is the only thing that shows and hides it. -->
+  <div id="dl" hidden>
+    <div class="strip">
+      <div class="lane-grid">
+        <span class="dl-what" id="dlWhat">Joining</span>
+        <span class="track"><i id="dlFill"></i></span>
+        <span class="dl-pct" id="dlPct"></span>
+      </div>
+      <div class="lane-grid dl-under">
+        <span></span>
+        <span class="dl-detail" id="dlDetail"></span>
+        <span></span>
       </div>
     </div>
+  </div>
+
+  <div id="transcript">
+    <div class="inner" id="messages"></div>
   </div>
 
   <footer>
@@ -100,6 +126,17 @@
       <!-- Calm notes about this browser (errors.js's `calm` problems), kept
            out of the conversation. -->
       <p class="composer-note" id="composerNote" hidden></p>
+      <!-- Your side of the deal, where your hands already are. An on/off
+           light: lit and violet while this tab's GPU is in the cluster, blank
+           and grey when it is not, the same row either way. The whole row
+           opens the Your GPU drawer, so it is that drawer's button. -->
+      <button class="mine off" id="contribBtn" aria-expanded="false" aria-controls="contrib">
+        <i class="lamp" aria-hidden="true"></i>
+        <span class="said"><span class="state" id="mineState">Not contributing</span><span class="big" id="ran" hidden></span><span class="cap" id="mineCap" hidden>tokens generated</span></span>
+        <span class="spacer"></span>
+        <span class="rest" id="speed"></span>
+        <span class="go" id="mineGo">Contribute &rsaquo;</span>
+      </button>
       <div class="row">
         <textarea id="input" rows="1" placeholder="Waiting for the cluster…" disabled></textarea>
         <button id="send" class="primary" disabled>Send</button>
@@ -141,45 +178,57 @@
     </div>
   </aside>
 
-  <!-- Contribute, opened by the header button: lending this tab's GPU, what
-       it holds, and the cluster's numbers. tools/load.mjs reads #role,
-       #covered and #vramlimit by id and by format. -->
-  <aside id="contrib" class="drawer" role="dialog" aria-modal="true" aria-labelledby="contribTitle" hidden>
+  <!-- Your GPU, opened by the contributing band above the input: how much
+       this tab lends, and the detail that does not fit in the strip. Not
+       modal — the strip stays readable while the slider moves. tools/load.mjs
+       drives #vramlimit and reads #peerid, #covered's data-* and #role's
+       data-held; see the comment on showLending() in peer.js. -->
+  <aside id="contrib" class="drawer" role="dialog" aria-labelledby="contribTitle" hidden>
     <div class="drawer-head">
-      <h2 id="contribTitle">Contribute</h2>
+      <h2 id="contribTitle">Your GPU</h2>
       <button id="contribClose" class="icon" aria-label="Close" title="Close">&times;</button>
     </div>
 
     <div class="drawer-body">
       <section>
-        <h3>Your GPU</h3>
-        <p id="contribState" class="lend-state">Not lending yet.</p>
-        <label class="field" title="Stop growing once this tab's own GPU memory use would pass this. Blank = no limit: it keeps taking pieces until the GPU is full or it holds the whole model.">
-          <span><span class="name">Lend up to</span><span class="desc">e.g. 4gb. Blank = no limit</span></span>
-          <input id="vramlimit" type="text" placeholder="no limit" autocomplete="off">
-        </label>
+        <p id="contribState" class="drawer-state">Not lending yet.</p>
+
+        <!-- The same slider the join screen uses, instead of a second, worse
+             control for one setting. Its own ids: #lendBar and friends are
+             the welcome dialog's, on this same page. #vramlimit stays as the
+             value behind it, which is what the rest of peer.js reads. The
+             whole block goes when this browser cannot lend at all. -->
+        <div id="lendControl">
+        <div class="lend-amount">
+          <span class="name" id="limitLabel">Lend up to</span>
+          <output class="num" id="limitOut" for="limitHandle">4 GB</output>
+        </div>
+        <div class="lend-bar" id="limitBar">
+          <div class="lend-you" id="limitYou">
+            <span class="lend-handle" id="limitHandle" role="slider" tabindex="0" aria-labelledby="limitLabel"
+                  aria-valuemin="1" aria-valuemax="33" aria-valuenow="4" aria-valuetext="4 GB"></span>
+          </div>
+        </div>
+        <div class="lend-scale"><span>1 GB</span><span>No limit</span></div>
+        <input id="vramlimit" type="text" hidden autocomplete="off">
+
         <div class="lend-actions">
+          <button id="lendApply" class="primary" hidden disabled>Apply &middot; reloads the tab</button>
           <button id="lendStart" class="primary" hidden>Start lending</button>
           <button id="lendStop" hidden>Stop lending</button>
+        </div>
+        <p class="lend-note">Changing how much you lend restarts this tab, because the model is loaded into your GPU at start-up. Your chats are saved and come back.</p>
         </div>
       </section>
 
       <section>
-        <h3>This tab</h3>
+        <h3>Detail</h3>
         <dl class="kv">
-          <div><dt>Holds</dt><dd id="role">joining…</dd></div>
-          <div><dt>GPU memory used</dt><dd id="vram">—</dd></div>
-          <div><dt>Work done for others</dt><dd id="ran">0 tokens</dd></div>
-          <div><dt>Last reply</dt><dd id="speed">—</dd></div>
-        </dl>
-      </section>
-
-      <section>
-        <h3>Cluster</h3>
-        <dl class="kv">
-          <div><dt>People</dt><dd id="peers">0</dd></div>
-          <div><dt>Pieces held</dt><dd id="covered" title="Pieces of the model at least one ready computer holds: the embedding, each block, the head">—</dd></div>
-          <div><dt>Copies of the rarest piece</dt><dd id="depth" title="0: something is missing. 1: runs, but stops if that computer leaves. 2 or more: anyone can leave">0</dd></div>
+          <div><dt>What you hold</dt><dd id="role">joining…</dd></div>
+          <div><dt>GPU memory used</dt><dd id="vram">&mdash;</dd></div>
+          <div><dt>Pieces held</dt><dd id="covered" title="Pieces of the model at least one ready computer holds: the embedding, each block, the head">&mdash;</dd></div>
+          <div><dt>Lending for</dt><dd id="lentFor">&mdash;</dd></div>
+          <div><dt>This tab</dt><dd id="peerid">&mdash;</dd></div>
         </dl>
       </section>
 
@@ -193,7 +242,8 @@
 
   <!-- Generation settings, opened by the gear button. Each field's HTML value
        is its default: "Reset" and the gear's changed-dot read defaultValue /
-       defaultSelected. -->
+       defaultSelected.
+ -->
   <div id="scrim" class="scrim" hidden></div>
   <aside id="settings" class="drawer" role="dialog" aria-modal="true" aria-labelledby="settingsTitle" hidden>
     <div class="drawer-head">

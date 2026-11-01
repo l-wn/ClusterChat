@@ -4,6 +4,21 @@
 
 import { renderMarkdown } from './markdown.js';
 
+// The one highlighted phrase in a meta line: this tab's own GPU ran part of
+// that reply. Marking it here rather than at the call site keeps a reply
+// replayed from storage looking like one just written, and keeps the meta
+// setter taking plain text.
+const YOURS = 'yours included';
+
+function setMeta(el, v) {
+    const at = v.indexOf(YOURS);
+    if (at < 0) { el.textContent = v; return; }
+    const mark = document.createElement('span');
+    mark.className = 'yours';
+    mark.textContent = YOURS;
+    el.replaceChildren(v.slice(0, at), mark, v.slice(at + YOURS.length));
+}
+
 export function makeMessage(who, text = '', cls = '') {
     const el = document.createElement('div');
     el.className = `msg ${cls}`;
@@ -23,7 +38,7 @@ export function makeMessage(who, text = '', cls = '') {
     return {
         el,
         set body(v) { setBody(v); },
-        set meta(v) { el.querySelector('.meta').textContent = v; },
+        set meta(v) { setMeta(el.querySelector('.meta'), v); },
         // The longer timing line, shown when hovering the meta line.
         set detail(v) {
             const meta = el.querySelector('.meta');

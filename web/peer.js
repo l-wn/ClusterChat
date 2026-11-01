@@ -6,14 +6,15 @@
 
 import { dimsFromManifest } from './model/loader.js';
 import { Engine, ContextFullError } from './engine.js';
-import { positions, coverage, holders, holding, describeRange, storedBytes, costDims, blockBytes,
-         endBytes, mtpBytes } from './split.js';
+import { positions, coverage, holders, holding, filling, describeRange, storedBytes, costDims,
+         blockBytes, endBytes, mtpBytes } from './split.js';
 import { chatFormat, stopRe } from './prompt.js';
 import { runTurn } from './turn.js';
 import { makeMessage } from './message.js';
 import { summarize, formatLine, formatText } from './profile.js';
 import { readInvite, inviteModel, openRoom, inviteUrl, cleanName, NAME_MAX, nameKey, creatorKey, chatsKey, sessionsKey, ctxKey } from './room.js';
 import { saveChoice } from './welcome.js';
+import { lendSlider, limitGb, MAX_GB, DEFAULT_GB } from './lend.js';
 import { PROBLEMS, classify, report } from './errors.js';
 import { openHistory, idbBackend, memoryBackend, newRecord, groupByDay } from './history.js';
 
@@ -138,14 +139,26 @@ function setBusy(busy) {
     if (!busy) ui.input.focus();
 }
 
-// The download's progress box. It is shown from the first byte until this tab
-// stops downloading, and growth can pause under a VRAM limit and start again
-// when it is raised, so the box is taken out and put back rather than dropped
-// for good. It is the first thing in the transcript (render() keeps it there).
-function showBoot(on) {
-    if (!ui.boot) return;
-    if (!on) ui.boot.remove();
-    else if (!ui.boot.isConnected) ui.messages.prepend(ui.boot);
+// The download's line, across the top of the chat. It is shown from the first
+// byte until this tab stops downloading, and growth can pause under a VRAM
+// limit and start again when it is raised, so it is hidden and shown again
+// rather than dropped for good. It sits outside the transcript, so showing it
+// never moves the conversation.
+//
+// This is also the only honest answer to "is this tab downloading": a growth
+// step announces its range only once the piece has landed (engine.js's
+// #growClaim), so split.js's filling() is false for the whole of it. The lane
+// and the contributing band both read downloading() rather than the roster.
+function showDownload(on) {
+    ui.dl.hidden = !on;
+    if (!on) ui.dlPct.textContent = '';
+}
+const downloading = () => !ui.dl.hidden;
+
+// What the download line says it is doing, while it waits for the first
+// progress event to give it a piece and a percentage.
+function downloadWhat(text) {
+    ui.dlWhat.textContent = text;
 }
 
 // Engine events, translated into DOM updates.
@@ -157,11 +170,16 @@ function handleEngineEvent(type, detail) {
             break;
         case 'progress':
             // Background growth reports through here too, on the same bar: the
-            // box is kept after the first claim is filled, so one bar runs from
+            // line is kept after the first claim is filled, so it runs from
             // the embedding to the last piece this tab ends up holding.
-            if (!ui.boot?.isConnected) break;
-            ui.bootnote.textContent = detail.text;
-            if (detail.fraction != null) ui.bootbar.style.width = `${detail.fraction * 100}%`;
+            if (!downloading()) break;
+            ui.dlDetail.textContent = detail.text;
+            if (detail.fraction != null) {
+                const pct = Math.round(detail.fraction * 100);
+                ui.dlFill.style.width = `${pct}%`;
+                ui.dlPct.textContent = `${pct}%`;
+                showLending();           // the band shows the same percentage
+            }
             break;
         // Engine notes by code: limits and problems are shown; the rest
         // (retries, the MTP head, growth resuming) only go to the console.
@@ -170,25 +188,25 @@ function handleEngineEvent(type, detail) {
                 case 'limit':
                     console.info(detail.text);
                     note(`Limit reached: you're lending your full ${Math.round(detail.limit / 2 ** 30)} GB.`);
-                    showBoot(false);
+                    showDownload(false);
                     break;
                 case 'limit-room':
                     console.info(detail.text);
-                    showBoot(true);
+                    showDownload(true);
                     break;
                 case 'grow-stopped':
                     grewTo(detail.cause, detail.text);
-                    showBoot(false);
+                    showDownload(false);
                     break;
                 // Growth stopped on its own (this GPU's ceiling). Not a
                 // problem to report, but the download is over.
                 case 'ceiling':
                     console.info(detail.text);
-                    showBoot(false);
+                    showDownload(false);
                     break;
                 case 'whole':
                     note("You're holding the whole model.");
-                    showBoot(false);
+                    showDownload(false);
                     break;
                 case 'gpu-lost':
                     console.error(detail.text);
@@ -275,30 +293,25 @@ function refresh() {
         note("You were idle, so your spot went to someone waiting. Send a message to get it back, if there's room.");
     }
 
-    // The Contribute drawer's numbers. #covered and #role keep the formats
-    // tools/load.mjs reads.
+    // The Your GPU drawer's numbers. tools/load.mjs no longer parses these
+    // sentences: it reads #peerid, #covered's data-covered/data-total and
+    // #role's data-held, so the wording here is free to change.
     const cov = net.coverage;
     ui.covered.textContent = net.positions
-        ? `${cov.covered}/${cov.total} held` : 'model unknown';
+        ? `${cov.covered} of ${cov.total}` : 'model unknown';
+    ui.covered.dataset.covered = net.positions ? String(cov.covered) : '';
+    ui.covered.dataset.total = net.positions ? String(cov.total) : '';
     ui.covered.className = !net.positions ? '' : cov.covered === cov.total ? 'ok'
         : cov.covered ? 'busy' : 'err';
     ui.covered.title = net.positions ? summarise(cov, net) : '';
 
     ui.role.textContent = roleLine(net);
-
-    const loading = net.peers.filter((p) => holding(p) && (p.have ?? p.hi) < p.hi).length;
-    ui.peers.textContent = `${net.peers.length}${loading ? ` (${loading} downloading)` : ''}`
-        + (net.online ? '' : ' · offline');
-
-    // The fewest ready computers holding any one piece. 0 cannot run, 1 runs
-    // but stops if that computer leaves, 2 survives anyone leaving.
-    const r = cov.r;
-    ui.depth.textContent = String(r);
-    ui.depth.className = r >= 2 ? 'ok' : r === 1 ? 'busy' : 'err';
+    ui.role.dataset.held = String(heldPositions(net));
+    ui.peerid.textContent = net.id == null ? '—' : `peer ${net.id}`;
 
     // This tab's own GPU memory, not the cluster's.
     ui.vram.textContent = engine.runner ? `${(engine.vramBytes / 2 ** 30).toFixed(2)} GiB` : '—';
-    ui.ran.textContent = `${engine.ran.toLocaleString()} tokens`;
+    ui.lentFor.textContent = lentFor();
     ui.ctx.textContent = `${engine.ctxLen.toLocaleString()} / ${engine.ctxMax.toLocaleString()} tokens`;
 
     renderMap(net, cov);
@@ -352,8 +365,8 @@ function refresh() {
     if (state.busy) return;
 
     // Not welcomed yet and retrying (net.js): show the reason in the boot box.
-    if (net.trouble && engine.canPrompt === null && ui.boot?.isConnected) {
-        ui.bootnote.textContent = net.trouble;
+    if (net.trouble && engine.canPrompt === null && downloading()) {
+        ui.dlDetail.textContent = net.trouble;
     }
 
     const why = foreign() ? 'read-only: made on another model'
@@ -402,12 +415,26 @@ function showHealth(net, cov) {
         text = need ? `Needs ${Math.max(1, Math.ceil(need / 2 ** 30))} GB more` : 'Waiting for more people';
         kind = 'busy';
     } else {
-        text = 'Running';
+        // Running, how many GPUs it runs on, and whether it survives one of
+        // them closing their tab: cov.r is the copies of the rarest piece.
+        const gpus = net.peers.filter(holding).length;
+        text = `<b>Running</b> · ${plural(gpus, 'GPU')} · ` +
+            (cov.r >= 2 ? 'safe if one person leaves' : 'stops if one person leaves');
         kind = 'ok';
     }
-    if (ui.health.textContent !== text) ui.health.textContent = text;
+    // The running sentence carries its own emphasis on the first word; every
+    // other state is one short phrase, so all of it is the emphasis.
+    const html = kind === 'ok' ? text : `<b>${escapeHtml(text)}</b>`;
+    if (healthSaid !== html) {
+        healthSaid = html;
+        ui.health.innerHTML = html;
+    }
     ui.health.dataset.state = kind;
 }
+
+let healthSaid = null;
+
+const escapeHtml = (s) => s.replace(/[<&]/g, (c) => ({ '<': '&lt;', '&': '&amp;' }[c]));
 
 // Stored bytes of the pieces nobody ready holds, or 0 when unknown.
 function missingBytes(cov) {
@@ -429,26 +456,47 @@ function positionBytes(manifest) {
         endBytes(d, 'head') + mtpBytes(d, opts)];
 }
 
-// E.g. `peer 3 · the embedding + blocks 0–5 (+3 loading)`: id, holding, and
-// how much of the claim is still loading, from this tab's own roster entry.
+// E.g. `the embedding + blocks 0–5, 3 still downloading`: what this tab holds
+// and how much of its claim is still coming, from its own roster entry. The
+// peer id is its own row (#peerid), so this is one plain sentence.
 function roleLine(net) {
-    const id = net.id ?? '—';
-    if (engine.role === 'spectator') return `peer ${id} · spectator`;
+    if (engine.role === 'spectator') return 'nothing — chatting only';
 
     const me = net.me;
-    if (!holding(me)) return `peer ${id} · joining…`;
+    if (!holding(me)) return 'joining…';
 
     const have = me.have ?? me.hi;
     // Loaded but not announced: its links to neighbouring peers are still
     // opening (net.js's ready gate).
     const waiting = net.linking;
     if (waiting) {
-        return `peer ${id} · linking to peer${waiting.length === 1 ? '' : 's'} ${waiting.join(', ')}…`;
+        return `linking to peer${waiting.length === 1 ? '' : 's'} ${waiting.join(', ')}…`;
     }
-    if (have <= me.lo) return `peer ${id} · loading ${describeRange(me.lo, me.hi, net.blocks)}`;
+    if (have <= me.lo) return `${describeRange(me.lo, me.hi, net.blocks)}, downloading`;
     const left = me.hi - have;
-    return `peer ${id} · ${describeRange(me.lo, have, net.blocks)}`
-        + (left ? ` (+${left} loading)` : '');
+    return describeRange(me.lo, have, net.blocks)
+        + (left ? `, ${left} still downloading` : '');
+}
+
+// Positions this tab has downloaded and can serve. tools/load.mjs waits on
+// this as #role's data-held, rather than on the wording above.
+function heldPositions(net) {
+    const me = net?.me;
+    if (!holding(me)) return 0;
+    return Math.max(0, Math.min(me.have ?? me.hi, me.hi) - me.lo);
+}
+
+// When this tab started lending, for the drawer's "Lending for". Null until
+// it does.
+let lendingSince = null;
+
+function lentFor() {
+    if (lendingSince == null) return '—';
+    const m = Math.round((Date.now() - lendingSince) / 60000);
+    if (m < 1) return 'less than a minute';
+    if (m < 60) return plural(m, 'minute');
+    const h = Math.floor(m / 60);
+    return `${plural(h, 'hour')} ${m % 60} min`;
 }
 
 // --- The block map ---
@@ -587,7 +635,10 @@ function renderLanes(net) {
     const L = net.positions;
     if (!L) return;
     const now = performance.now();
-    const holders = net.peers.filter(holding).sort((a, b) => (a.lo - b.lo) || (a.id - b.id));
+    // This tab first, then everyone else by where their range starts.
+    const holders = net.peers.filter(holding)
+        .sort((a, b) => (a.id === net.id ? -1 : b.id === net.id ? 1 : 0)
+                     || (a.lo - b.lo) || (a.id - b.id));
     const ids = new Set(holders.map((p) => p.id));
     for (const p of net.peers) if (!firstSeen.has(p.id)) firstSeen.set(p.id, now);
 
@@ -614,13 +665,16 @@ function renderLanes(net) {
 
         const me = p.id === net.id;
         const have = Math.min(p.have ?? p.hi, p.hi);
-        const name = `${p.name ?? `GPU ${p.id}`}${me ? ' (you)' : ''}`;
+        const name = me ? 'You' : (p.name ?? `GPU ${p.id}`);
         const ms = hopMs.get(p.id);
-        const loading = have < p.hi;
+        // This tab's own download is not visible in the roster during growth
+        // (showDownload's comment), so ask the download line instead.
+        const loading = me ? downloading() : filling(p);
         const pct = Math.round(((have - p.lo) / (p.hi - p.lo)) * 100);
         const bytes = laneBytes(net, p.lo, p.hi);
-        const stat = loading ? `${pct}%` : ms != null ? `${Math.round(ms)} ms`
-            : bytes != null ? `${(bytes / 2 ** 30).toFixed(1)} GB` : '';
+        // One unit down the column, always: how much of the model this bar
+        // is. Its speed and how much has arrived are in the detail below.
+        const size = bytes != null ? `${(bytes / 2 ** 30).toFixed(1)} GB` : '';
 
         lane.el.classList.toggle('me', me);
         lane.el.classList.toggle('loading', loading);
@@ -629,13 +683,17 @@ function renderLanes(net) {
         lane.have.style.width = `${((have - p.lo) / (p.hi - p.lo)) * 100}%`;
 
         if (lane.name.textContent !== name) lane.name.textContent = name;
-        if (lane.stat.textContent !== stat) lane.stat.textContent = stat;
-        lane.stat.title = loading ? 'Downloaded so far' : ms != null ? 'Time per word on your last reply' : 'Size of its pieces';
+        const stat = size + (loading ? ' <i class="loading">downloading</i>' : '');
+        if (lane.said !== stat) {
+            lane.said = stat;
+            lane.stat.innerHTML = stat;
+        }
+        lane.stat.title = loading ? 'Still downloading its pieces' : 'How much of the model its pieces are';
 
         const held = describeRange(p.lo, have, net.blocks) || 'nothing yet';
         const joined = `joined ${ago(now - firstSeen.get(p.id))}`;
         const lines = [
-            `Holds ${held}${loading ? ` (${pct}% downloaded)` : ''}`,
+            `Holds ${held}${have < p.hi ? ` (${pct}% downloaded)` : ''}`,
             // `bytes` is null until the manifest has been read, and the lane
             // is drawn before that.
             bytes != null ? `${(bytes / 2 ** 30).toFixed(1)} GB of the model · ${joined}`
@@ -748,7 +806,7 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
         room = await openRoom(secret, { model: inviteModel(location.hash) });
     } catch (err) {
         ui.title.textContent = 'ClusterChat';
-        showBoot(false);
+        showDownload(false);
         showMesh(null);
         problem('BAD_LINK', err);
         setStatus('bad invite link', 'err');
@@ -758,7 +816,9 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
     showSide();
     openStore(room);
 
-    ui.bootnote.textContent = 'connecting to the signaling server…';
+    showDownload(true);
+    downloadWhat('Joining');
+    ui.dlDetail.textContent = 'connecting to the signaling server…';
     // Holding the head, also hold the MTP draft head; ?mtp=0 turns it off.
     // ?warm=0: no keep-warm kernel between jobs (stage.js KEEP_WARM_MS).
     // ?batch=0: each job in a pass of its own (stage.js #batchWith).
@@ -777,7 +837,7 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
     } catch (err) {
         console.warn('connect failed:', err);
         ui.title.textContent = 'ClusterChat';
-        showBoot(false);
+        showDownload(false);
         problem('NO_CONNECTION', err);
         refresh();
         return;
@@ -825,29 +885,35 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
         at = placement(manifest);
     } catch (err) {
         console.warn('placement:', err);
-        showBoot(false);
+        showDownload(false);
         problem('LEND_FAILED', err);
         return;
     }
 
     // The GPU is opened only after the visitor agrees in the welcome popup,
     // and only up to the amount they chose.
-    ui.bootwhat.textContent = 'Waiting for your answer…';
-    ui.bootnote.textContent = 'about lending your GPU';
+    downloadWhat('Waiting');
+    ui.dlDetail.textContent = 'for your answer about lending your GPU';
     const { contribute, limit } = await gpuConsent;
     // Take a spot among the people chatting. Two people can press Join for
     // the last one at once; the one turned away is told here, and gets a spot
     // with their next message if one has freed.
     engine.net.enter(contribute).then(({ ok }) => { if (!ok) problem('DEMO_FULL'); });
+    // The amount this tab is running with. The slider follows the field, and
+    // Apply is offered only once the slider leaves this value.
     ui.vramlimit.value = limit;
+    ui.vramlimit.dispatchEvent(new Event('input'));
+    appliedLimit = limit.trim();
     if (!contribute) {
-        showBoot(false);
+        showDownload(false);
         lending = false;
         refresh();
         return;
     }
     lending = true;
-    ui.bootwhat.textContent = 'Lending your GPU…';
+    lendingSince = Date.now();
+    downloadWhat('Downloading');
+    ui.dlDetail.textContent = 'your share of the model';
 
     applyVramLimit();
     // Not awaited. serve() reports its own failures; the catch is for bugs.
@@ -855,13 +921,19 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
         .then(({ note: msg, code, cause, grows }) => {
             // serve() resolves once the first claim is filled, but a tab that
             // grows keeps downloading a piece at a time for a good while after
-            // that. The box stays until growth ends (the 'status' codes below
-            // remove it), so the bar does not vanish mid-download.
-            if (grows) ui.bootwhat.textContent = 'Downloading the model…';
-            else showBoot(false);
+            // that. The line stays until growth ends (the 'status' codes
+            // above hide it), so it does not vanish mid-download.
+            if (grows) downloadWhat('Downloading');
+            else showDownload(false);
             if (code === 'grow-stopped') grewTo(cause, msg);
-            else if (code === 'lend-failed') { console.warn(msg); problem(lendProblem(cause), cause); }
-            else console.info(msg);
+            else if (code === 'lend-failed') {
+                // The GPU never opened: this tab is a spectator, so the light
+                // goes out rather than sitting on with nothing behind it.
+                console.warn(msg);
+                lending = false;
+                lendingSince = null;
+                problem(lendProblem(cause), cause);
+            } else console.info(msg);
             refresh();
         })
         .catch((err) => console.error('serve:', err));
@@ -936,8 +1008,8 @@ const slowMs = () => Math.max(0, Number(new URLSearchParams(location.search).get
 // invite); only the link to the public demo is shown.
 function showMesh(r) {
     const priv = !!r?.private;
-    ui.mesh.textContent = !r ? 'no cluster' : priv ? `private · ${r.tag}` : 'public demo';
-    ui.mesh.className = `pill ${!r ? 'err' : priv ? 'private' : 'public'}`;
+    ui.meshName.textContent = !r ? 'No cluster' : priv ? `Private · ${r.tag}` : 'Public demo';
+    ui.mesh.className = `chip ${!r ? 'err' : priv ? 'private' : 'public'}`;
     ui.mesh.title = !r ? 'This tab has not joined any cluster.'
         : priv ? `A private cluster. Everyone in it sees the same tag (${r.tag}). Only people ` +
                  'with its link can join, and only their computers run your chats.'
@@ -945,9 +1017,12 @@ function showMesh(r) {
           "Don't send anything personal.";
     ui.newmesh.hidden = !r || priv;
     ui.invite.hidden = !priv;
+    // With no cluster at all (a damaged invite) this is the way back, so it
+    // is offered there too, as an arrival rather than an exit.
     ui.leave.hidden = !(priv || !r);
     ui.leave.href = location.pathname;         // this page with no invite or query
-    ui.leave.textContent = priv ? 'Leave' : 'Public demo';
+    ui.leave.textContent = priv ? 'Leave this cluster' : 'Go to the public demo';
+    ui.leave.classList.toggle('danger', priv);
     ui.chatsMesh.textContent = !r ? 'no cluster' : priv ? `private ${r.tag}` : 'public demo';
 }
 
@@ -1007,6 +1082,7 @@ function wireEvents() {
         location.href = '/create';
     });
     ui.invite.addEventListener('click', copyInvite);
+    wireMeshMenu();
 
     ui.send.addEventListener('click', () => submitPrompt());
     ui.stop.addEventListener('click', () => { engine.stop(); ui.stop.disabled = true; });
@@ -1039,6 +1115,24 @@ function wireEvents() {
 // field's HTML value is its default, so Reset and the gear's changed-dot
 // compare against defaultValue / defaultSelected.
 
+// The cluster chip's menu: what you can do to the cluster this tab is in.
+// Everything in it navigates away, so it closes on any click, on Escape, and
+// on a click anywhere outside.
+function wireMeshMenu() {
+    const show = (open) => {
+        ui.meshMenu.hidden = !open;
+        ui.mesh.setAttribute('aria-expanded', String(open));
+    };
+    ui.mesh.addEventListener('click', (e) => { e.stopPropagation(); show(ui.meshMenu.hidden); });
+    ui.meshMenu.addEventListener('click', () => show(false));
+    document.addEventListener('click', (e) => {
+        if (!ui.meshMenu.hidden && !ui.meshMenu.contains(e.target)) show(false);
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && !ui.meshMenu.hidden) { e.stopImmediatePropagation(); show(false); }
+    });
+}
+
 const settingFields = () => ui.settings.querySelectorAll('input, select');
 
 const isDefault = (el) => el.tagName === 'SELECT'
@@ -1046,11 +1140,16 @@ const isDefault = (el) => el.tagName === 'SELECT'
     : el.value === el.defaultValue;
 
 // The right-hand drawers, by name: each has a button that opens it and a
-// close button. At most one is open.
+// close button. At most one is open. `modal` draws the scrim behind it;
+// Your GPU is not modal, so the strip stays readable while its slider moves.
 const DRAWERS = {
-    settings: { el: 'settings', button: 'settingsBtn', close: 'settingsClose' },
-    contrib: { el: 'contrib', button: 'contribBtn', close: 'contribClose' },
+    settings: { el: 'settings', button: 'settingsBtn', close: 'settingsClose', modal: true },
+    contrib: { el: 'contrib', button: 'contribBtn', close: 'contribClose', modal: false },
 };
+
+// Whether anything that wants the scrim is open. layoutChats() asks too, so
+// the list of drawers lives in one place.
+const scrimWanted = () => Object.values(DRAWERS).some((d) => d.modal && !ui[d.el].hidden);
 
 function openDrawer(name, open) {
     if (open) openChats(false);
@@ -1062,7 +1161,7 @@ function openDrawer(name, open) {
         if (show) ui[d.close].focus();
         else if (wasOpen && (key === name || name === null)) ui[d.button].focus();
     }
-    ui.scrim.hidden = !open;
+    ui.scrim.hidden = !scrimWanted();
 }
 const openSettings = (open) => openDrawer('settings', open);
 
@@ -1089,8 +1188,9 @@ function wireSettings() {
         markChanged();
     });
 
-    // Lending is decided at boot, so starting or stopping saves the choice
-    // and reloads. Chats are saved, so the chat on screen comes back.
+    // Lending is decided at boot, so starting, stopping or changing the
+    // amount saves the choice and reloads. Chats are saved, so the chat on
+    // screen comes back.
     const relend = (contribute) => {
         if (state.busy && !confirm('A reply is still being written. Stop it and reload?')) return;
         saveChoice({ contribute, limit: ui.vramlimit.value.trim() });
@@ -1098,27 +1198,88 @@ function wireSettings() {
     };
     ui.lendStart.addEventListener('click', () => relend(true));
     ui.lendStop.addEventListener('click', () => relend(false));
+    ui.lendApply.addEventListener('click', () => relend(true));
+    wireLimit();
+}
+
+// The "Lend up to" slider, and the field behind it. The field is the value
+// everything else reads (applyVramLimit, relend, showLending) and the one
+// tools/load.mjs drives, so the slider writes through it rather than
+// replacing it. A limit typed in by the harness moves the knob; the knob
+// never calls back into itself.
+function wireLimit() {
+    const from = (v) => (v.trim() ? limitGb(v) ?? DEFAULT_GB : Infinity);
+    limitSlider = lendSlider({
+        bar: ui.limitBar, fill: ui.limitYou, handle: ui.limitHandle, out: ui.limitOut,
+        lo: 1, open: true, value: from(ui.vramlimit.value),
+        onChange: (gb) => {
+            ui.vramlimit.value = gb > MAX_GB ? '' : `${gb}gb`;
+            ui.lendApply.disabled = ui.vramlimit.value.trim() === appliedLimit;
+            showLending();
+        },
+    });
+    ui.vramlimit.addEventListener('input', () => limitSlider.set(from(ui.vramlimit.value)));
     ui.vramlimit.addEventListener('change', () => {
         if (parseByteLimit(ui.vramlimit.value) != null) saveChoice({ contribute: lending, limit: ui.vramlimit.value.trim() });
     });
 }
 
-// The Contribute drawer's lending state, and the live square on its button.
+let limitSlider = null;
+// The limit this tab actually started with. Apply is offered only once the
+// slider has moved away from it, because applying means a reload.
+let appliedLimit = '';
+
+// The contributing band above the input, and the drawer's state line.
+//
+// The band is an on/off light with one lit state: the count starts at 0 and
+// only rises. There is no "ready" or "loading" wording to fall out of step
+// with what is actually happening — the download has its own line at the top
+// of the chat, and shows here only as the parenthetical.
 function showLending() {
     const canLend = !!navigator.gpu;
-    const me = engine?.net?.me;
-    const holds = lending && holding(me);
     const limit = ui.vramlimit.value.trim();
-    ui.contribBtn.classList.toggle('lending', holds);
+    const amount = limit ? `up to ${limit.toUpperCase()}` : 'with no limit';
+
+    // Lit from the moment this tab commits its GPU, not once the first token
+    // has run: holding the pieces is the contribution.
+    const on = lending;
+    ui.contribBtn.classList.toggle('off', !on);
+    if (on && !wasLending) ui.contribBtn.classList.add('lit');
+    wasLending = on;
+
+    ui.mineState.textContent = on ? 'Contributing:' : 'Not contributing';
+    ui.ran.hidden = ui.mineCap.hidden = !on;
+    if (on) ui.ran.textContent = engine ? engine.ran.toLocaleString() : '0';
+    ui.mineGo.textContent = on ? 'Manage ›' : 'Contribute ›';
+    // The right-hand parenthetical: what is coming down, or how long this
+    // tab took per word on the last reply. Empty until there is one or the
+    // other, and rendered from both each time so neither can be left behind.
+    ui.speed.textContent = !on ? ''
+        : downloading() ? `(downloading${ui.dlPct.textContent ? ` ${ui.dlPct.textContent}` : ''})`
+        : lastPerTok != null ? `(${lastPerTok.toFixed(0)} ms/word)`
+        : '';
+    ui.contribBtn.title = on
+        ? `Lending ${amount}. Open to change it or stop.`
+        : 'Lend part of your GPU to this cluster.';
+
+    // Nothing to set on a browser that cannot lend: the drawer is then just
+    // the sentence saying so, and the detail below it.
+    ui.lendControl.hidden = !canLend && !lending;
     ui.lendStart.hidden = lending || !canLend;
     ui.lendStop.hidden = !lending;
-    ui.contribState.textContent = !canLend && !lending
+    ui.lendApply.hidden = !lending;
+    ui.contribState.innerHTML = !canLend && !lending
         ? "This browser can't lend its GPU. Chatting works as normal."
         : !lending ? 'Not lending. You can still chat.'
-        : !holds ? `Starting to lend${limit ? ` up to ${limit.toUpperCase()}` : ''}…`
-        : `Lending ${limit ? `up to ${limit.toUpperCase()}` : 'with no limit'}. ` +
-          `Thank you: this keeps the cluster running.`;
+        : `Lending <b>${escapeHtml(amount)}</b> to this cluster. ` +
+          'You can keep chatting while it runs.';
 }
+
+// So the lamp's flare plays on the change, not on every refresh().
+let wasLending = false;
+// Milliseconds per word on the last reply, for the band. Null until there
+// has been one.
+let lastPerTok = null;
 
 // --- The chat list ---
 //
@@ -1145,7 +1306,7 @@ function layoutChats() {
         ui.chats.hidden = false;
         ui.chats.setAttribute('role', 'complementary');
         ui.chats.removeAttribute('aria-modal');
-        if (ui.settings.hidden && ui.contrib.hidden) ui.scrim.hidden = true;
+        if (!scrimWanted()) ui.scrim.hidden = true;
     } else {
         ui.chats.setAttribute('role', 'dialog');
         ui.chats.setAttribute('aria-modal', 'true');
@@ -1363,7 +1524,7 @@ function attach() {
 // Render the transcript from the chat's messages. The boot progress box is
 // kept while boot is running.
 function render() {
-    ui.messages.replaceChildren(...(ui.boot?.isConnected ? [ui.boot] : []));
+    ui.messages.replaceChildren();
     for (const m of current.rec?.messages ?? []) {
         if (m.role === 'user') { addMessage('you', m.text, 'user'); continue; }
         const out = addMessage('ClusterChat', m.text, 'model');
@@ -1609,17 +1770,21 @@ async function respond(text, opts, out, reply) {
     const hopsLine = formatLine(summary);
     // Under the reply: how many GPUs ran it and how fast, in tokens. The token
     // timings are the hover text; tools/load.mjs reads them from there.
-    const gpus = new Set((summary.decode?.hops ?? []).map((h) => h.id)).size;
+    const ids = new Set((summary.decode?.hops ?? []).map((h) => h.id));
+    const gpus = ids.size;
     for (const h of summary.decode?.hops ?? []) if (h.ms?.med != null) hopMs.set(h.id, h.ms.med);
     const tps = turn.ids.length && turn.perTok > 0 ? 1000 / turn.perTok : 0;
-    show('meta', [gpus ? `via ${plural(gpus, 'GPU')}` : null,
+    // Say so when this tab's own GPU ran part of the reply — that it took
+    // part is the interesting bit, not which blocks it holds.
+    const mine = engine.net.id != null && ids.has(engine.net.id);
+    show('meta', [gpus ? `via ${plural(gpus, 'GPU')}${mine ? ', yours included' : ''}` : null,
                   tps ? `${tps < 10 ? tps.toFixed(1) : tps.toFixed(0)} tok/s` : null]
         .filter(Boolean).join(' · '));
     out.detail = `${turn.ids.length} tokens · ${turn.perTok.toFixed(0)} ms/tok · ` +
         `prefill ${turn.prefillMs.toFixed(0)} ms for ${turn.promptTokens} · ${turn.stopped}` +
         (hopsLine ? ` · ${hopsLine}` : '');
     showProfile(out.el, summary, engine.lastProfile);
-    ui.speed.textContent = turn.perTok ? `${(1000 / turn.perTok).toFixed(1)} tokens/s` : '—';
+    if (turn.perTok) { lastPerTok = turn.perTok; showLending(); }
     setStatus('ready', 'ok');
     scrollDown();
     return true;

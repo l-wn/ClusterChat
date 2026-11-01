@@ -49,28 +49,44 @@ export function cellsFor(bar, L) {
 // Wire a slider: `bar` the track, `fill` the part up to the value, `handle`
 // the knob (role="slider"), `out` the number shown. Drag or click the track,
 // or use the arrow keys on the handle. Calls onChange(gb) on every change.
-// lock() sets it to zero for good, for a browser that can't lend.
-export function lendSlider({ bar, fill, handle, out, value = DEFAULT_GB, onChange = () => {} }) {
-    let gb = Math.max(0, Math.min(MAX_GB, value));
+// lock() pins it to the low end for good, for a browser that can't lend.
+//
+// `lo` is the lowest amount offered. The pre-join screens start at 0, which
+// means "don't lend"; the Your GPU drawer starts at 1, because stopping is
+// its own button there.
+//
+// `open` adds one stop past MAX_GB meaning "no limit": keep growing until the
+// GPU is full. `value` reads Infinity there, which is what parseByteLimit()
+// gives for a blank limit, so a caller can pass it straight on.
+export function lendSlider({ bar, fill, handle, out, value = DEFAULT_GB,
+                             lo = 0, open = false, onChange = () => {} }) {
+    const hi = MAX_GB + (open ? 1 : 0);      // the top stop, "no limit" if open
+    const clamp = (v) => Math.max(lo, Math.min(hi, Math.round(v)));
+    const unlimited = () => open && gb > MAX_GB;
+    const label = () => (unlimited() ? 'No limit' : gb ? `${gb} GB` : 'None');
+    let gb = clamp(value === Infinity ? hi : value);
     let locked = false;
     const show = () => {
-        out.textContent = gb ? `${gb} GB` : 'None';
-        fill.style.width = `${(gb / MAX_GB) * 100}%`;
-        handle.setAttribute('aria-valuemax', String(MAX_GB));
+        out.textContent = label();
+        fill.style.width = `${((gb - lo) / (hi - lo)) * 100}%`;
+        handle.setAttribute('aria-valuemin', String(lo));
+        handle.setAttribute('aria-valuemax', String(hi));
         handle.setAttribute('aria-valuenow', String(gb));
-        handle.setAttribute('aria-valuetext', gb ? `${gb} GB` : 'none');
+        handle.setAttribute('aria-valuetext', unlimited() ? 'no limit' : gb ? `${gb} GB` : 'none');
     };
-    const set = (v) => {
+    // `notify` is false when the value is being brought in from elsewhere (the
+    // drawer's backing field), so syncing cannot loop back into onChange.
+    const apply = (v, notify = true) => {
         if (locked) return;
-        const next = Math.max(0, Math.min(MAX_GB, Math.round(v)));
+        const next = clamp(v);
         if (next === gb) return;
         gb = next;
         show();
-        onChange(gb);
+        if (notify) onChange(gb);
     };
     const fromPointer = (e) => {
         const r = bar.getBoundingClientRect();
-        set(((e.clientX - r.left) / r.width) * MAX_GB);
+        apply(lo + ((e.clientX - r.left) / r.width) * (hi - lo));
     };
     bar.addEventListener('pointerdown', (e) => {
         bar.setPointerCapture(e.pointerId);
@@ -84,15 +100,17 @@ export function lendSlider({ bar, fill, handle, out, value = DEFAULT_GB, onChang
     bar.addEventListener('pointercancel', stop);
     handle.addEventListener('keydown', (e) => {
         const step = { ArrowRight: 1, ArrowUp: 1, ArrowLeft: -1, ArrowDown: -1, PageUp: 4, PageDown: -4 }[e.key];
-        if (step) { e.preventDefault(); set(gb + step); }
-        else if (e.key === 'Home') { e.preventDefault(); set(0); }
-        else if (e.key === 'End') { e.preventDefault(); set(MAX_GB); }
+        if (step) { e.preventDefault(); apply(gb + step); }
+        else if (e.key === 'Home') { e.preventDefault(); apply(lo); }
+        else if (e.key === 'End') { e.preventDefault(); apply(hi); }
     });
     show();
     return {
-        get value() { return gb; },
+        get value() { return unlimited() ? Infinity : gb; },
+        // Bring the knob to a value decided elsewhere, without calling back.
+        set(v) { apply(v === Infinity ? hi : v, false); },
         lock() {
-            set(0);
+            apply(lo);
             locked = true;
             bar.classList.add('locked');
             handle.setAttribute('aria-disabled', 'true');

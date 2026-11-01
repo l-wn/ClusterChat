@@ -34,7 +34,7 @@ header {
 }
 header h1 { font-size: inherit; font-weight: 600; letter-spacing: -0.015em; margin: 0; line-height: 1; }
 header .sub { color: var(--muted); font-size: var(--t-sm); }
-header .spacer, .strip-row .spacer { flex: 1; }
+header .spacer, .strip-head .spacer { flex: 1; }
 
 header .brand { display: flex; align-items: baseline; gap: .45em; font-size: 18px; color: var(--ink); text-decoration: none; margin-right: 4px; }
 /* The pieces are as tall as the wordmark's capitals (Instrument Sans caps
@@ -62,10 +62,57 @@ header .model {
 .pill.ok   { color: var(--ok); border-color: #b7d8c0; }
 .pill.busy { color: var(--warn); border-color: #ead2a8; }
 .pill.err  { color: var(--err); border-color: #efc2bd; background: var(--err-soft); }
-/* The cluster badge: the public demo, or a private cluster. */
-#mesh { text-transform: uppercase; letter-spacing: .05em; }
+
+/* The cluster chip: which cluster this tab is in, and the menu holding
+   everything you can do to it. */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  font: 500 var(--t-sm)/1 var(--sans);
+  word-spacing: .08em;
+  padding: 8px 11px;
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r);
+  background: var(--bg);
+  color: var(--ink);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.chip:hover { border-color: var(--ink); }
+.chip .caret { color: var(--faint); }
 #mesh.public { color: var(--warn); border-color: #ead2a8; background: var(--warn-soft); }
-#mesh.private { color: var(--ink); border-color: var(--ink); }
+#mesh.private { border-color: var(--ink); }
+#mesh.err { color: var(--err); border-color: #efc2bd; background: var(--err-soft); }
+
+.menu-wrap { position: relative; display: inline-flex; }
+.menu {
+  position: absolute;
+  top: calc(100% + 6px); right: 0;
+  min-width: 15rem;
+  padding: 5px;
+  background: var(--bg);
+  border: 1px solid var(--rule-strong);
+  border-radius: var(--r-lg);
+  box-shadow: 0 16px 40px rgba(11, 11, 12, .14), 0 2px 6px rgba(11, 11, 12, .06);
+  z-index: 20;
+}
+.menu button, .menu a {
+  display: block;
+  width: 100%;
+  font: 400 var(--t-sm)/1 var(--sans);
+  text-align: left;
+  border: 0;
+  border-radius: var(--r);
+  padding: 9px 10px;
+  background: none;
+  color: var(--ink);
+  text-decoration: none;
+  cursor: pointer;
+}
+.menu button:hover, .menu a:hover { background: var(--surface); border-color: transparent; color: var(--ink); }
+/* Leaving is last and marked, so it is not reached by accident. */
+.menu .danger { color: var(--err); }
 
 /* --- Buttons --- */
 
@@ -106,16 +153,6 @@ button.icon:hover:not(:disabled) { border-color: var(--rule-strong); }
   border-radius: 50%;
   background: var(--signal);
 }
-/* Contribute while this tab lends: a small live square. */
-#contribBtn.lending::before {
-  content: "";
-  display: inline-block;
-  width: 7px; height: 7px;
-  margin-right: 7px;
-  border-radius: 1px;
-  background: var(--signal);
-  vertical-align: 0;
-}
 
 /* --- The model bar (as on the setup screen) and the health line --- */
 
@@ -126,7 +163,7 @@ button.icon:hover:not(:disabled) { border-color: var(--rule-strong); }
   background: var(--bg);
 }
 .strip { max-width: 46rem; margin: 0 auto; }
-.strip-row { display: flex; align-items: baseline; gap: 6px 12px; min-width: 0; }
+.strip-head { display: flex; align-items: baseline; gap: 6px 12px; min-width: 0; margin-bottom: 10px; }
 .strip-label { font-size: var(--t-sm); font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 .strip-num { font: 500 16px/1 var(--sans); letter-spacing: -0.01em; color: var(--signal-ink); }
 #status { font: 400 var(--t-xs)/1 var(--mono); color: var(--faint); white-space: nowrap; }
@@ -151,7 +188,8 @@ button.icon:hover:not(:disabled) { border-color: var(--rule-strong); }
 @keyframes light { 0% { transform: scaleY(1.4); } 100% { transform: scaleY(1); } }
 @media (prefers-reduced-motion: reduce) { .map .cell.lit { animation: none; } }
 
-#health { font: 500 var(--t-xs)/1 var(--mono); text-transform: uppercase; letter-spacing: .06em; color: var(--ink-2); }
+#health { font: 400 var(--t-sm)/1 var(--sans); word-spacing: .08em; color: var(--ink-2); }
+#health b { font-weight: 600; color: var(--ink); }
 #health::before {
   content: "";
   display: inline-block;
@@ -159,7 +197,7 @@ button.icon:hover:not(:disabled) { border-color: var(--rule-strong); }
   margin-right: 8px;
   border-radius: 50%;
   background: var(--rule-strong);
-  vertical-align: 1px;
+  vertical-align: 0;
 }
 #health[data-state="ok"]::before { background: var(--ok); }
 #health[data-state="thin"]::before, #health[data-state="busy"]::before { background: #d08a1c; }
@@ -202,8 +240,7 @@ button.toggle:hover:not(:disabled) { color: var(--ink); }
 .lane-side { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; min-width: 0; }
 .model-row .map { margin: 0; }
 .model-row { margin-bottom: 4px; }
-.flag-row { margin-bottom: 8px; }
-.flag-row button.toggle { padding-right: 0; }
+.strip-head button.toggle { padding-right: 0; }
 .lane-track {
   width: 100%;
   height: 26px;
@@ -216,6 +253,9 @@ button.toggle:hover:not(:disabled) { color: var(--ink); }
 .lane-track:hover:not(:disabled), .lane.open .lane-track { background: var(--surface); }
 .lane-name { font: 400 var(--t-xs)/1 var(--mono); color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .lane-stat { font: 400 var(--t-xs)/1 var(--mono); color: var(--faint); }
+/* A word, not a third kind of number. Sans and a size down, so "8.0 GB
+   downloading" still fits the column beside the bar. */
+.lane-stat .loading { font: 400 11px/1 var(--sans); font-style: normal; color: var(--faint); }
 .lane.me .lane-name { color: var(--signal-ink); font-weight: 500; }
 .lane.me .lane-stat { color: var(--signal-ink); }
 .lane-rail { position: relative; display: block; height: 8px; }
@@ -243,6 +283,24 @@ button.toggle:hover:not(:disabled) { color: var(--ink); }
 .person { width: 12px; height: 14px; color: var(--rule-strong); }
 .person.me { color: var(--signal); }
 .lanes:empty::before { content: "Nobody is lending yet."; display: block; padding: 8px 0; font-size: var(--t-xs); color: var(--faint); }
+
+/* --- The download, across the top of the chat ---
+   One more line of the strip's grid, so its bar starts and ends with the
+   bars above it. peer.js's showDownload() shows and hides the whole block;
+   it is never in the transcript, so the conversation does not move. */
+
+#dl {
+  flex: none;
+  padding: 9px 16px 10px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--bg);
+}
+.dl-what { font: 400 var(--t-sm)/1 var(--sans); color: var(--ink-2); }
+#dl .track { height: 3px; border-radius: 2px; background: var(--surface-2); overflow: hidden; }
+#dl .track > i { display: block; height: 100%; width: 0; background: var(--signal); transition: width .2s var(--ease); }
+.dl-pct { font: 400 var(--t-xs)/1 var(--mono); color: var(--signal-ink); }
+.dl-under { margin-top: 6px; }
+.dl-detail { font: 400 var(--t-xs)/1 var(--mono); color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 /* --- Transcript --- */
 
@@ -272,6 +330,8 @@ button.toggle:hover:not(:disabled) { color: var(--ink); }
 .msg .meta { font: 400 var(--t-xs)/1.4 var(--mono); color: var(--faint); }
 .msg .meta:empty { display: none; }
 .msg .meta[title] { cursor: help; }
+/* "yours included", when this tab's GPU ran part of the reply. */
+.msg .meta .yours { color: var(--signal-ink); }
 .msg details.prof { font: 400 var(--t-xs)/1.4 var(--mono); color: var(--faint); }
 .msg details.prof summary { cursor: pointer; }
 .msg details.prof pre { margin: 6px 0; overflow-x: auto; white-space: pre; font-size: 11px; }
@@ -330,10 +390,9 @@ button.toggle:hover:not(:disabled) { color: var(--ink); }
 .share-name input { width: 12rem; font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--rule-strong); border-radius: var(--r); padding: 7px 9px; }
 .share .small { margin: 14px 0 0; font-size: var(--t-xs); font-family: var(--mono); }
 
-/* --- Boot progress --- */
+/* --- Boot progress (the dev page chat.html; peer.html uses #dl) --- */
 
 #boot { max-width: 46rem; width: 100%; margin: 0 auto; color: var(--muted); font-size: var(--t-sm); }
-#bootwhat { color: var(--ink); font-weight: 500; }
 #boot .bar { height: 3px; background: var(--surface-2); overflow: hidden; margin: 10px 0 8px; }
 #boot .bar > div { height: 100%; width: 0; background: var(--signal); transition: width .15s; }
 #bootnote { font: 400 var(--t-xs)/1.5 var(--mono); }
@@ -364,6 +423,64 @@ textarea {
 }
 textarea:focus { outline: none; border-color: var(--ink); }
 textarea:disabled { background: var(--surface); }
+
+/* --- Contributing, above the input: an on/off light ---
+   One row, two states. Lit, it takes the signal tint and the block fills;
+   unlit, the same row in grey with a hollow block, so starting to lend is a
+   change in place rather than a different layout. Everything on the line is
+   one size: the count stands out by weight and colour. The whole row is the
+   Your GPU drawer's button. */
+
+.mine {
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  width: 100%;
+  text-align: left;
+  padding: 13px 12px;
+  border: 0;
+  border-radius: var(--r);
+  background: var(--signal-soft);
+  color: var(--ink);
+  font: inherit;
+  transition: background .35s var(--ease);
+}
+.mine:hover { background: #ebdffb; border-color: transparent; }
+
+.lamp {
+  flex: none;
+  align-self: center;
+  width: 9px; height: 9px;
+  border-radius: 2px;
+  background: var(--signal);
+  box-shadow: 0 0 0 3px rgba(112, 34, 214, .14);
+  transition: background .35s var(--ease), box-shadow .35s var(--ease);
+}
+
+/* The three words are one sentence: tight gaps inside, the row's own spacing
+   outside. tabular-nums so the line does not shuffle as the count ticks. */
+.mine .said { display: inline-flex; align-items: baseline; gap: 5px; min-width: 0; }
+.mine .state { font: 500 var(--t-sm)/1 var(--sans); color: var(--signal-ink); }
+.mine .big { font: 600 var(--t-sm)/1 var(--sans); color: var(--signal-ink); font-variant-numeric: tabular-nums; }
+.mine .cap { font-size: 11px; color: var(--muted); }
+.mine .spacer { flex: 1; }
+.mine .rest { font: 400 var(--t-xs)/1 var(--mono); color: var(--faint); }
+.mine .go { font: 400 var(--t-xs)/1 var(--mono); color: var(--signal-ink); white-space: nowrap; }
+
+/* Off: the same row, light out. */
+.mine.off { background: var(--surface); }
+.mine.off:hover { background: var(--surface-2); }
+.mine.off .lamp { background: none; box-shadow: inset 0 0 0 1px var(--rule-strong); }
+.mine.off .state { color: var(--muted); }
+.mine.off .go { color: var(--ink-2); }
+
+/* The moment it comes on. */
+@keyframes lampOn {
+  0%   { box-shadow: 0 0 0 0 rgba(112, 34, 214, .55); }
+  100% { box-shadow: 0 0 0 3px rgba(112, 34, 214, .14); }
+}
+.mine.lit .lamp { animation: lampOn .6s var(--ease); }
+@media (prefers-reduced-motion: reduce) { .mine.lit .lamp { animation: none; } }
 
 .settings {
   display: flex;
@@ -454,11 +571,17 @@ textarea:disabled { background: var(--surface); }
 .field select { width: 9.5rem; }
 .field input:focus, .field select:focus { outline: none; border-color: var(--ink); }
 
-/* Contribute: lending state, and the numbers as label/value rows. */
-.lend-state { margin: 0 0 6px; font-size: 14px; }
-.lend-actions { display: flex; gap: 8px; margin-top: 8px; }
+/* Your GPU: how much is lent, then the numbers as label/value rows. */
+.drawer-state { margin: 0 0 16px; font-size: var(--t-sm); color: var(--ink-2); }
+.drawer-state b { font-weight: 600; color: var(--ink); }
+.lend-amount { display: flex; align-items: baseline; justify-content: space-between; gap: 16px; margin: 0 0 12px; }
+.lend-amount .name { font-size: 14px; }
+.lend-amount .num { font: 600 var(--t-md)/1 var(--sans); letter-spacing: -0.02em; }
+.lend-scale { display: flex; justify-content: space-between; margin-top: 9px; font: 400 var(--t-xs)/1 var(--mono); color: var(--faint); }
+.lend-note { margin: 14px 0 0; font-size: var(--t-xs); line-height: 1.45; color: var(--muted); }
+.lend-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
 .kv { margin: 0; }
-.kv > div { display: flex; justify-content: space-between; align-items: baseline; gap: 16px; padding: 7px 0; border-bottom: 1px solid var(--rule); }
+.kv > div { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 2px 16px; padding: 7px 0; border-bottom: 1px solid var(--rule); }
 .kv > div:last-child { border-bottom: 0; }
 .kv dt { font-size: var(--t-sm); color: var(--muted); flex: none; }
 .kv dd { margin: 0; font: 400 var(--t-xs)/1.4 var(--mono); text-align: right; overflow-wrap: anywhere; }
@@ -600,10 +723,9 @@ body.chats-docked { padding-left: var(--side); }
 @media (max-width: 760px) {
   header { padding: 8px 12px; gap: 6px 8px; }
   header .model { display: none; }
-  #newmesh { font-size: 0; padding: 9px 12px; }
-  #newmesh::after { content: "New cluster"; font-size: var(--t-sm); }
   #mapstrip { padding: 8px 12px; }
-  .strip-row { flex-wrap: wrap; }
+  .strip-head { flex-wrap: wrap; }
+  #dl { padding: 8px 12px 9px; }
   footer { padding: 10px 12px; }
   .drawer { width: 100vw; border-left: 0; }
   .drawer.left { border-right: 0; }
@@ -615,10 +737,15 @@ body.chats-docked { padding-left: var(--side); }
   .lane-grid > :first-child { justify-self: start; text-align: left; }
   .lane-grid > :nth-child(2):not(:last-child) { grid-column: 1 / -1; grid-row: 2; }
   .lane-grid > :last-child:not(:first-child) { grid-column: 2; grid-row: 1; justify-self: end; text-align: right; }
-  .flag-row.lane-grid { display: block; }
-  .flag-row > span:empty { display: none; }
+  /* The detail sits under the bar already; no need for the grid's columns. */
+  .dl-under { display: block; }
   .lane-track { height: auto; padding: 4px 0; }
   .strip-gb { display: none; }
+  /* The light, the count and the way in survive; the ms drops. */
+  .mine { gap: 7px; }
+  .mine .rest { display: none; }
+  .mine .go { font-size: 0; }
+  .mine .go::after { content: "\203a"; font-size: 15px; }
 }
 .person { fill: currentColor; stroke: none; }
 
