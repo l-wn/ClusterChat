@@ -25,6 +25,11 @@ import { blockBytes, endBytes, mtpBytes, floorBlocks, positions, describeRange, 
 // downloads and warm-ups do not compete with live chats.
 const GROWTH_QUIET_MS = 2000;
 
+// How often a growth download reports progress. Background growth is the only
+// download running once serve() has resolved, so without this the page has
+// nothing to show while 30-odd positions come down one at a time.
+const GROW_PROGRESS_MS = 250;
+
 // A growth step whose download fails is retried after this long, doubling up
 // to the second value, while the tab keeps serving what it has. Only a GPU out
 // of memory or a permanent failure (a 4xx) ends growth.
@@ -295,7 +300,8 @@ export class Engine {
             if (autoGrow) {
                 this.#growClaim(device, d).catch((err) => console.error('growClaim:', err));
             }
-            return { role: 'worker', held: [lo, hi], note, error: false, code: 'lending' };
+            return { role: 'worker', held: [lo, hi], note, error: false, code: 'lending',
+                     grows: autoGrow };
         } catch (err) {
             // The GPU was lost while filling the claim. #onLost() has given
             // the claim back and is reloading or has given up.
@@ -618,9 +624,27 @@ export class Engine {
     async #loadForGrowth(device, d, p, r) {
         const L = d.n_layer;
         let wait = this.#growRetryMs[0];
+        // Throttled: onBytes fires per stream chunk, and every event redraws
+        // the page. The first and last bytes of a file always report, so a
+        // download is visible the moment it starts and reads 100% when it ends.
+        let last = 0;
+        const step = (b, t) => {
+            const now = performance.now();
+            if (b > 0 && b < t && now - last < GROW_PROGRESS_MS) return;
+            last = now;
+            // One piece at a time, so the bar is this piece's own download
+            // rather than a share of the model: it fills, the piece lands, and
+            // the next piece starts it again.
+            this.#emit('progress', {
+                fraction: t ? b / t : 0,
+                text: t ? `${describeRange(p, p + 1, L)}: ${(b / 2 ** 20).toFixed(0)}/` +
+                          `${(t / 2 ** 20).toFixed(0)} MiB`
+                        : `fetching ${describeRange(p, p + 1, L)}…`,
+            });
+        };
         for (;;) {
             try {
-                return await this.#load(device, d, p);
+                return await this.#load(device, d, p, step);
             } catch (err) {
                 if (err.permanent || /ran out of memory/.test(err.message) || this.#runner !== r) throw err;
                 this.#emit('status', {

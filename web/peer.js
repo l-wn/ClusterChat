@@ -138,6 +138,16 @@ function setBusy(busy) {
     if (!busy) ui.input.focus();
 }
 
+// The download's progress box. It is shown from the first byte until this tab
+// stops downloading, and growth can pause under a VRAM limit and start again
+// when it is raised, so the box is taken out and put back rather than dropped
+// for good. It is the first thing in the transcript (render() keeps it there).
+function showBoot(on) {
+    if (!ui.boot) return;
+    if (!on) ui.boot.remove();
+    else if (!ui.boot.isConnected) ui.messages.prepend(ui.boot);
+}
+
 // Engine events, translated into DOM updates.
 function handleEngineEvent(type, detail) {
     switch (type) {
@@ -146,6 +156,10 @@ function handleEngineEvent(type, detail) {
             refresh();
             break;
         case 'progress':
+            // Background growth reports through here too, on the same bar: the
+            // box is kept after the first claim is filled, so one bar runs from
+            // the embedding to the last piece this tab ends up holding.
+            if (!ui.boot?.isConnected) break;
             ui.bootnote.textContent = detail.text;
             if (detail.fraction != null) ui.bootbar.style.width = `${detail.fraction * 100}%`;
             break;
@@ -156,12 +170,25 @@ function handleEngineEvent(type, detail) {
                 case 'limit':
                     console.info(detail.text);
                     note(`Limit reached: you're lending your full ${Math.round(detail.limit / 2 ** 30)} GB.`);
+                    showBoot(false);
+                    break;
+                case 'limit-room':
+                    console.info(detail.text);
+                    showBoot(true);
                     break;
                 case 'grow-stopped':
                     grewTo(detail.cause, detail.text);
+                    showBoot(false);
+                    break;
+                // Growth stopped on its own (this GPU's ceiling). Not a
+                // problem to report, but the download is over.
+                case 'ceiling':
+                    console.info(detail.text);
+                    showBoot(false);
                     break;
                 case 'whole':
                     note("You're holding the whole model.");
+                    showBoot(false);
                     break;
                 case 'gpu-lost':
                     console.error(detail.text);
@@ -721,7 +748,7 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
         room = await openRoom(secret, { model: inviteModel(location.hash) });
     } catch (err) {
         ui.title.textContent = 'ClusterChat';
-        ui.boot.remove();
+        showBoot(false);
         showMesh(null);
         problem('BAD_LINK', err);
         setStatus('bad invite link', 'err');
@@ -750,7 +777,7 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
     } catch (err) {
         console.warn('connect failed:', err);
         ui.title.textContent = 'ClusterChat';
-        ui.boot.remove();
+        showBoot(false);
         problem('NO_CONNECTION', err);
         refresh();
         return;
@@ -798,7 +825,7 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
         at = placement(manifest);
     } catch (err) {
         console.warn('placement:', err);
-        ui.boot.remove();
+        showBoot(false);
         problem('LEND_FAILED', err);
         return;
     }
@@ -814,7 +841,7 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
     engine.net.enter(contribute).then(({ ok }) => { if (!ok) problem('DEMO_FULL'); });
     ui.vramlimit.value = limit;
     if (!contribute) {
-        ui.boot.remove();
+        showBoot(false);
         lending = false;
         refresh();
         return;
@@ -825,8 +852,13 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
     applyVramLimit();
     // Not awaited. serve() reports its own failures; the catch is for bugs.
     engine.serve({ blocks: blocksParam(), vram: vramParam(), at, slowMs: slowMs() })
-        .then(({ note: msg, code, cause }) => {
-            ui.boot.remove();
+        .then(({ note: msg, code, cause, grows }) => {
+            // serve() resolves once the first claim is filled, but a tab that
+            // grows keeps downloading a piece at a time for a good while after
+            // that. The box stays until growth ends (the 'status' codes below
+            // remove it), so the bar does not vanish mid-download.
+            if (grows) ui.bootwhat.textContent = 'Downloading the model…';
+            else showBoot(false);
             if (code === 'grow-stopped') grewTo(cause, msg);
             else if (code === 'lend-failed') { console.warn(msg); problem(lendProblem(cause), cause); }
             else console.info(msg);
