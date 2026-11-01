@@ -419,11 +419,13 @@ export class Engine {
                 await new Promise((r) => setTimeout(r, slowMs));
             }
             const what = describeRange(p, p + 1, L);
+            // This piece's own share, like a growth step's (#loadForGrowth),
+            // so the percentage and the MiB beside it describe the same file.
             const step = (b, t) => {
                 this.#emit('progress', {
                     text: t ? `${what}: ${(b / 2 ** 20).toFixed(0)}/${(t / 2 ** 20).toFixed(0)} MiB`
                             : `fetching ${what}…`,
-                    fraction: (p - lo + (t ? b / t : 0)) / (hi - lo),
+                    fraction: t ? b / t : 0,
                 });
             };
             step(0, 0);
