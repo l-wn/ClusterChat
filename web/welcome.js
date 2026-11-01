@@ -152,10 +152,12 @@ export function askWelcome() {
         }
 
         // GB of the model held with this tab, of the whole model.
+        // Only the percentage until the manifest gives the sizes.
         const gbAt = (x) => info.pieceGb?.[x] ?? info.modelGb / L;
         let haveGb = 0;
         for (let x = 0; x < L; x++) if (held[x] || (x >= lo && x < hi)) haveGb += gbAt(x);
-        $('modelPct').textContent = `${pct(withYou)}% (${Math.round(haveGb)}/${Math.round(info.modelGb)} GB)`;
+        $('modelPct').textContent = info.modelGb == null ? `${pct(withYou)}%`
+            : `${pct(withYou)}% (${Math.round(haveGb)}/${Math.round(info.modelGb)} GB)`;
         barEl.classList.toggle('full', withYou === L);
         const n = hi - lo;
         // Missing pieces another computer has claimed and is downloading.

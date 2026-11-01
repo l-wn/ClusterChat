@@ -3,8 +3,12 @@
 // slider; nobody else is in the cluster yet, so the preview grows outwards
 // from the middle. "Create cluster" saves the choices, makes the invite and
 // opens the chat in it, past the pre-join screen.
+//
+// The models on offer are checkpoint.json's `models`. The chosen one goes in
+// the invite link (`&model=<id>`, web/room.js), so the cluster keeps it even
+// after the signaling server restarts.
 
-import { newSecret, cleanName, nameKey, creatorKey, chatsKey, ctxKey } from './room.js';
+import { newSecret, cleanName, nameKey, creatorKey, chatsKey, ctxKey, LEGACY_MODEL } from './room.js';
 import { storedBytes, costDims, modelBytes, CONTEXTS, DEFAULT_CTX } from './split.js';
 import { saveChoice, joinedKey } from './welcome.js';
 import { lendSlider, previewRange, cellsFor } from './lend.js';
@@ -15,8 +19,12 @@ import { lendSlider, previewRange, cellsFor } from './lend.js';
 const FIXED_GB = 1.2;
 
 const $ = (id) => document.getElementById(id);
-let model = { L: 66, gb: 27 };      // replaced by the checkpoint's numbers
-let dims = null;                    // the checkpoint's, for pricing each context
+let model = { L: 66, gb: 27 };      // replaced by the chosen checkpoint's numbers
+let dims = null;                    // the chosen checkpoint's, for pricing each context
+let chosen = LEGACY_MODEL;          // the chosen model's id
+// Every model offered: { id, name, dims, L }, dims null until its manifest
+// has loaded.
+let offered = [];
 
 // The chat lengths a cluster can have, with what the whole model then takes.
 const k = (n) => `${n / 1024}K`;
@@ -33,10 +41,18 @@ fillCtx();
 $('ctx').addEventListener('change', () => { setModelSize(); render(slider.value); });
 
 // The model's size at the chosen context: weights plus every block's KV.
+// Every tile shows its own model's, at that context or its longest.
 function setModelSize() {
+    const ctx = Number($('ctx').value) || DEFAULT_CTX;
+    const gbOf = (d) => modelBytes(d, { nMax: Math.min(ctx, d.n_pos || ctx) }) / 2 ** 30;
+    for (const m of offered) {
+        const need = document.querySelector(`[data-need="${m.id}"]`);
+        if (m.dims && need) need.textContent = `${Math.round(gbOf(m.dims))} GB`;
+    }
     if (!dims) return;
-    model.gb = modelBytes(dims, { nMax: Number($('ctx').value) || DEFAULT_CTX }) / 2 ** 30;
-    $('modelNeed').textContent = `${Math.round(model.gb)} GB`;
+    model.gb = gbOf(dims);
+    const fallback = $('modelNeed');
+    if (fallback) fallback.textContent = `${Math.round(model.gb)} GB`;
 }
 
 function render(gb) {
@@ -46,10 +62,13 @@ function render(gb) {
     const [lo, hi] = previewRange([], new Int32Array(L), L, 1, n) ?? [0, 0];
     cells.forEach((c, x) => { c.dataset.state = x >= lo && x < hi ? 'you' : 'empty'; });
     const pct = Math.round(((hi - lo) / L) * 100);
-    $('modelPct').textContent = `${pct}% (${Math.round(((hi - lo) / L) * model.gb)}/${Math.round(model.gb)} GB)`;
+    // Only the percentage until a manifest gives the sizes.
+    $('modelPct').textContent = !dims ? `${pct}%`
+        : `${pct}% (${Math.round(((hi - lo) / L) * model.gb)}/${Math.round(model.gb)} GB)`;
     $('previewBar').classList.toggle('full', hi - lo === L);
     $('previewCaption').textContent = !gb ? ''
         : pct >= 100 ? 'You would hold the whole model on your own.'
+        : !dims ? `You'd hold about ${pct}%. Invite people to lend the rest.`
         : `You'd hold about ${pct}%. Invite people to lend the rest, about ${Math.ceil(model.gb * (1 - pct / 100))} GB.`;
 }
 
@@ -61,20 +80,74 @@ const slider = lendSlider({
 render(slider.value);
 
 
-// The model's size and piece count, from the checkpoint the cluster runs.
+// Without checkpoint.json, the page's own tile keeps its rough figure.
+function noSizes() {
+    $('modelNeed').textContent = '27 GB';
+}
+
+// Make model `id` the cluster's: its size, piece count and context lengths.
+function choose(id) {
+    const m = offered.find((x) => x.id === id);
+    if (!m) return;
+    chosen = id;
+    $('modelLabel').textContent = m.name;
+    // A model whose manifest did not load shows percentages only.
+    dims = m.dims;
+    if (m.dims) model = { L: m.L, gb: model.gb };
+    fillCtx();
+    setModelSize();
+    render(slider.value);
+}
+
+// A tile for each model checkpoint.json offers, replacing the page's own
+// (Qwen3.8-27B), which stays if the file cannot be read.
+function showModels() {
+    const tiles = offered.map((m) => {
+        const label = document.createElement('label');
+        label.className = 'model-option';
+        const input = Object.assign(document.createElement('input'),
+            { type: 'radio', name: 'model', value: m.id, checked: m.id === chosen });
+        input.addEventListener('change', () => input.checked && choose(m.id));
+        const name = Object.assign(document.createElement('span'),
+            { className: 'model-option-name', textContent: m.name });
+        const meta = Object.assign(document.createElement('span'), { className: 'model-option-meta' });
+        const need = Object.assign(document.createElement('b'), { textContent: '…' });
+        need.dataset.need = m.id;
+        meta.append('Needs about ', need, ' across your group');
+        label.append(input, name, meta);
+        return label;
+    });
+    $('modelList').replaceChildren(...tiles);
+}
+
 (async () => {
+    let cfg;
     try {
-        const { url } = await (await fetch('/checkpoint.json')).json();
-        const m = await (await fetch(`${url.replace(/\/$/, '')}/manifest.json`)).json();
-        if (!storedBytes(m)) return;
-        dims = { ...costDims(m), n_pos: m.n_pos };
-        model = { L: m.n_layer + 2, gb: model.gb };
-        fillCtx();
-        setModelSize();
-        render(slider.value);
+        cfg = await (await fetch('/checkpoint.json')).json();
     } catch (err) {
         console.info('create: using the default model size', err);
+        noSizes();
+        return;
     }
+    const list = Array.isArray(cfg.models) && cfg.models.length ? cfg.models
+        : [{ id: LEGACY_MODEL, name: 'Qwen3.8-27B', url: cfg.url }];
+    offered = list.filter((m) => typeof m?.id === 'string' && typeof m.url === 'string')
+        .map((m) => ({ id: m.id, name: m.name ?? m.id, url: m.url.replace(/\/$/, ''), dims: null, L: 0 }));
+    if (!offered.length) return noSizes();
+    chosen = offered.some((m) => m.id === LEGACY_MODEL) ? LEGACY_MODEL : offered[0].id;
+    showModels();
+    await Promise.all(offered.map(async (m) => {
+        try {
+            const man = await (await fetch(`${m.url}/manifest.json`)).json();
+            if (!storedBytes(man)) return;
+            m.dims = { ...costDims(man), n_pos: man.n_pos };
+            m.L = man.n_layer + 2;
+        } catch (err) {
+            console.info(`create: no manifest for ${m.id}`, err);
+        }
+    }));
+    choose(chosen);
+    setModelSize();
 })();
 
 $('create').addEventListener('click', () => {
@@ -89,5 +162,7 @@ $('create').addEventListener('click', () => {
     store(() => sessionStorage.setItem(ctxKey(secret), $('ctx').value));
     store(() => sessionStorage.setItem(nameKey(secret), cleanName($('name').value)));
     saveChoice(gb ? { contribute: true, limit: `${gb}gb` } : { contribute: false, limit: '' });
-    location.href = `/chat#mesh=${secret}`;
+    // LEGACY_MODEL's links name no model, as every link did before there
+    // was a choice (web/room.js).
+    location.href = `/chat#mesh=${secret}${chosen !== LEGACY_MODEL ? `&model=${chosen}` : ''}`;
 });

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="referrer" content="no-referrer" />
   <title>Start a private cluster · ClusterChat</title>
-  <meta name="description" content="Start a private ClusterChat cluster and invite your group to run a 27B model together." />
+  <meta name="description" content="Start a private ClusterChat cluster and invite your group to run an open model together." />
   <meta name="theme-color" content="#ffffff" />
   <link rel="icon" href="/favicon.svg?v=3" type="image/svg+xml" />
   <link rel="preload" href="/fonts/instrument-sans.woff2" as="font" type="font/woff2" crossorigin />
@@ -42,14 +42,17 @@
           <h2 class="step-title">Pick a model</h2>
           <p class="step-desc">Bigger models need more graphics card memory from your group.</p>
         </div>
-        <!-- One model for now; more would be more tiles, each with its need. -->
+        <!-- A tile per model in checkpoint.json's `models`, built by
+             create.js. This one stays if that file cannot be read. -->
         <fieldset class="model-list">
           <legend class="sr">Model</legend>
+          <div class="model-tiles" id="modelList">
           <label class="model-option">
             <input type="radio" name="model" value="qwen3.8-27b" checked>
             <span class="model-option-name">Qwen3.8-27B</span>
-            <span class="model-option-meta">Needs about <b id="modelNeed">27 GB</b> across your group</span>
+            <span class="model-option-meta">Needs about <b id="modelNeed">…</b> across your group</span>
           </label>
+          </div>
         </fieldset>
       </li>
 

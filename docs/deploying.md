@@ -222,6 +222,31 @@ the checkpoint once at boot, and fetches its manifest for the model's depth.
 Caddy revalidates `checkpoint.json` on every load, so browsers pick it up
 without a hard reload.
 
+Private clusters can run other models. List them in `checkpoint.json`; `url`
+stays the public demo's model:
+
+```json
+{
+  "url": "https://<weights-host>/qwen3.8-27b-q8",
+  "models": [
+    { "id": "qwen3.8-27b", "name": "Qwen3.8-27B", "url": "https://<weights-host>/qwen3.8-27b-q8" },
+    { "id": "qwen3.5-4b", "name": "Qwen3.5-4B", "url": "https://<weights-host>/qwen3.5-4b-q8" }
+  ]
+}
+```
+
+The create page shows one option per entry, and invite links carry the id
+(`#mesh=<code>&model=<id>`), so never rename or remove an id that links may
+still name: those links would be refused. A link with no model runs
+`qwen3.8-27b`. The server reads every listed manifest at boot and leaves out
+any it cannot fetch.
+
+**Never overwrite a published weights directory.** Browsers cache the files by
+URL, so changing them in place can mix two conversions in one tab. Upload a new
+conversion to a new directory (`<name>-v2`) and point the entry's `url` at it.
+Tabs already in a cluster then stop with "this cluster's model changed. Reload
+the page." the next time they reconnect, instead of serving stale blocks.
+
 ## Configuration
 
 The deploy reads `~/.config/clusterchat/env` (mode 600, outside the repo),
@@ -246,7 +271,8 @@ Signaling server environment:
 | `HOST` | 127.0.0.1 | `0.0.0.0` to accept sockets directly rather than only through the proxy |
 | `ALLOWED_ORIGINS` | `https://clusterchat.io` | comma-separated page origins that may open a socket; any `localhost` port is always allowed |
 | `MAX_CONN_PER_IP` | 16 | sockets per client address, by Cloudflare's `CF-Connecting-IP` (uncapped without it) |
-| `WEIGHTS_URL` | from `checkpoint.json` | override the checkpoint URL |
+| `CHECKPOINT` | `./checkpoint.json` | the checkpoint file; `/weights/...` URLs in it are read from disk next to it |
+| `WEIGHTS_URL` | from `checkpoint.json` | override the global mesh's checkpoint URL |
 | `MANIFEST` | `./<url>/manifest.json` for a same-origin URL | the server's own copy of the manifest |
 | `N_LAYER`, `MIN_BLOCKS` | from the manifest | override the model depth / minimum range |
 | `TURN_SECRET`, `TURN_URLS` | unset | your own TURN server: coturn's `static-auth-secret`, and its comma-separated `turn:` URLs. Each peer gets its own 24-hour credential |

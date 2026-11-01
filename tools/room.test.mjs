@@ -7,8 +7,8 @@
 import { webcrypto } from 'node:crypto';
 globalThis.crypto ??= webcrypto;
 
-import { newSecret, inviteUrl, readInvite, inviteFrom, cleanName, NAME_MAX, openRoom, roomKey,
-         GLOBAL, SECRET_BYTES, unb64url } from '../web/room.js';
+import { newSecret, inviteUrl, readInvite, inviteFrom, inviteModel, cleanName, NAME_MAX, openRoom,
+         roomKey, GLOBAL, SECRET_BYTES, unb64url, LEGACY_MODEL } from '../web/room.js';
 
 let pass = 0, fail = 0;
 const ok = (name, cond, detail = '') => {
@@ -154,6 +154,40 @@ console.log('\nhistoryTag: the scope saved chats are filed under');
         .filter((v) => v.includes(a.historyTag) || a.historyTag.includes(v));
     eq('and shares nothing with the secret, the join token, the tag or the room key', leaks, []);
     eq('the global mesh is "global"', GLOBAL.historyTag, 'global');
+}
+
+console.log('\nthe model in an invite link');
+{
+    const s = newSecret();
+    const base = { href: 'https://chat.example/chat?gb=4' };
+    const url = inviteUrl(s, base, 'Ana', 'qwen3.5-4b');
+    eq('a link carries its model before the name', url,
+        `https://chat.example/chat#mesh=${s}&model=qwen3.5-4b&from=Ana`);
+    eq('the secret reads back', readInvite(new URL(url).hash), s);
+    eq('and the model', inviteModel(new URL(url).hash), 'qwen3.5-4b');
+    eq('and the name', inviteFrom(new URL(url).hash), 'Ana');
+    eq('a model without a name', inviteModel(`#mesh=${s}&model=qwen3.5-4b`), 'qwen3.5-4b');
+    eq('a link with no model has none', inviteModel(`#mesh=${s}&from=Ana`), null);
+    eq('nor does the global mesh', inviteModel(''), null);
+    eq('a link for LEGACY_MODEL leaves it out', inviteUrl(s, base, '', null), `https://chat.example/chat#mesh=${s}`);
+    throws('a damaged model id throws', () => readInvite(`#mesh=${s}&model=Qwen 4B`));
+    throws('so does an empty one', () => readInvite(`#mesh=${s}&model=`));
+    throws('and a model after the name', () => readInvite(`#mesh=${s}&from=Ana&model=qwen3.5-4b`));
+
+    // Pinned like the legacy token above: a 4B link already shared must lead
+    // to the same room after a deploy.
+    const zero = await openRoom('AAAAAAAAAAAAAAAAAAAAAA', { model: 'qwen3.5-4b' });
+    eq('the join token with a model is pinned', zero.joinToken, 'I_r9yH7TmczyjBdBqRENsfmrilf3Tx59hBA6CnfNcKo');
+    eq('a room knows its model', zero.model, 'qwen3.5-4b');
+    const legacy = await openRoom('AAAAAAAAAAAAAAAAAAAAAA', { model: LEGACY_MODEL });
+    eq('naming LEGACY_MODEL gives the legacy token', legacy.joinToken, 'HtNrfd6FlO-dR6weiX6alidQIT07Vm-KqR71uLhVuZQ');
+    eq('and no model', legacy.model, null);
+    const [a, b] = await Promise.all([openRoom(s, { model: 'qwen3.5-4b' }), openRoom(s, { model: 'other' })]);
+    ok('another model is another room', a.joinToken !== b.joinToken);
+    ok('the history tag does not depend on it', a.historyTag === b.historyTag);
+    let refused = false;
+    try { await openRoom(s, { model: 'Bad Id' }); } catch { refused = true; }
+    ok('openRoom rejects a model id that is not one', refused);
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

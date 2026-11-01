@@ -61,8 +61,8 @@ web/profile.js        per-hop timing summary for the mesh page
 The handshake (`signal-server.js`, `net.js`):
 
 ```
-peer   -> join     { v, room, chats? }      first, always: a join token, or null (global)
-server -> welcome  { id, blocks, positions, minBlocks, weightsUrl, private, maxChats, ice, peers }
+peer   -> join     { v, room, model?, chats? }  first, always: a join token, or null (global)
+server -> welcome  { id, blocks, positions, minBlocks, weightsUrl, model, private, maxChats, ice, peers }
 peer   -> capacity { cap, lo?, hi? }
 server -> assign   { lo, hi }               null/null for a peer holding nothing
 peer   -> have     { have }                 downloaded and warmed up to here
@@ -102,7 +102,8 @@ its Runner with it once, in `serve()`. A different number in a later welcome
 Peers need not agree on it: each sizes only its own memory.
 
 Nothing is sent to a socket until its `join`; one that sends anything else, or
-nothing for 10 s, is closed with code 4001, and a full mesh with 4002. A join
+nothing for 10 s, is closed with code 4001, a full mesh with 4002, and a join
+naming a model the server does not offer with 4003. A join
 whose `v` is not `PROTOCOL` (`split.js`) is closed with 4001 too, so a mesh
 never mixes pages that speak different versions of the messages below. The
 page reports both instead of retrying.
@@ -116,7 +117,17 @@ given up on cannot open a second, orphaned replacement.
 
 The server reads `checkpoint.json` (or `WEIGHTS_URL`), loads that checkpoint's
 manifest for the model depth and dimensions, and sends the weights URL to every
-peer, so the whole mesh runs one checkpoint.
+peer, so the whole mesh runs one checkpoint. Its `models` list adds the models a
+private mesh can run (see Private meshes). Each room runs one model for its
+whole life, and its welcome carries that model's depth, minimum range and
+weights URL.
+
+**A reconnect never changes model.** A tab keeps the weights URL of its first
+welcome. If a later welcome (after a server restart or a redeploy) names
+another, the tab stops with "this cluster's model changed. Reload the page."
+rather than reclaim a range whose VRAM holds another model's blocks. The files
+under a published weights URL must never change either: browsers cache them by
+URL, so a new conversion goes in a new directory.
 
 A tab goes through three stages, each on its own schedule (`Engine`):
 
@@ -164,7 +175,8 @@ service. It cannot read a prompt, open a link, or sit between two peers:
   `referrer: no-referrer`.
 - The page derives two keys from it with HKDF-SHA-256 (salt
   `chattorrent/mesh/v1`):
-  - the **join token** (`info "join"`), sent in `join`. Everyone with the invite
+  - the **join token** (`info "join"`, or `"join/<model id>"` for a link that
+    names a model), sent in `join`. Everyone with the invite
     derives the same one; the server files the room under SHA-256 of it and
     logs only the first six hex characters (the *tag* the page also shows, so
     members can compare);
@@ -178,7 +190,18 @@ service. It cannot read a prompt, open a link, or sit between two peers:
   residual stream or a token takes is to a peer holding the invite. TURN
   relays see DTLS ciphertext.
 
-**Failing closed.** A `#` that is not exactly `mesh=<22 base64url>` stops the
+**The model.** The create page offers `checkpoint.json`'s `models`, and the
+link carries the choice: `#mesh=<secret>&model=<id>[&from=<name>]`. A link
+with no `&model=` runs `LEGACY_MODEL` (`qwen3.8-27b`, what every link ran
+before there was a choice), whatever the server's default becomes. Every join
+sends the link's model, so a room the server forgot in a restart is recreated
+with it by whoever arrives first. The model is also part of the join token, so
+a link whose `&model=` was edited or removed opens another, empty room and can
+never switch a running one. The server refuses a model it does not offer, and
+a join whose model differs from its room's, with 4003.
+
+**Failing closed.** A `#` that is not exactly `mesh=<22 base64url>` (optionally
+followed by `&model=<id>` and `&from=<name>`) stops the
 page before any socket opens: it never falls back to the global mesh. The
 welcome says whether the mesh is private, and a Mesh that asked for one kind
 and was given the other stops for good. `join` is resent on every reconnect. A

@@ -1,3 +1,7 @@
 {
-  "url": "https://weights.clusterchat.io/qwen3.8-27b-q8"
+  "url": "https://weights.clusterchat.io/qwen3.8-27b-q8",
+  "models": [
+    { "id": "qwen3.8-27b", "name": "Qwen3.8-27B", "url": "https://weights.clusterchat.io/qwen3.8-27b-q8" },
+    { "id": "qwen3.5-4b", "name": "Qwen3.5-4B", "url": "https://weights.clusterchat.io/qwen3.5-4b-q8" }
+  ]
 }

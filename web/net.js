@@ -68,9 +68,11 @@ export function relayOnlySdp(sdp) {
 }
 
 // Close codes from signal-server.js that a reconnect cannot fix: a join the
-// server did not accept (this page is older than the server), and a full mesh.
+// server did not accept (this page is older than the server), a full mesh, and
+// a link naming a model the server does not offer.
 const REFUSED = { 4001: 'the signaling server did not accept this page. Reload it.',
-                  4002: 'this cluster is full' };
+                  4002: 'this cluster is full',
+                  4003: "this link's model is not offered by this server" };
 
 // --- Framing ---
 
@@ -373,6 +375,7 @@ export class Mesh {
     #backoff = RECONNECT_MIN_MS;
     #closed = false;            // stop() was called; do not reconnect
     #rejoining = false;         // this socket is a reconnect, not a first join
+    #firstUrl;                  // the first welcome's weightsUrl (undefined before it)
 
     // Open the signaling socket. Called again after every drop.
     //
@@ -405,7 +408,10 @@ export class Mesh {
             if (gone || ws !== this.ws) return;
             this.#kick();
             // `join` is the first message on every socket: it names the mesh.
+            // `model` comes from the invite link, so the server can recreate
+            // the room with its model after a restart.
             this.#ws({ type: 'join', v: PROTOCOL, room: this.room.joinToken,
+                       ...(this.room.model && { model: this.room.model }),
                        ...(this.chats && { chats: this.chats }),
                        ...(this.askSessions && { sessions: this.askSessions }),
                        ...(this.askCtx && { ctx: this.askCtx }) });
@@ -860,6 +866,15 @@ export class Mesh {
                     : 'the signaling server put this tab in a private cluster it did not ask for');
                 return;
             }
+            // The weights this tab loaded (manifest, tokenizer, and the
+            // blocks in its VRAM) belong to the first welcome's checkpoint.
+            // After a reconnect to a server that runs another one, reclaiming
+            // the range would serve another model's layers: stop instead.
+            const url = m.weightsUrl ? new URL(m.weightsUrl, this.server).href : null;
+            if (this.#firstUrl !== undefined && this.#firstUrl !== url) {
+                this.#stopFor("this cluster's model changed. Reload the page.");
+                return;
+            }
             // Joined: clear the welcome timeout and reset the backoff. Reset
             // here and not on `open`, so a server that accepts sockets and
             // never welcomes them is still backed off.
@@ -886,7 +901,7 @@ export class Mesh {
                 minBlocks: m.minBlocks, ice: m.ice ?? ICE,
                 // Null if the server does not send one. The loader then uses
                 // /checkpoint.json. A relative URL is on the server.
-                weightsUrl: m.weightsUrl ? new URL(m.weightsUrl, this.server).href : null,
+                weightsUrl: (this.#firstUrl ??= url),
                 maxChats: m.maxChats ?? null,
                 sessions: this.sessions ?? sessions,
                 ctx: this.ctx ?? ctx,

@@ -6,12 +6,13 @@
 
 import { dimsFromManifest } from './model/loader.js';
 import { Engine, ContextFullError } from './engine.js';
-import { positions, coverage, holders, holding, describeRange, storedBytes } from './split.js';
+import { positions, coverage, holders, holding, describeRange, storedBytes, costDims, blockBytes,
+         endBytes, mtpBytes } from './split.js';
 import { chatFormat, stopRe } from './prompt.js';
 import { runTurn } from './turn.js';
 import { makeMessage } from './message.js';
 import { summarize, formatLine, formatText } from './profile.js';
-import { readInvite, openRoom, inviteUrl, cleanName, NAME_MAX, nameKey, creatorKey, chatsKey, sessionsKey, ctxKey } from './room.js';
+import { readInvite, inviteModel, openRoom, inviteUrl, cleanName, NAME_MAX, nameKey, creatorKey, chatsKey, sessionsKey, ctxKey } from './room.js';
 import { saveChoice } from './welcome.js';
 import { PROBLEMS, classify, report } from './errors.js';
 import { openHistory, idbBackend, memoryBackend, newRecord, groupByDay } from './history.js';
@@ -278,15 +279,17 @@ function refresh() {
     showHealth(net, cov);
     showLending();
     if (net.positions) {
-        // GB of the model held, of the whole model.
+        // GB of the model held, of the whole model. Left out until the
+        // manifest gives the sizes, rather than showing a guess first.
         let held = 0, total = 0;
         for (let x = 0; x < cov.total; x++) {
-            const b = posBytes?.[x] ?? (27 * 2 ** 30) / cov.total;
+            const b = posBytes?.[x] ?? 0;
             total += b;
             if (cov.depths[x]) held += b;
         }
         ui.modelHeld.textContent = `${Math.round((cov.covered / cov.total) * 100)}%`;
-        ui.modelGb.textContent = `(${Math.round(held / 2 ** 30)}/${Math.round(total / 2 ** 30)} GB)`;
+        ui.modelGb.textContent = posBytes
+            ? `(${Math.round(held / 2 ** 30)}/${Math.round(total / 2 ** 30)} GB)` : '';
     } else {
         ui.modelHeld.textContent = '—';
         ui.modelGb.textContent = '';
@@ -308,7 +311,8 @@ function refresh() {
             // chatting and the limit (null for none).
             full: net.full, people: net.people, maxPeople: net.maxPeople,
             needGb: Math.ceil(missingBytes(cov) / 2 ** 30),
-            modelGb: (posBytes ? posBytes.reduce((x, y) => x + y, 0) : 27 * 2 ** 30) / 2 ** 30,
+            // Null until the manifest gives the sizes.
+            modelGb: posBytes ? posBytes.reduce((x, y) => x + y, 0) / 2 ** 30 : null,
             pieceGb: posBytes ? posBytes.map((b) => b / 2 ** 30) : null,
             capacity: (gb) => engine.capacityFor(gb * 2 ** 30),
         },
@@ -386,11 +390,16 @@ function missingBytes(cov) {
     return n;
 }
 
-// Bytes per position (the embedding, each block, the head) from the manifest.
+// GPU bytes per position (the embedding, each block, the head): the weights
+// plus each block's chat memory at this cluster's context window, priced as
+// the create page prices the whole model (split.js's modelBytes()).
 function positionBytes(manifest) {
-    const b = storedBytes(manifest);
-    if (!b) return null;
-    return [b.wte, ...b.blocks, b.norm + b.lm_head];
+    if (!storedBytes(manifest)) return null;
+    const d = { ...costDims(manifest), n_pos: manifest.n_pos };
+    const opts = { nMax: engine.ctxMax, ...(engine.net?.sessions && { sessions: engine.net.sessions }) };
+    return [endBytes(d, 'embed'),
+        ...Array.from({ length: d.n_layer }, (_, i) => blockBytes(d, { ...opts, index: i })),
+        endBytes(d, 'head') + mtpBytes(d, opts)];
 }
 
 // E.g. `peer 3 · the embedding + blocks 0–5 (+3 loading)`: id, holding, and
@@ -511,9 +520,11 @@ const ago = (ms) => {
     return m < 1 ? 'just now' : m < 60 ? `${m} min ago` : `${Math.round(m / 60)} h ago`;
 };
 
+// Null until the manifest gives the sizes.
 function laneBytes(net, lo, hi) {
+    if (!posBytes) return null;
     let b = 0;
-    for (let x = lo; x < hi; x++) b += posBytes ? posBytes[x] ?? 0 : (27 * 2 ** 30) / (net.positions || 1);
+    for (let x = lo; x < hi; x++) b += posBytes[x] ?? 0;
     return b;
 }
 
@@ -580,8 +591,9 @@ function renderLanes(net) {
         const ms = hopMs.get(p.id);
         const loading = have < p.hi;
         const pct = Math.round(((have - p.lo) / (p.hi - p.lo)) * 100);
-        const gb = laneBytes(net, p.lo, p.hi) / 2 ** 30;
-        const stat = loading ? `${pct}%` : ms != null ? `${Math.round(ms)} ms` : `${gb.toFixed(1)} GB`;
+        const bytes = laneBytes(net, p.lo, p.hi);
+        const stat = loading ? `${pct}%` : ms != null ? `${Math.round(ms)} ms`
+            : bytes != null ? `${(bytes / 2 ** 30).toFixed(1)} GB` : '';
 
         lane.el.classList.toggle('me', me);
         lane.el.classList.toggle('loading', loading);
@@ -702,7 +714,7 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
     // someone expecting a private mesh in the public one.
     try {
         secret = readInvite(location.hash);
-        room = await openRoom(secret);
+        room = await openRoom(secret, { model: inviteModel(location.hash) });
     } catch (err) {
         ui.title.textContent = 'ClusterChat';
         ui.boot.remove();
@@ -933,7 +945,7 @@ const creatorCtx = (s) => creatorNumber(s, ctxKey);
 
 // The invite link, with this person's name if they gave one.
 const myName = () => { try { return cleanName(sessionStorage.getItem(nameKey(secret))); } catch { return ''; } };
-const shareUrl = () => inviteUrl(secret, location, myName());
+const shareUrl = () => inviteUrl(secret, location, myName(), room?.model);
 
 async function copyText(text, button, label) {
     try {
@@ -1357,13 +1369,15 @@ function shareCard() {
     card.className = 'share';
     const creator = (() => { try { return sessionStorage.getItem(creatorKey(secret)) === '1'; } catch { return false; } })();
     const total = posBytes ? posBytes.reduce((a, b) => a + b, 0) : 0;
-    const gb = total ? Math.round(total / 2 ** 30) : 27;
+    const gb = total ? Math.round(total / 2 ** 30) : null;
     card.innerHTML = `<h2></h2><p>Anyone with this link can join, lend their GPU and chat. Send it only to people you trust.</p>
         <div class="share-link"><input type="text" readonly aria-label="Invite link"><button type="button" class="primary">Copy link</button></div>
         <label class="share-name">Your name, so they see "… invited you" <input type="text" placeholder="e.g. Ana (optional)" autocomplete="off"></label>
         <p class="small"></p>`;
     card.querySelector('h2').textContent = creator ? 'Your private cluster is ready. Invite your group.' : 'Invite people to this cluster';
-    card.querySelector('.small').textContent = `It runs once the group lends about ${gb} GB of GPU memory in total. ` +
+    card.querySelector('.small').textContent = (gb
+        ? `It runs once the group lends about ${gb} GB of GPU memory in total. `
+        : 'It runs once the group lends enough GPU memory to hold the whole model. ') +
         'A little extra lets people leave without stopping the chats.';
     const link = card.querySelector('.share-link input');
     const name = card.querySelector('.share-name input');

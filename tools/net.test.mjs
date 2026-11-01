@@ -580,6 +580,59 @@ console.log('\nMesh.ready: retries a failed or hung first connect, never gives u
         m.stop();
     }
 
+    console.log('\nMesh: a reconnect to a server running another model');
+    {
+        // The weights in this tab's VRAM belong to the first welcome's
+        // checkpoint. Reclaiming them under another one would serve another
+        // model's layers to everyone downstream.
+        const m = new Mesh({ server: 'https://example.test' });
+        m.ws.emit('message', { data: JSON.stringify({ ...welcome, weightsUrl: '/weights/a' }) });
+        await m.ready;
+        const p = m.claim(9);
+        m.ws.emit('message', { data: JSON.stringify({ type: 'assign', lo: 0, hi: 9 }) });
+        await p;
+        m.announceReady();
+
+        const first = m.ws;
+        first.readyState = 3;
+        first.emit('close', { code: 1006 });
+        await later(1200);
+        ok('it reconnects', m.ws !== first);
+        m.ws.emit('message', { data: JSON.stringify({ ...welcome, id: 7, weightsUrl: '/weights/b' }) });
+        ok('a welcome with other weights stops the tab', /model changed/.test(m.refused ?? ''), `${m.refused}`);
+        eq('without reclaiming its blocks', m.ws.sent.filter((x) => x.type === 'capacity').length, 0);
+        eq('and keeps the weights it loaded', m.weightsUrl, 'https://example.test/weights/a');
+        m.stop();
+    }
+    {
+        // The same weights after a reconnect: reclaimed as before.
+        const m = new Mesh({ server: 'https://example.test' });
+        m.ws.emit('message', { data: JSON.stringify({ ...welcome, weightsUrl: '/weights/a' }) });
+        await m.ready;
+        const p = m.claim(9);
+        m.ws.emit('message', { data: JSON.stringify({ type: 'assign', lo: 0, hi: 9 }) });
+        await p;
+        const first = m.ws;
+        first.readyState = 3;
+        first.emit('close', { code: 1006 });
+        await later(1200);
+        m.ws.emit('message', { data: JSON.stringify({ ...welcome, id: 8, weightsUrl: '/weights/a' }) });
+        ok('the same weights are reclaimed', !m.refused
+            && m.ws.sent.some((x) => x.type === 'capacity' && x.lo === 0 && x.hi === 9));
+        m.stop();
+    }
+    {
+        // A first connect that failed has loaded nothing, so its first
+        // welcome is not compared with anything.
+        const m = new Mesh({});
+        m.ws.emit('close', { code: 1006 });
+        await later(1200);
+        m.ws.emit('message', { data: JSON.stringify({ ...welcome, weightsUrl: '/weights/a' }) });
+        ok('a retried first connect is not taken for a model change', !m.refused
+            && await settled(m.ready) === 'resolved');
+        m.stop();
+    }
+
     console.log('\nMesh: a message carries the id of the link it arrived on');
     {
         // Covers #attach. The other tests here call the framing functions
@@ -1034,6 +1087,28 @@ const logged = [];
 {
     const log = console.log;
     console.log = (...a) => { logged.push(a.join(' ')); log(...a); };
+}
+// A checkpoint file of the suite's own, so it neither reads the deployed one
+// nor fetches manifests: the global mesh, and two models private clusters can
+// run. A private link with no model (LEGACY_MODEL, not listed here) runs the
+// global mesh's.
+{
+    const { mkdtempSync, mkdirSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const dir = mkdtempSync(join(tmpdir(), 'clusterchat-net-'));
+    const manifest = (model, n_layer) => ({ model, n_layer, hidden: 256, n_head: 4, n_kv_head: 2,
+        head_dim: 64, ffn: 512, vocab: 1000, n_pos: 262144, dtype: 'f16' });
+    for (const [d, m] of [['global', manifest('test-global', 30)], ['small', manifest('test-small', 6)],
+                          ['big', manifest('test-big', 40)]]) {
+        mkdirSync(join(dir, 'weights', d), { recursive: true });
+        writeFileSync(join(dir, 'weights', d, 'manifest.json'), JSON.stringify(m));
+    }
+    writeFileSync(join(dir, 'checkpoint.json'), JSON.stringify({ url: '/weights/global', models: [
+        { id: 'test-small', name: 'Small', url: '/weights/small' },
+        { id: 'test-big', name: 'Big', url: '/weights/big' },
+    ] }));
+    process.env.CHECKPOINT = join(dir, 'checkpoint.json');
 }
 const { coturnCredential } = await import('../signal-server.js');
 await new Promise((r) => setTimeout(r, 200));
@@ -1725,6 +1800,55 @@ console.log('\nsignal-server: chats in memory');
     eq('and so is zero', await alone({ sessions: 0 }), 6);
 }
 
+console.log('\nsignal-server: the model a private cluster runs');
+{
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const welcome = (p) => p.next((m) => m.type === 'welcome');
+    const secret = newSecret();
+
+    // One private mesh at a time: the suite's MAX_ROOMS is 3.
+    const small = await openRoom(secret, { model: 'test-small' });
+    const a = connect(small.joinToken, { model: 'test-small' });
+    const wa = await welcome(a);
+    eq('a link naming a model gets its depth', wa.blocks, 6);
+    eq('and its positions', wa.positions, 8);
+    eq('and its weights', wa.weightsUrl, '/weights/small');
+    eq('and its id', wa.model, 'test-small');
+    const b = connect(small.joinToken, { model: 'test-small' });
+    eq('a second tab with the same link joins it', (await welcome(b)).blocks, 6);
+    const wrong = connect(small.joinToken, { model: 'test-big' });
+    eq('the same token with another model is refused', await wrong.closed, 4003);
+
+    const big = await openRoom(secret, { model: 'test-big' });
+    ok('the model is part of the join token', big.joinToken !== small.joinToken);
+    const c = connect(big.joinToken, { model: 'test-big' });
+    const wc = await welcome(c);
+    eq('so the same secret with another model is another room', wc.blocks, 40);
+    eq('with that model\'s weights', wc.weightsUrl, '/weights/big');
+    for (const p of [a, b, c]) p.close();
+    await sleep(150);
+
+    // A restart forgets every room. The first tab back recreates its room
+    // from its link, so the model survives.
+    const again = connect(small.joinToken, { model: 'test-small' });
+    eq('a room recreated from its link runs the link\'s model', (await welcome(again)).blocks, 6);
+    again.close();
+    await sleep(150);
+
+    const legacy = connect((await openRoom(newSecret())).joinToken);
+    const wl = await welcome(legacy);
+    eq('a link with no model runs the global mesh\'s', wl.blocks, 30);
+    eq('with no model id', wl.model, null);
+    legacy.close();
+    await sleep(150);
+
+    const unknown = connect((await openRoom(newSecret(), { model: 'nope' })).joinToken, { model: 'nope' });
+    eq('a model the server does not offer is refused', await unknown.closed, 4003);
+    const odd = connect((await openRoom(newSecret())).joinToken, { model: { id: 'test-small' } });
+    eq('and so is a model that is not a string', await odd.closed, 4003);
+    await sleep(150);
+}
+
 // --- Mesh: which mesh it joins, and what it passes to WebRTC ---
 //
 // Uses a WebSocket the test controls and an RTCPeerConnection that records
@@ -1863,6 +1987,18 @@ console.log('\nsignal-server: chats in memory');
     ws.open();
     eq('and its first frame is the same join', ws.sent[0], { type: 'join', v: PROTOCOL, room: room.joinToken });
     m.stop();
+
+    {
+        // The link's model goes with every join, so after a server restart
+        // the first tab back recreates the room with it.
+        const withModel = await openRoom(newSecret(), { model: 'qwen3.5-4b' });
+        const p = new Mesh({ room: withModel });
+        const s1 = FakeWS.all.at(-1);
+        s1.open();
+        eq('a link with a model sends it in the join', s1.sent[0],
+            { type: 'join', v: PROTOCOL, room: withModel.joinToken, model: 'qwen3.5-4b' });
+        p.stop();
+    }
 
     console.log('\nMesh: fails closed');
     {

@@ -807,6 +807,7 @@ select.step-input { cursor: pointer; }
 
 /* A model to pick: a tile, selected with a purple edge and a tick. */
 .model-list { margin: 0; padding: 0; border: 0; min-width: 0; }
+.model-tiles { display: grid; gap: 10px; }
 .model-option {
   position: relative;
   display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 12px;
