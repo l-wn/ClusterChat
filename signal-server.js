@@ -409,7 +409,14 @@ function roomFor(token, chats, sessions, ctx, modelId) {
             ? Math.min(model.ctxFor(ctx), model.maxPrivateCtx) : model.meshCtx;
         room = makeRoom(model, `room ${key.slice(0, 6)} `, Math.min(asked, MAX_PRIVATE_CHATS), kept, windowCtx);
         rooms.set(key, room);
-        room.log(`opened on ${model.id ?? model.name}, ${room.chatLimit === 1 ? '1 chat' : `${room.chatLimit ?? 'no limit on'} chats`} at once, `
+        // clusterDash (rooms-dashboard.mjs) reads this line as `opened, `
+        // followed by the creator's choices, one per `, `-separated part, and
+        // takes the model from a `model <name>` part. The name rather than the
+        // id, so a room that names its model groups with the rooms that fall
+        // back to the model on the `signaling on` boot line, which is a name
+        // too.
+        room.log(`opened, model ${model.name}, `
+            + `${room.chatLimit === 1 ? '1 chat' : `${room.chatLimit ?? 'no limit on'} chats`} at once, `
             + `${kept} in memory per peer, ${windowCtx}-token context`);
     }
     return { key, room };
