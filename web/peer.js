@@ -606,9 +606,13 @@ function renderLanes(net) {
         lane.stat.title = loading ? 'Downloaded so far' : ms != null ? 'Time per word on your last reply' : 'Size of its pieces';
 
         const held = describeRange(p.lo, have, net.blocks) || 'nothing yet';
+        const joined = `joined ${ago(now - firstSeen.get(p.id))}`;
         const lines = [
             `Holds ${held}${loading ? ` (${pct}% downloaded)` : ''}`,
-            `${gb.toFixed(1)} GB of the model · joined ${ago(now - firstSeen.get(p.id))}`,
+            // `bytes` is null until the manifest has been read, and the lane
+            // is drawn before that.
+            bytes != null ? `${(bytes / 2 ** 30).toFixed(1)} GB of the model · ${joined}`
+                          : joined,
         ];
         if (ms != null) lines.push(`${Math.round(ms)} ms per word on your last reply`);
         const detail = lines.join('\n');

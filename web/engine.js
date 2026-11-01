@@ -138,7 +138,18 @@ export class Engine {
         return engine;
     }
 
-    #emit(type, detail = {}) { this.#onEvent(type, detail); }
+    // A listener is the page's, and a throw in one must not reach the caller:
+    // #fill() emits progress between positions, so a page that threw while
+    // rendering would abort the download of a claim it had already been given
+    // and leave the mesh a hole. The failure is logged and the engine carries
+    // on.
+    #emit(type, detail = {}) {
+        try {
+            this.#onEvent(type, detail);
+        } catch (err) {
+            console.error(`onEvent(${type}) threw; the engine carried on:`, err);
+        }
+    }
 
     // --- Joining ---
 
