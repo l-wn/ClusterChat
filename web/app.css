@@ -431,7 +431,7 @@ textarea:disabled { background: var(--surface); }
    one size: the count stands out by weight and colour. The whole row is the
    Your GPU drawer's button. */
 
-.mine {
+.contrib-band {
   display: flex;
   align-items: baseline;
   gap: 9px;
@@ -445,7 +445,7 @@ textarea:disabled { background: var(--surface); }
   font: inherit;
   transition: background .35s var(--ease);
 }
-.mine:hover { background: #ebdffb; border-color: transparent; }
+.contrib-band:hover { background: #ebdffb; border-color: transparent; }
 
 .lamp {
   flex: none;
@@ -459,28 +459,28 @@ textarea:disabled { background: var(--surface); }
 
 /* The three words are one sentence: tight gaps inside, the row's own spacing
    outside. tabular-nums so the line does not shuffle as the count ticks. */
-.mine .said { display: inline-flex; align-items: baseline; gap: 5px; min-width: 0; }
-.mine .state { font: 500 var(--t-sm)/1 var(--sans); color: var(--signal-ink); }
-.mine .big { font: 600 var(--t-sm)/1 var(--sans); color: var(--signal-ink); font-variant-numeric: tabular-nums; }
-.mine .cap { font-size: 11px; color: var(--muted); }
-.mine .spacer { flex: 1; }
-.mine .rest { font: 400 var(--t-xs)/1 var(--mono); color: var(--faint); }
-.mine .go { font: 400 var(--t-xs)/1 var(--mono); color: var(--signal-ink); white-space: nowrap; }
+.contrib-band .said { display: inline-flex; align-items: baseline; gap: 5px; min-width: 0; }
+.contrib-band .state { font: 500 var(--t-sm)/1 var(--sans); color: var(--signal-ink); }
+.contrib-band .big { font: 600 var(--t-sm)/1 var(--sans); color: var(--signal-ink); font-variant-numeric: tabular-nums; }
+.contrib-band .cap { font-size: 11px; color: var(--muted); }
+.contrib-band .spacer { flex: 1; }
+.contrib-band .rest { font: 400 var(--t-xs)/1 var(--mono); color: var(--faint); }
+.contrib-band .go { font: 400 var(--t-xs)/1 var(--mono); color: var(--signal-ink); white-space: nowrap; }
 
 /* Off: the same row, light out. */
-.mine.off { background: var(--surface); }
-.mine.off:hover { background: var(--surface-2); }
-.mine.off .lamp { background: none; box-shadow: inset 0 0 0 1px var(--rule-strong); }
-.mine.off .state { color: var(--muted); }
-.mine.off .go { color: var(--ink-2); }
+.contrib-band.off { background: var(--surface); }
+.contrib-band.off:hover { background: var(--surface-2); }
+.contrib-band.off .lamp { background: none; box-shadow: inset 0 0 0 1px var(--rule-strong); }
+.contrib-band.off .state { color: var(--muted); }
+.contrib-band.off .go { color: var(--ink-2); }
 
 /* The moment it comes on. */
 @keyframes lampOn {
   0%   { box-shadow: 0 0 0 0 rgba(112, 34, 214, .55); }
   100% { box-shadow: 0 0 0 3px rgba(112, 34, 214, .14); }
 }
-.mine.lit .lamp { animation: lampOn .6s var(--ease); }
-@media (prefers-reduced-motion: reduce) { .mine.lit .lamp { animation: none; } }
+.contrib-band.lit .lamp { animation: lampOn .6s var(--ease); }
+@media (prefers-reduced-motion: reduce) { .contrib-band.lit .lamp { animation: none; } }
 
 .settings {
   display: flex;
@@ -742,10 +742,10 @@ body.chats-docked { padding-left: var(--side); }
   .lane-track { height: auto; padding: 4px 0; }
   .strip-gb { display: none; }
   /* The light, the count and the way in survive; the ms drops. */
-  .mine { gap: 7px; }
-  .mine .rest { display: none; }
-  .mine .go { font-size: 0; }
-  .mine .go::after { content: "\203a"; font-size: 15px; }
+  .contrib-band { gap: 7px; }
+  .contrib-band .rest { display: none; }
+  .contrib-band .go { font-size: 0; }
+  .contrib-band .go::after { content: "\203a"; font-size: 15px; }
 }
 .person { fill: currentColor; stroke: none; }
 
