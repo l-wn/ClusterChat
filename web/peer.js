@@ -7,7 +7,7 @@
 import { dimsFromManifest } from './model/loader.js';
 import { Engine, ContextFullError } from './engine.js';
 import { positions, coverage, holders, holding, filling, describeRange, storedBytes, costDims,
-         blockBytes, endBytes, mtpBytes } from './split.js';
+         blockBytes, blockWeightBytes, endBytes, mtpBytes } from './split.js';
 import { chatFormat, stopRe } from './prompt.js';
 import { runTurn } from './turn.js';
 import { makeMessage } from './message.js';
@@ -40,6 +40,10 @@ let lending = false;
 // "needs about N GB more" line. Null until the manifest is read or when it
 // lists no files.
 let posBytes = null;
+
+// The weights alone of each position: what is downloaded for it. posBytes
+// adds the chat memory (KV cache) a holder reserves on its GPU.
+let posWeights = null;
 
 // The checkpoint the mesh runs, set once the manifest is read. A saved chat's
 // token ids are only valid for the tokenizer they were made with.
@@ -456,6 +460,15 @@ function positionBytes(manifest) {
         endBytes(d, 'head') + mtpBytes(d, opts)];
 }
 
+function positionWeights(manifest) {
+    const s = storedBytes(manifest);
+    if (!s) return null;
+    const d = { ...costDims(manifest), n_pos: manifest.n_pos };
+    return [endBytes(d, 'embed'),
+        ...Array.from({ length: d.n_layer }, (_, i) => blockWeightBytes(d, { index: i })),
+        endBytes(d, 'head') + s.mtp];
+}
+
 // E.g. `the embedding + blocks 0–5, 3 still downloading`: what this tab holds
 // and how much of its claim is still coming, from its own roster entry. The
 // peer id is its own row (#peerid), so this is one plain sentence.
@@ -554,7 +567,7 @@ function renderMap(net, cov) {
         cell.classList.toggle('mine', x >= (me?.lo ?? 0) && x < mineTo);
 
         const who = holders(net.readyPeers, x);
-        cell.title = `${cell.dataset.name}: `
+        cell.title = `${cell.dataset.name}${posWeights ? ` (${mb(posWeights[x])})` : ''}: `
             + (who.length ? `held by ${plural(who.length, 'computer')} (${who.join(', ')})`
                 : claimed.depths[x] ? 'downloading' : 'missing');
     }
@@ -596,12 +609,15 @@ const ago = (ms) => {
 };
 
 // Null until the manifest gives the sizes.
-function laneBytes(net, lo, hi) {
-    if (!posBytes) return null;
+function laneBytes(net, lo, hi, per = posBytes) {
+    if (!per) return null;
     let b = 0;
-    for (let x = lo; x < hi; x++) b += posBytes[x] ?? 0;
+    for (let x = lo; x < hi; x++) b += per[x] ?? 0;
     return b;
 }
+
+const mb = (b) => `${Math.round(b / 2 ** 20)} MB`;
+const gb = (b) => `${(b / 2 ** 30).toFixed(1)} GB`;
 
 function makeLane(id) {
     const el = document.createElement('div');
@@ -671,10 +687,12 @@ function renderLanes(net) {
         // (showDownload's comment), so ask the download line instead.
         const loading = me ? downloading() : filling(p);
         const pct = Math.round(((have - p.lo) / (p.hi - p.lo)) * 100);
+        // The column is the weights, the same bytes the download line counts,
+        // so "0.6 GB downloading" is what is coming down. The chat memory its
+        // GPU reserves on top (the KV cache) is in the detail below.
+        const weights = laneBytes(net, p.lo, p.hi, posWeights);
         const bytes = laneBytes(net, p.lo, p.hi);
-        // One unit down the column, always: how much of the model this bar
-        // is. Its speed and how much has arrived are in the detail below.
-        const size = bytes != null ? `${(bytes / 2 ** 30).toFixed(1)} GB` : '';
+        const size = weights != null ? gb(weights) : '';
 
         lane.el.classList.toggle('me', me);
         lane.el.classList.toggle('loading', loading);
@@ -688,17 +706,23 @@ function renderLanes(net) {
             lane.said = stat;
             lane.stat.innerHTML = stat;
         }
-        lane.stat.title = loading ? 'Still downloading its pieces' : 'How much of the model its pieces are';
+        lane.stat.title = loading ? 'The model weights it is downloading' : 'The model weights it holds';
 
-        const held = describeRange(p.lo, have, net.blocks) || 'nothing yet';
+        // describeRange() names the embedding for any range starting at 0,
+        // empty or not.
+        const held = have > p.lo ? describeRange(p.lo, have, net.blocks) : 'nothing yet';
         const joined = `joined ${ago(now - firstSeen.get(p.id))}`;
         const lines = [
             `Holds ${held}${have < p.hi ? ` (${pct}% downloaded)` : ''}`,
-            // `bytes` is null until the manifest has been read, and the lane
+            // `weights` is null until the manifest has been read, and the lane
             // is drawn before that.
-            bytes != null ? `${(bytes / 2 ** 30).toFixed(1)} GB of the model · ${joined}`
-                          : joined,
+            weights != null ? `${gb(weights)} of model weights · ${joined}` : joined,
         ];
+        // Its share of the model takes more GPU memory than it downloads:
+        // room for the conversations running through it.
+        if (weights != null && bytes > weights) {
+            lines.push(`+ ${gb(bytes - weights)} of chat memory (KV cache) = ${gb(bytes)} of GPU memory`);
+        }
         if (ms != null) lines.push(`${Math.round(ms)} ms per word on your last reply`);
         const detail = lines.join('\n');
         if (lane.detail.textContent !== detail) lane.detail.textContent = detail;
@@ -848,6 +872,7 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
     TURN_RE = stopRe(CHAT);
     running = { model: manifest.model ?? null, weights: engine.net.weightsUrl ?? null };
     posBytes = positionBytes(manifest);
+    posWeights = positionWeights(manifest);
     showSide();
     // A chat picked from the list during connect() is given to the engine
     // here.
