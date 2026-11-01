@@ -187,7 +187,7 @@ console.log('\nloadFile: a connection that goes silent');
         return n === 1 ? 'silent' : 'ok';
     });
     const buf = await loadFile(url, 'w.bin', undefined,
-        { bytes: 100 * 1024 * 1024, stallMs: 150 });
+        { bytes: 200 * 1024 * 1024, stallMs: 150 });
     ok('a stalled range aborts, retries and resumes', identical(buf));
     ok('and every range really did stall once',
         seen.size === 3 && [...seen.values()].every((n) => n === 2), `${[...seen]}`);
@@ -232,7 +232,7 @@ console.log('\nloadFile: a file too big to risk a non-resumable attempt on');
         if (req.headers.range) ranged++; else bare++;
         return 'ok';
     });
-    const buf = await loadFile(url, 'w.bin', undefined, { bytes: 100 * 1024 * 1024 });
+    const buf = await loadFile(url, 'w.bin', undefined, { bytes: 200 * 1024 * 1024 });
     ok('is fetched correctly', identical(buf));
     ok('without one request that could not have resumed', bare === 0, `${bare} bare GETs`);
     ok('in 8 MiB ranges', ranged === 3, `${ranged} ranged requests`);

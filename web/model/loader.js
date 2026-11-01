@@ -253,7 +253,13 @@ const CHUNK = 8 * 1024 * 1024;
 // downloaded. Files above this size take the ranged path from the start; the
 // browser cache the whole-file path exists for does not reliably store a body
 // this big.
-const WHOLE_MAX = 64 * 1024 * 1024;
+//
+// Set above one block of a 4B q8 checkpoint (~115 MiB) so that block is taken
+// in a single cacheable 200 rather than 15 sequential ranges, which cost a
+// round trip each and leave nothing a reload can reuse. A 27B q8 block
+// (~430 MB) and either checkpoint's client.bin are still well above this and
+// keep the resumable ranged path.
+const WHOLE_MAX = 128 * 1024 * 1024;
 
 // One request, read through a watchdog that aborts it when no bytes have
 // arrived for `stallMs`. The timer covers the headers too: a static file whose
