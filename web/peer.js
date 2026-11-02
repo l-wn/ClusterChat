@@ -1618,10 +1618,11 @@ function shareCard() {
     link.addEventListener('focus', () => link.select());
     copy.addEventListener('click', () => copyText(shareUrl(), copy, 'Copy link'));
     // The command for this server and cluster, so a self-hosted server's
-    // card gives its own address (cli/README.md).
+    // card gives its own address (cli/README.md). @latest, since npx
+    // otherwise reuses whichever version it cached first.
     const cmd = card.querySelector('.share-agent input');
     const copyCmd = card.querySelector('.share-agent button');
-    cmd.value = `npx clusterchat connect '${inviteUrl(secret, location, '', room?.model)}'`;
+    cmd.value = `npx clusterchat@latest connect '${inviteUrl(secret, location, '', room?.model)}'`;
     cmd.addEventListener('focus', () => cmd.select());
     copyCmd.addEventListener('click', () => copyText(cmd.value, copyCmd, 'Copy command',
         'Copy this command and run it in a terminal:'));

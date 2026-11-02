@@ -202,7 +202,7 @@ terminal, with no GPU or browser needed, and serves it to Claude Code, opencode
 and other tools as local Anthropic and OpenAI APIs:
 
 ```bash
-npx clusterchat connect '<invite link>'
+npx clusterchat@latest connect '<invite link>'
 ```
 
 The invite card on a private cluster's page shows this command with the link

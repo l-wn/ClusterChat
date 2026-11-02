@@ -10,6 +10,9 @@ npm install -g clusterchat
 clusterchat connect 'https://clusterchat.io/chat#mesh=<code>&model=qwen3.5-4b'
 ```
 
+Or without installing: `npx clusterchat@latest connect '<invite link>'`. Keep
+the `@latest`: without it npx reuses whichever version it cached first.
+
 Copy the invite link from the cluster's page (Invite → the command is shown
 there too). **Keep it in quotes**: unquoted, the shell cuts it at `&` and you
 join a different, empty cluster. `connect` prints which cluster it joined and
