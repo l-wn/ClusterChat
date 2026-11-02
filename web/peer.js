@@ -1083,13 +1083,14 @@ const creatorCtx = (s) => creatorNumber(s, ctxKey);
 const myName = () => { try { return cleanName(sessionStorage.getItem(nameKey(secret))); } catch { return ''; } };
 const shareUrl = () => inviteUrl(secret, location, myName(), room?.model);
 
-async function copyText(text, button, label) {
+async function copyText(text, button, label,
+                        ask = 'Copy this invite link and send it only to people you trust:') {
     try {
         await navigator.clipboard.writeText(text);
         button.textContent = 'Copied';
     } catch {
         // The clipboard API needs a secure origin (not plain http on a LAN).
-        window.prompt('Copy this invite link and send it only to people you trust:', text);
+        window.prompt(ask, text);
     }
     setTimeout(() => { button.textContent = label; }, 2000);
 }
@@ -1596,9 +1597,9 @@ function shareCard() {
         <div class="share-link"><input type="text" readonly aria-label="Invite link"><button type="button" class="primary">Copy link</button></div>
         <label class="share-name">Your name, so they see "… invited you" <input type="text" placeholder="e.g. Ana (optional)" autocomplete="off"></label>
         <p class="small"></p>
-        <details class="share-agent"><summary>Use it from a coding agent</summary>
-        <p class="small">Run this to serve the cluster to Claude Code, opencode and other tools on your computer. It prints how to point each one at it.</p>
-        <div class="share-link"><input type="text" readonly aria-label="Command"><button type="button">Copy</button></div></details>`;
+        <div class="share-agent"><h3>Use it from a coding agent</h3>
+        <p>Run this in a terminal to use the cluster from Claude Code, opencode and other coding tools. It prints how to point each one at it.</p>
+        <div class="share-link"><input type="text" readonly aria-label="Coding agent command"><button type="button" class="primary">Copy command</button></div></div>`;
     card.querySelector('h2').textContent = creator ? 'Your private cluster is ready. Invite your group.' : 'Invite people to this cluster';
     card.querySelector('.small').textContent = (gb
         ? `It runs once the group lends about ${gb} GB of GPU memory in total. `
@@ -1622,7 +1623,8 @@ function shareCard() {
     const copyCmd = card.querySelector('.share-agent button');
     cmd.value = `npx clusterchat connect '${inviteUrl(secret, location, '', room?.model)}'`;
     cmd.addEventListener('focus', () => cmd.select());
-    copyCmd.addEventListener('click', () => copyText(cmd.value, copyCmd, 'Copy'));
+    copyCmd.addEventListener('click', () => copyText(cmd.value, copyCmd, 'Copy command',
+        'Copy this command and run it in a terminal:'));
     return card;
 }
 

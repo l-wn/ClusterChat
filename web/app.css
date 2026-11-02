@@ -382,16 +382,13 @@ button.toggle:hover:not(:disabled) { color: var(--ink); }
   border-radius: var(--r);
   padding: 20px 22px;
 }
-.share h2 { font-size: var(--t-lg); font-weight: 600; letter-spacing: -0.01em; margin: 0 0 6px; }
-.share p { margin: 0 0 14px; color: var(--muted); font-size: var(--t-sm); }
+.share h2, .share p { margin: 0 0 14px; color: var(--muted); font-size: var(--t-sm); }
 .share-link { display: flex; gap: 8px; }
 .share-link input { flex: 1; min-width: 0; font: 400 var(--t-sm)/1 var(--mono); color: var(--ink-2); background: var(--surface); border: 1px solid var(--rule); border-radius: var(--r); padding: 9px 10px; }
 .share-name { display: flex; align-items: center; gap: 10px; margin-top: 12px; font-size: var(--t-sm); color: var(--muted); }
 .share-name input { width: 12rem; font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--rule-strong); border-radius: var(--r); padding: 7px 9px; }
 .share .small { margin: 14px 0 0; font-size: var(--t-xs); font-family: var(--mono); }
-.share-agent { margin-top: 14px; font-size: var(--t-sm); color: var(--muted); }
-.share-agent summary { cursor: pointer; }
-.share-agent .small { margin: 8px 0; }
+.share-agent { margin-top: 20px; padding-top: 18px; border-top: 1px solid var(--rule); }
 
 /* --- Boot progress (the dev page chat.html; peer.html uses #dl) --- */
 
@@ -833,7 +830,7 @@ body.create-page { display: block; height: auto; min-height: 100vh; min-height: 
 }
 body.side-open { padding-right: var(--side-r); }
 .side-right .share { border: 0; padding: 0; border-radius: 0; }
-.side-right .share h2 { font-size: var(--t-md); line-height: 1.3; }
+.side-right .share h2, .side-right .share-agent h3 { font-size: var(--t-md); line-height: 1.3; }
 .side-right .share-link { flex-direction: column; }
 .side-right .share-link input { width: 100%; font-size: var(--t-xs); }
 .side-right .share-link button { width: 100%; height: 40px; }
