@@ -70,7 +70,7 @@ export function relayOnlySdp(sdp) {
 // Close codes from signal-server.js that a reconnect cannot fix: a join the
 // server did not accept (this page is older than the server), a full mesh, and
 // a link naming a model the server does not offer.
-const REFUSED = { 4001: 'the signaling server did not accept this page. Reload it.',
+export const REFUSED = { 4001: 'the signaling server did not accept this page. Reload it.',
                   4002: 'this cluster is full',
                   4003: "this link's model is not offered by this server" };
 
@@ -257,9 +257,12 @@ export function bucket(rate, burst, now = performance.now()) {
 
 // --- Mesh ---
 
+// Gathering is over at the null candidate a browser sends or the state
+// change, whichever comes: node-datachannel only changes the state.
 const iceDone = (pc) => new Promise((res) => {
     if (pc.iceGatheringState === 'complete') return res();
     pc.addEventListener('icecandidate', (e) => { if (!e.candidate) res(); });
+    pc.addEventListener('icegatheringstatechange', () => { if (pc.iceGatheringState === 'complete') res(); });
     setTimeout(res, GATHER_MS);
 });
 

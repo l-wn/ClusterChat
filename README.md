@@ -195,6 +195,20 @@ share the invite link.
 - **Chats stay in your browser** (IndexedDB) and can be resumed or exported
   later.
 
+## Use it from your coding agent
+
+The [`clusterchat`](cli/README.md) npm package joins a cluster from your
+terminal, with no GPU or browser needed, and serves it to Claude Code, opencode
+and other tools as local Anthropic and OpenAI APIs:
+
+```bash
+npx clusterchat connect '<invite link>'
+```
+
+The invite card on a private cluster's page shows this command with the link
+filled in. It works the same with a self-hosted server: the client takes the
+server from the link. See [cli/README.md](cli/README.md) for each tool's setup.
+
 ## What it doesn't do yet
 
 - **One model per cluster.**

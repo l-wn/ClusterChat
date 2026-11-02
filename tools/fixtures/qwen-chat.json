@@ -1,0 +1,246 @@
+[
+ {
+  "system": "Be brief.",
+  "tools": [],
+  "msgs": [
+   {
+    "role": "user",
+    "text": "Hi there"
+   }
+  ],
+  "prompt": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "system": "Be brief.",
+  "tools": [],
+  "msgs": [
+   {
+    "role": "user",
+    "text": "Hi"
+   },
+   {
+    "role": "assistant",
+    "text": "Hello!"
+   },
+   {
+    "role": "user",
+    "text": "  How are you?  "
+   }
+  ],
+  "prompt": "<|im_start|>system\nBe brief.<|im_end|>\n<|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\nHello!<|im_end|>\n<|im_start|>user\nHow are you?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "system": "You code.",
+  "tools": [
+   {
+    "name": "read",
+    "description": "Read a file.",
+    "schema": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string"
+      },
+      "lines": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "path"
+     ]
+    }
+   },
+   {
+    "name": "edit",
+    "description": "Edit a file.",
+    "schema": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string"
+      },
+      "opts": {
+       "type": "object"
+      },
+      "all": {
+       "type": "boolean"
+      }
+     }
+    }
+   }
+  ],
+  "msgs": [
+   {
+    "role": "user",
+    "text": "Open a.js"
+   }
+  ],
+  "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"read\", \"description\": \"Read a file.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"lines\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"edit\", \"description\": \"Edit a file.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"opts\": {\"type\": \"object\"}, \"all\": {\"type\": \"boolean\"}}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou code.<|im_end|>\n<|im_start|>user\nOpen a.js<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "system": "",
+  "tools": [
+   {
+    "name": "read",
+    "description": "Read a file.",
+    "schema": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string"
+      },
+      "lines": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "path"
+     ]
+    }
+   }
+  ],
+  "msgs": [
+   {
+    "role": "user",
+    "text": "Open a.js"
+   }
+  ],
+  "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"read\", \"description\": \"Read a file.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"lines\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nOpen a.js<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "system": "You code.",
+  "tools": [
+   {
+    "name": "read",
+    "description": "Read a file.",
+    "schema": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string"
+      },
+      "lines": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "path"
+     ]
+    }
+   },
+   {
+    "name": "edit",
+    "description": "Edit a file.",
+    "schema": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string"
+      },
+      "opts": {
+       "type": "object"
+      },
+      "all": {
+       "type": "boolean"
+      }
+     }
+    }
+   }
+  ],
+  "msgs": [
+   {
+    "role": "user",
+    "text": "Fix a.js"
+   },
+   {
+    "role": "assistant",
+    "text": "Reading it first.",
+    "calls": [
+     {
+      "name": "read",
+      "args": {
+       "path": "a.js",
+       "lines": 40
+      }
+     },
+     {
+      "name": "edit",
+      "args": {
+       "path": "a.js",
+       "opts": {
+        "x": [
+         1,
+         2
+        ]
+       },
+       "all": true
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "text": "const a = 1;"
+   },
+   {
+    "role": "tool",
+    "text": "ok"
+   }
+  ],
+  "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"read\", \"description\": \"Read a file.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"lines\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}}}\n{\"type\": \"function\", \"function\": {\"name\": \"edit\", \"description\": \"Edit a file.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"opts\": {\"type\": \"object\"}, \"all\": {\"type\": \"boolean\"}}}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou code.<|im_end|>\n<|im_start|>user\nFix a.js<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nReading it first.\n\n<tool_call>\n<function=read>\n<parameter=path>\na.js\n</parameter>\n<parameter=lines>\n40\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=edit>\n<parameter=path>\na.js\n</parameter>\n<parameter=opts>\n{\"x\": [1, 2]}\n</parameter>\n<parameter=all>\nTrue\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nconst a = 1;\n</tool_response>\n<tool_response>\nok\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ },
+ {
+  "system": "You code.",
+  "tools": [
+   {
+    "name": "read",
+    "description": "Read a file.",
+    "schema": {
+     "type": "object",
+     "properties": {
+      "path": {
+       "type": "string"
+      },
+      "lines": {
+       "type": "integer"
+      }
+     },
+     "required": [
+      "path"
+     ]
+    }
+   }
+  ],
+  "msgs": [
+   {
+    "role": "user",
+    "text": "Read b"
+   },
+   {
+    "role": "assistant",
+    "text": "",
+    "calls": [
+     {
+      "name": "read",
+      "args": {
+       "path": "b"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "text": "B"
+   },
+   {
+    "role": "assistant",
+    "text": "It says B."
+   },
+   {
+    "role": "user",
+    "text": "Thanks"
+   }
+  ],
+  "prompt": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"read\", \"description\": \"Read a file.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"path\": {\"type\": \"string\"}, \"lines\": {\"type\": \"integer\"}}, \"required\": [\"path\"]}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nYou code.<|im_end|>\n<|im_start|>user\nRead b<|im_end|>\n<|im_start|>assistant\n<tool_call>\n<function=read>\n<parameter=path>\nb\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\nB\n</tool_response><|im_end|>\n<|im_start|>assistant\nIt says B.<|im_end|>\n<|im_start|>user\nThanks<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+ }
+]

@@ -54,6 +54,8 @@ web/history.js        saved chats: IndexedDB, filed by mesh, synced across tabs
 web/chat.js, chat.html    single-tab chat: the whole model on one GPU, no mesh
 web/turn.js, prompt.js    chat templates and where a turn ends
 web/profile.js        per-hop timing summary for the mesh page
+cli/                  the clusterchat npm package: one chat-only Engine in Node behind
+                      local Anthropic and OpenAI APIs for coding agents (cli/README.md)
 ```
 
 ## Joining

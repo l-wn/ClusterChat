@@ -35,8 +35,11 @@ const REASONS = {
 // `onToken` is called once per token with the text already split into
 // reasoning and answer and already cut at the stop sequence. The turn ends
 // when the engine ends or the stop sequence appears, whichever is first.
-export async function runTurn(engine, text, opts, { chat, turnRe, onToken } = {}) {
-    const prompt = opts.chat
+//
+// `prompt` is text already wrapped by the caller (the CLI renders its own
+// turns), fed as it is in place of wrapTurn()'s.
+export async function runTurn(engine, text, opts, { chat, turnRe, onToken, prompt = null } = {}) {
+    prompt ??= opts.chat
         ? wrapTurn(chat, text, { first: !engine.ctxLen, thinking: opts.thinking })
         : text;
 

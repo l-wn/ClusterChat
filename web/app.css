@@ -389,6 +389,9 @@ button.toggle:hover:not(:disabled) { color: var(--ink); }
 .share-name { display: flex; align-items: center; gap: 10px; margin-top: 12px; font-size: var(--t-sm); color: var(--muted); }
 .share-name input { width: 12rem; font: inherit; color: var(--ink); background: var(--bg); border: 1px solid var(--rule-strong); border-radius: var(--r); padding: 7px 9px; }
 .share .small { margin: 14px 0 0; font-size: var(--t-xs); font-family: var(--mono); }
+.share-agent { margin-top: 14px; font-size: var(--t-sm); color: var(--muted); }
+.share-agent summary { cursor: pointer; }
+.share-agent .small { margin: 8px 0; }
 
 /* --- Boot progress (the dev page chat.html; peer.html uses #dl) --- */
 

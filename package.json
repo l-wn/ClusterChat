@@ -1,5 +1,5 @@
 {
-  "name": "clusterchat",
+  "name": "clusterchat-site",
   "private": true,
   "license": "AGPL-3.0-only",
   "type": "module",
@@ -7,8 +7,8 @@
     "signal": "node signal-server.js",
     "build": "node tools/build-site.mjs",
     "preview": "node tools/build-site.mjs > /dev/null && node tools/preview.mjs",
-    "test": "node tools/parse.test.mjs && node tools/split.test.mjs && node tools/f16.test.mjs && node tools/tokenizer.test.mjs && node tools/prompt.test.mjs && node tools/room.test.mjs && node tools/lend.test.mjs && node tools/markdown.test.mjs && node tools/errors.test.mjs && node tools/history.test.mjs && node tools/sampling.test.mjs && node tools/profile.test.mjs && node tools/loader.test.mjs && node tools/stage.test.mjs && node tools/net.test.mjs && node tools/mesh.test.mjs && node tools/engine.test.mjs && node tools/grow.test.mjs",
-    "test:gpu": "node tools/tinymodel.mjs && node tools/mesh.gpu.test.mjs"
+    "test": "node tools/parse.test.mjs && node tools/split.test.mjs && node tools/f16.test.mjs && node tools/tokenizer.test.mjs && node tools/prompt.test.mjs && node tools/room.test.mjs && node tools/lend.test.mjs && node tools/markdown.test.mjs && node tools/errors.test.mjs && node tools/history.test.mjs && node tools/sampling.test.mjs && node tools/profile.test.mjs && node tools/loader.test.mjs && node tools/stage.test.mjs && node tools/net.test.mjs && node tools/mesh.test.mjs && node tools/engine.test.mjs && node tools/grow.test.mjs && node tools/cli.test.mjs",
+    "test:gpu": "node tools/tinymodel.mjs && node tools/mesh.gpu.test.mjs && node tools/cli.gpu.mjs"
   },
   "dependencies": {
     "ws": "^8.18.0"

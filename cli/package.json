@@ -1,0 +1,23 @@
+{
+  "name": "clusterchat",
+  "version": "0.1.0",
+  "description": "Use a ClusterChat cluster from Claude Code, opencode and other coding agents.",
+  "license": "AGPL-3.0-only",
+  "homepage": "https://clusterchat.io",
+  "repository": { "type": "git", "url": "git+https://github.com/l-wn/ClusterChat.git", "directory": "cli" },
+  "type": "module",
+  "bin": { "clusterchat": "dist/clusterchat.js" },
+  "files": ["dist", "README.md"],
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build": "node build.mjs",
+    "prepack": "node build.mjs"
+  },
+  "dependencies": {
+    "node-datachannel": "^0.33.6",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0"
+  }
+}
