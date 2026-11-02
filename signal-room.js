@@ -69,10 +69,12 @@ export class Room {
     get size() { return this.peers.size; }
     get full() { return this.peers.size >= this.maxPeers; }
 
-    add(id, ws) {
+    // `client` is what the peer says it is (signal-server.js's clientName()),
+    // null for a page.
+    add(id, ws, client = null) {
         const name = freshName(new Set([...this.peers.values()].map((p) => p.name)));
-        this.peers.set(id, { ws, name, cap: 0, lo: null, hi: null, have: null, ready: false, alive: true });
-        this.log(`+ peer ${id} (${this.peers.size} online): ${this.health()}`);
+        this.peers.set(id, { ws, name, client, cap: 0, lo: null, hi: null, have: null, ready: false, alive: true });
+        this.log(`+ peer ${id}${client ? ` (${client})` : ''} (${this.peers.size} online): ${this.health()}`);
     }
 
     // A departure leaves a hole and moves nobody. The remaining peers keep
@@ -83,7 +85,8 @@ export class Room {
         if (!this.peers.delete(id)) return;
         this.#unseat(id);
         this.people.delete(id);
-        this.log(`- peer ${id} ${me ? this.where(me) : ''} (${this.peers.size} online): ${this.health()}`);
+        const ran = me?.ran ? `, ${me.ran.toLocaleString('en-US')} tokens run` : '';
+        this.log(`- peer ${id}${me?.client ? ` (${me.client})` : ''} ${me ? this.where(me) : ''} (${this.peers.size} online)${ran}: ${this.health()}`);
         this.broadcast();
     }
 
@@ -92,7 +95,8 @@ export class Room {
     // claim and never decreasing. See served() in web/split.js.
     roster() {
         return [...this.peers].map(([id, p]) =>
-            ({ id, name: p.name, lo: p.lo, hi: p.hi, have: p.have, cap: p.cap, ready: p.ready }));
+            ({ id, name: p.name, lo: p.lo, hi: p.hi, have: p.have, cap: p.cap, ready: p.ready,
+               ...(p.client && { client: p.client }) }));
     }
 
     broadcast() {
@@ -201,6 +205,13 @@ export class Room {
         const ws = me.ws;
 
         if (m.type === 'pong') { me.alive = true; return; }
+
+        // ran: tokens this peer's GPU has run, logged when it leaves. Only
+        // ever grows; anything else is ignored.
+        if (m.type === 'ran') {
+            if (Number.isSafeInteger(m.n) && m.n > (me.ran ?? 0)) me.ran = m.n;
+            return;
+        }
 
         // capacity: how many positions the peer can hold. Answered with a
         // range, or nulls for a peer below the minimum. A peer may be

@@ -301,6 +301,7 @@ export class Mesh {
                   server = location.origin,
                   WebSocket = globalThis.WebSocket,
                   RTCPeerConnection = globalThis.RTCPeerConnection,
+                  client = null, ran = null,
                   linkWait = LINK_WAIT_MS, readyTimeout = READY_TIMEOUT_MS,
                   linkRetry = LINK_RETRY_MS, linkOpen = LINK_OPEN_MS,
                   fullRetry = FULL_RETRY_MS } = {}) {
@@ -331,6 +332,10 @@ export class Mesh {
         this.ctx = null;
         this.relayOnly = relayOnly;
         this.server = server;
+        this.client = client;       // what this peer says it is in its join; null for a page
+        this.#ran = ran;            // tokens this peer's GPU has run (route.js's ran)
+        // A closing tab's last event. Node has none; it calls stop().
+        globalThis.addEventListener?.('pagehide', () => { if (!this.#closed) this.reportRan(); });
         this.#WebSocket = WebSocket;
         this.#RTCPeerConnection = RTCPeerConnection;
         this.linkWait = linkWait;
@@ -415,6 +420,7 @@ export class Mesh {
             // the room with its model after a restart.
             this.#ws({ type: 'join', v: PROTOCOL, room: this.room.joinToken,
                        ...(this.room.model && { model: this.room.model }),
+                       ...(this.client && { client: this.client }),
                        ...(this.chats && { chats: this.chats }),
                        ...(this.askSessions && { sessions: this.askSessions }),
                        ...(this.askCtx && { ctx: this.askCtx }) });
@@ -470,7 +476,18 @@ export class Mesh {
     }
 
     // Stop reconnecting. The page is going away.
+    #ran = null;
+
+    // Tell the server how many tokens this peer's GPU ran, for the line it
+    // logs when the peer leaves. Sent on leaving: stop(), or the page's
+    // pagehide. A peer that crashes or loses its network sends nothing.
+    reportRan() {
+        const n = this.#ran?.() ?? 0;
+        if (n) this.#ws({ type: 'ran', n });
+    }
+
     stop() {
+        if (!this.#closed) this.reportRan();
         this.#closed = true;
         clearTimeout(this.#watchdog);
         clearTimeout(this.#hang);

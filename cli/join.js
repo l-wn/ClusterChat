@@ -48,7 +48,7 @@ function origin(s) {
 //
 // `on(step, detail)` follows along: 'joined' with info, then 'no-gpus', or
 // 'linking' and then 'linked' { seconds } or 'unlinked'.
-export async function join(target, { on = () => {} } = {}) {
+export async function join(target, { on = () => {}, client = null } = {}) {
     let Polyfill, WebSocket;
     try {
         ({ RTCPeerConnection: Polyfill } = await import('node-datachannel/polyfill'));
@@ -74,7 +74,7 @@ export async function join(target, { on = () => {} } = {}) {
         // which a page wants and a command line does not.
         ({ manifest } = await Promise.race([
             engine.connect({ room, relayOnly: true,
-                platform: { server: target.server, WebSocket, RTCPeerConnection } }),
+                platform: { server: target.server, WebSocket, RTCPeerConnection, client } }),
             new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(
                 `could not reach ${target.server}: ${engine.net?.trouble?.replace(/, retrying in .*/, '') ?? 'no answer'}`)), JOIN_WAIT_MS); }),
         ]));

@@ -291,6 +291,13 @@ const JOIN_TIMEOUT_MS = Number(process.env.JOIN_TIMEOUT_MS) || 10000;
 // Close codes a page reports and does not retry. 4001: a malformed or missing
 // join, or one from a page with another PROTOCOL (a reload fixes it). 4002: a
 // full room or server.
+// What a peer says it is in its join, for the log and the roster: the
+// clusterchat CLI sends `clusterchat/<version>`, a page sends nothing. A
+// label it chose, not a check. Anything but a short plain name is dropped.
+export function clientName(c) {
+    return typeof c === 'string' && /^[A-Za-z0-9][\w.\/-]{0,39}$/.test(c) ? c : null;
+}
+
 export const CLOSE_BAD_JOIN = 4001;
 export const CLOSE_FULL = 4002;
 // 4003: an invite link naming a model this server does not offer.
@@ -452,7 +459,7 @@ wss.on('connection', (ws, req) => {
 
         const id = nextId++;
         joined = { id, key, room };
-        room.add(id, ws);
+        room.add(id, ws, clientName(m.client));
 
         // Handlers are attached before this await: minting can take a round
         // trip to Cloudflare, and an offer arriving meanwhile must be handled.

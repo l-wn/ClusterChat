@@ -172,8 +172,8 @@ export class Engine {
     // replies at once, `sessions` the chats each peer keeps in memory and
     // `ctx` the context window, to ask for if this join creates a private mesh.
     //
-    // `platform` is `{ server, WebSocket, RTCPeerConnection }`, for running
-    // outside a page (see net.js). A page leaves it out.
+    // `platform` is `{ server, WebSocket, RTCPeerConnection, client }`, for
+    // running outside a page (see net.js). A page leaves it out.
     async connect({ room, relayOnly = true, chats = null, sessions = null, ctx = null,
                     platform = {} } = {}) {
         const net = new Mesh({
@@ -183,6 +183,7 @@ export class Engine {
             sessions,
             ctx,
             relayOnly,
+            ran: () => this.#router?.ran ?? 0,
             onMessage: (h, payload, raw, from) => this.#router.route(h, payload, raw, from),
             onChange: () => this.#emit('change'),
         });

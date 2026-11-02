@@ -1529,6 +1529,39 @@ console.log('\nsignal-server: joining a mesh');
     g.close();
 }
 
+console.log('\nsignal-server: a peer that names itself');
+{
+    const { clientName } = await import('../signal-server.js');
+    const named = connect(null, { client: 'clusterchat/0.1.0' });
+    const w = await named.next((m) => m.type === 'welcome');
+    eq('the roster says what it is', w.peers.find((p) => p.id === w.id).client, 'clusterchat/0.1.0');
+    const page = connect();
+    const wp = await page.next((m) => m.type === 'welcome');
+    ok('and a page says nothing', !('client' in wp.peers.find((p) => p.id === wp.id)));
+    eq('anything but a short plain name is dropped',
+        ['clusterchat/0.1.0', 'x'.repeat(41), '<b>hi</b>', 7, null].map(clientName),
+        ['clusterchat/0.1.0', null, null, null, null]);
+    named.close(); page.close();
+}
+
+console.log('\nsignal-server: tokens run, logged when a peer leaves');
+{
+    const { Room } = await import('../signal-room.js');
+    const lines = [];
+    const room = new Room({ positions: 10, head: 9, minBlocks: 1, log: (l) => lines.push(l) });
+    const ws = { readyState: 1, send() {} };
+    room.add(1, ws);
+    room.handle(1, { type: 'ran', n: 18402 });
+    room.handle(1, { type: 'ran', n: 5 });
+    room.handle(1, { type: 'ran', n: 'lots' });
+    room.remove(1);
+    ok('a GPU peer\'s leave line has its total, which only grows', lines.at(-1).includes('(0 online), 18,402 tokens run:'),
+        lines.at(-1));
+    room.add(2, ws, 'clusterchat/0.1.0');
+    room.remove(2);
+    ok('a peer that ran nothing has no count', !lines.at(-1).includes('tokens run'), lines.at(-1));
+}
+
 console.log('\nsignal-server: TURN credentials');
 {
     // Checked against coturn's scheme, computed separately:
@@ -1998,6 +2031,24 @@ console.log('\nsignal-server: the model a private cluster runs');
         eq('a link with a model sends it in the join', s1.sent[0],
             { type: 'join', v: PROTOCOL, room: withModel.joinToken, model: 'qwen3.5-4b' });
         p.stop();
+        const cli = new Mesh({ room, client: 'clusterchat/0.1.0' });
+        const s2 = FakeWS.all.at(-1);
+        s2.open();
+        eq('a client that names itself says so in the join', s2.sent[0],
+            { type: 'join', v: PROTOCOL, room: room.joinToken, client: 'clusterchat/0.1.0' });
+        cli.stop();
+    }
+    {
+        const gpu = new Mesh({ room, ran: () => 18402 });
+        const s = FakeWS.all.at(-1);
+        s.open();
+        gpu.stop();
+        eq('leaving, a peer tells the server how many tokens its GPU ran', s.sent.at(-1), { type: 'ran', n: 18402 });
+        const idle = new Mesh({ room, ran: () => 0 });
+        const t = FakeWS.all.at(-1);
+        t.open();
+        idle.stop();
+        ok('and a peer that ran nothing says nothing', !t.sent.some((m) => m.type === 'ran'));
     }
 
     console.log('\nMesh: fails closed');

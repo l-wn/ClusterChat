@@ -61,7 +61,7 @@ async function connect(args) {
     const where = new URL(target.server).host;
     let s = ui.step(`joining ${where}`), joined = null;
     const gpuText = () => `${joined.gpus} GPU${joined.gpus === 1 ? '' : 's'} serving`;
-    const { engine, template, info } = await join(target, { on: (what, d) => {
+    const { engine, template, info } = await join(target, { client: `clusterchat/${VERSION}`, on: (what, d) => {
         if (what === 'joined') {
             joined = d;
             s.done('joined', `${where} ${c.dim('·')} ${d.room}`);
