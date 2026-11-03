@@ -49,6 +49,11 @@ signaling server over real sockets, a chain of Runners over a stub GPU, and
 `mesh.test.mjs`: N routers on a simulated wire, including a seeded soak that
 kills peers at random (`--seed N`) and a fuzzer (`--fuzz N --fuzz-seed S`).
 
+`node tools/f16.test.mjs --exhaustive` compares `toF16()`'s two paths over all
+2^32 floats (a few minutes, so not in `npm test`). Run it if either path is
+touched: a disagreement means two browsers would hand on different bits for
+the same rows.
+
 `npm run test:gpu` needs Chrome and a real GPU (it aborts on a software
 adapter). It takes the binary from `$CHROME`, else the first of
 `google-chrome`, `google-chrome-stable`, `chromium` or `chromium-browser` on

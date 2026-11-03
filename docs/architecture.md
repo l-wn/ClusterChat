@@ -328,6 +328,7 @@ TURN on the server: without it no link opens and the page says so.
 of showing its address to the peers it links to. The test harness links
 directly unless given `relay=1`.
 
+
 ## Routing
 
 A job carries a **cursor**, `pos`: the position its residual stream has
@@ -407,9 +408,12 @@ Messages are a JSON header plus an optional f16 payload (`net.js`):
 ```
 
 The payload is IEEE half precision (`web/f16.js`: round to nearest even,
-values past ±65504 clamped to it). A Runner rounds the rows it hands on once,
-where they leave it, and keeps those bits in its boundary log, so the next
-peer, a replay and a repair all see the same values. On Qwen3.8-27B a row is
+values past ±65504 clamped to it). Those two rules decide a reply, so
+`toF16()` has a `Float16Array` path and a scalar `toF16Scalar()` that defines
+them, and `tools/f16.test.mjs --exhaustive` holds the two to each other over
+all 2^32 floats. A Runner rounds the rows it hands on once, where they leave
+it, and keeps those bits in its boundary log, so the next peer, a replay and a
+repair all see the same values. On Qwen3.8-27B a row is
 10 KiB, against 20 KiB in f32, at about 5e-4 relative error per hop (int8
 was measured at about 1%, from outlier channels near 200 against an rms near
 2). A reply therefore depends on where the cuts fall: it is identical for
