@@ -2207,5 +2207,92 @@ console.log('\nsignal-server: the model a private cluster runs');
     globalThis.RTCPeerConnection = was.pc;
 }
 
+// --- A private link that names no model runs the global mesh's checkpoint ---
+//
+// LEGACY_MODEL is the id of the checkpoint the global mesh runs, and a link
+// naming it is written without a model (web/room.js). So a private room with
+// no model must run exactly what WEIGHTS_URL, MANIFEST, N_LAYER and MIN_BLOCKS
+// say, not what the checkpoint file's `models` entry for that id says. Needs
+// its own server, because those are read once at import, so this spawns one.
+console.log('\na private link with no model runs the checkpoint the server runs');
+{
+    const { spawn } = await import('node:child_process');
+    const { mkdtempSync, mkdirSync, writeFileSync } = await import('node:fs');
+    const { tmpdir } = await import('node:os');
+    const { join } = await import('node:path');
+    const { LEGACY_MODEL } = await import('../web/room.js');
+
+    const dir = mkdtempSync(join(tmpdir(), 'clusterchat-legacy-'));
+    const mf = (model, n_layer) => ({ model, n_layer, hidden: 256, n_head: 4, n_kv_head: 2,
+        head_dim: 64, ffn: 512, vocab: 1000, n_pos: 262144, dtype: 'f16' });
+    // `ran` is what the server is told to run; `listed` is what the file's
+    // entry for LEGACY_MODEL points at. They differ on purpose: that is the
+    // shape of every test run and of a self-hosted server pointing at a local
+    // conversion, and the two manifests differ in depth so the geometry says
+    // which one was picked.
+    for (const [d, m] of [['ran', mf('the-one-it-runs', 12)], ['listed', mf('the-one-listed', 40)]]) {
+        mkdirSync(join(dir, 'weights', d), { recursive: true });
+        writeFileSync(join(dir, 'weights', d, 'manifest.json'), JSON.stringify(m));
+    }
+    writeFileSync(join(dir, 'checkpoint.json'), JSON.stringify({
+        url: '/weights/listed',
+        models: [{ id: LEGACY_MODEL, name: 'Listed', url: '/weights/listed' }],
+    }));
+
+    const port = 8101;
+    // The env the in-process server above was given is still set, and N_LAYER
+    // and MANIFEST would both hide which manifest was read. MIN_BLOCKS stays,
+    // at a value of this section's own, to show it reaches the private room.
+    const env = { ...process.env, PORT: String(port), CHECKPOINT: join(dir, 'checkpoint.json'),
+                  WEIGHTS_URL: '/weights/ran', MIN_BLOCKS: '2' };
+    delete env.N_LAYER;
+    delete env.MANIFEST;
+    const proc = spawn('node', ['signal-server.js'], {
+        cwd: new URL('..', import.meta.url).pathname,
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    proc.stdout.on('data', (d) => { out += d; });
+    proc.stderr.on('data', (d) => { out += d; });
+    try {
+        for (let i = 0; i < 100 && !/signaling on/.test(out); i++) {
+            await new Promise((r) => setTimeout(r, 50));
+        }
+        const welcome = (room) => new Promise((resolve, reject) => {
+            const ws = new WS(`ws://localhost:${port}`);
+            const t = setTimeout(() => { ws.close(); reject(new Error('no welcome')); }, 3000);
+            ws.on('open', () => ws.send(JSON.stringify({ type: 'join', v: PROTOCOL, room })));
+            ws.on('message', (d) => {
+                const m = JSON.parse(d);
+                if (m.type !== 'welcome') return;
+                clearTimeout(t); ws.close(); resolve(m);
+            });
+            ws.on('error', reject);
+        });
+
+        const global = await welcome(null);
+        eq('the global mesh runs WEIGHTS_URL, not the file\'s url', global.weightsUrl, '/weights/ran');
+        eq('with that checkpoint\'s depth', global.blocks, 12);
+
+        const token = (await openRoom(newSecret())).joinToken;
+        const priv = await welcome(token);
+        ok('a private room was opened', priv.private === true);
+        // Before the fix these were '/weights/listed' and 40: the entry was
+        // built from the file, so the room ran a different checkpoint than the
+        // server, and a peer in it refused to boot on the wrong depth.
+        eq('a private link naming no model runs the same checkpoint',
+            priv.weightsUrl, '/weights/ran');
+        eq('and is placed on that checkpoint\'s line', [priv.blocks, priv.positions], [12, 14]);
+        eq('and takes MIN_BLOCKS, as the global mesh does', priv.minBlocks, 2);
+        ok('the boot log says the entry is the global mesh\'s',
+            /private model .*\(the global mesh's\)/.test(out), out.split('\n').slice(0, 6).join(' | '));
+        ok('and warns that the file points somewhere else',
+            /is not the checkpoint this server runs/.test(out), '');
+    } finally {
+        proc.kill('SIGKILL');
+    }
+}
+
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);

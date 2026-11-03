@@ -152,8 +152,9 @@ function geometry(manifest, { nLayer, minBlocks } = {}) {
 const manifest = await readManifest(WEIGHTS_URL, process.env.MANIFEST || localManifest(WEIGHTS_URL));
 const dims = manifest && costDims(manifest);
 
-// The global mesh's model. Also the model of a private link that names none
-// (LEGACY_MODEL) when the checkpoint file does not list LEGACY_MODEL.
+// The global mesh's model, and the model of a private link that names none
+// (LEGACY_MODEL): those are the same checkpoint, so the entry MODELS holds for
+// LEGACY_MODEL is built from this and not from the checkpoint file.
 const MESH_MODEL = Object.freeze({
     id: null, name: manifest?.model ?? 'unknown model', url: WEIGHTS_URL,
     ...geometry(manifest, { nLayer: process.env.N_LAYER, minBlocks: process.env.MIN_BLOCKS }),
@@ -162,6 +163,15 @@ const { blocks: BLOCKS, positions: POSITIONS, minBlocks: MIN_BLOCKS } = MESH_MOD
 
 // The models a private cluster can run, by id. One whose manifest cannot be
 // read is left out, so a link naming it is refused rather than run blind.
+//
+// LEGACY_MODEL is the exception: it names the global mesh's own checkpoint, so
+// its entry is MESH_MODEL under that id, keeping only the file's display name.
+// Its url and geometry must come from the same places the global mesh's do —
+// WEIGHTS_URL, MANIFEST, N_LAYER, MIN_BLOCKS — because a private link that
+// names no model is a link to that checkpoint. Reading them from the file
+// instead would send such a link to whatever the file lists on every server
+// that overrides any of the four, which is every test run and every
+// self-hosted server pointing at a local conversion.
 const MODEL_ID = /^[a-z0-9][a-z0-9.-]{0,39}$/;
 const MODELS = new Map();
 for (const e of Array.isArray(checkpoint?.models) ? checkpoint.models : []) {
@@ -172,6 +182,20 @@ for (const e of Array.isArray(checkpoint?.models) ? checkpoint.models : []) {
     }
     const url = checkUrl(e.url.replace(/\/$/, ''), `${CHECKPOINT} (${e.id})`);
     if (!url) continue;
+    if (e.id === LEGACY_MODEL) {
+        // A file whose LEGACY_MODEL entry points somewhere else is
+        // contradictory: the entry and no entry at all mean the same link.
+        if (url !== WEIGHTS_URL) {
+            console.warn(`${CHECKPOINT} (${e.id}): "${url}" is not the checkpoint this server `
+                + `runs (${WEIGHTS_URL}), and ${e.id} is the id of that one. A private link `
+                + 'naming it, or naming no model, runs ' + WEIGHTS_URL + '.');
+        }
+        MODELS.set(e.id, Object.freeze({
+            ...MESH_MODEL, id: e.id,
+            name: typeof e.name === 'string' ? e.name : MESH_MODEL.name,
+        }));
+        continue;
+    }
     const m = url === WEIGHTS_URL && manifest ? manifest : await readManifest(url);
     if (!m) {
         console.warn(`${CHECKPOINT}: no manifest for ${e.id}, so private clusters cannot run it`);
@@ -373,9 +397,11 @@ console.log(`signaling on ws://${HOST}:${PORT}: ${manifest?.model ?? 'unknown mo
 console.log(`  weights: ${WEIGHTS_URL}${process.env.WEIGHTS_URL ? ' (WEIGHTS_URL override)'
     : ` (from ${CHECKPOINT})`}`);
 for (const m of MODELS.values()) {
-    console.log(`  private model ${m.id}: ${m.name}, ${m.blocks} blocks, min ${m.minBlocks} per peer, ${m.url}`);
+    console.log(`  private model ${m.id}: ${m.name}, ${m.blocks} blocks, min ${m.minBlocks} per peer, `
+        + `${m.url}${m.id === LEGACY_MODEL ? ' (the global mesh\'s)' : ''}`);
 }
-if (!MODELS.has(LEGACY_MODEL)) console.log(`  a private link with no model runs the global mesh's`);
+console.log(`  a private link with no model runs ${MODELS.get(LEGACY_MODEL)?.name
+    ?? "the global mesh's"}`);
 console.log(`  chats at once: ${Number.isFinite(MAX_CHATS) ? MAX_CHATS : 'no limit'} in the global mesh, `
     + `${Number.isFinite(MAX_PRIVATE_CHATS) ? `at most ${MAX_PRIVATE_CHATS}` : 'no cap'} in a private one`);
 console.log(`  people chatting: ${Number.isFinite(MAX_PEOPLE) ? MAX_PEOPLE : 'no limit'} in the global mesh, `
