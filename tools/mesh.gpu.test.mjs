@@ -1168,6 +1168,29 @@ function check(row, reference) {
     const batchedJobs = runners.reduce((n, s) => n + (s.runner.batchedJobs ?? 0), 0);
     if (batched) console.log(`    batching: ${batched} passes carried ${batchedJobs} jobs`);
 
+    // What ICE settled on (net.js's `transports`). The harness links directly
+    // unless given relay=1, so an open link reporting `relayed` means a direct
+    // route was not found even between two tabs on this machine, which would
+    // make every measurement here a relay measurement. Skipped on --wire bc,
+    // which has no RTCPeerConnection at all.
+    if (WIRE === 'rtc') {
+        const links = (row.stats ?? []).flatMap((st) => st.transports ?? []).filter((t) => t.open);
+        if (links.length) {
+            const unread = links.filter((t) => t.local === null);
+            ok(`${row.name}: every open link reported what it negotiated`, unread.length === 0,
+                `${unread.length} of ${links.length} links had no readable candidate pair`);
+            const relayed = links.filter((t) => t.relayed);
+            ok(`${row.name}: and took a direct route, not the relay`, relayed.length === 0,
+                `${relayed.length} of ${links.length} links went through the TURN relay`);
+            const kinds = {};
+            for (const t of links) {
+                const k = `${t.local} to ${t.remote}`;
+                kinds[k] = (kinds[k] ?? 0) + 1;
+            }
+            console.log(`    links: ${Object.entries(kinds).map(([k, n]) => `${n} ${k}`).join(', ')}`);
+        }
+    }
+
     const ladder = all.flatMap((r) => r.events ?? []);
     const repairs = ladder.filter((e) => e === 'repair').length;
     const fixes = ladder.filter((e) => e === 'fix').length;

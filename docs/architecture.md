@@ -328,6 +328,23 @@ TURN on the server: without it no link opens and the page says so.
 of showing its address to the peers it links to. The test harness links
 directly unless given `relay=1`.
 
+**What a link actually took.** `?direct=1` only allows a direct route; it does
+not guarantee one, and two peers behind NATs that cannot reach each other fall
+back to the relay with nothing said. So when a channel opens, the peer reads
+the candidate pair ICE settled on and logs one line for it:
+
+```
+link to peer 7: host↔host over udp (direct)
+link to peer 9: relay↔relay over udp (through the TURN relay: no direct route was found)
+```
+
+`Mesh.transports` returns the same per link (`{ id, open, local, remote,
+protocol, relayed }`, with the candidate types `host`, `srflx`, `prflx` or
+`relay`), and the dev harness reports it from `stats()`. This is diagnostics
+only: nothing in the mesh reads it, and a failed read leaves the entry null.
+It matters because a relayed hop is policed per address (see Routing's
+`ACK_RATE` note), so two GPU peers that quietly relay to each other cap the
+prefill rate of the whole cluster.
 
 ## Routing
 

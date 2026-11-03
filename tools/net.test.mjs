@@ -411,6 +411,30 @@ console.log('\nMesh.linked: an open channel, not merely a pending connection');
     ok('unknown peer', m.linked(99) === false);
 }
 
+console.log('\nMesh.transports: what ICE settled on, per link');
+{
+    const m = mesh(P(0, 0, 10), thirds, { links: [1], gathering: [2] });
+    // #readTransport() fills this in when a channel opens; a link that never
+    // opened has none.
+    m.links.get(1).transport = { local: 'host', remote: 'host', protocol: 'udp', relayed: false };
+    const by = Object.fromEntries(m.transports.map((t) => [t.id, t]));
+    ok('one entry per link, keyed by peer id',
+        JSON.stringify(Object.keys(by).map(Number).sort()) === '[1,2]',
+        JSON.stringify(m.transports));
+    ok('an open link reports what it negotiated',
+        by[1].open === true && by[1].local === 'host' && by[1].relayed === false);
+    // Null, not absent: a caller distinguishing "direct" from "not read yet"
+    // must not have to test for a missing key.
+    ok('a link that has not opened reports nulls, with the same keys',
+        by[2].open === false && by[2].local === null && by[2].remote === null
+            && by[2].protocol === null && by[2].relayed === null,
+        JSON.stringify(by[2]));
+    ok('a relayed link says so', (() => {
+        m.links.get(1).transport = { local: 'relay', remote: 'host', protocol: 'udp', relayed: true };
+        return m.transports.find((t) => t.id === 1).relayed === true;
+    })());
+}
+
 console.log('\nMesh.send: a backed-up link takes no more work, and still carries the news');
 {
     // What one hop sends the next: a job with its residual stream, and

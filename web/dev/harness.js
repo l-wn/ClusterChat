@@ -336,6 +336,9 @@ export const api = {
             online: net?.online ?? false,
             connected: net?.connected ?? false,
             links: net?.links ? [...net.links.keys()] : [],
+            // What ICE settled on per link (net.js's `transports`): whether a
+            // GPU-to-GPU link went direct or fell back to the TURN relay.
+            transports: net?.transports ?? [],
             // `open`: the peers with an open channel, the only ones a message
             // can reach. `roster`: every peer id this tab knows of.
             open: net?.links ? [...net.links.keys()].filter((id) => net.linked(id)) : [],

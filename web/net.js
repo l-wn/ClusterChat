@@ -316,7 +316,7 @@ export class Mesh {
         this.onChange = onChange;
         this.rate = rate;
         this.ice = ICE;             // until the welcome brings the real list
-        this.links = new Map();     // id -> { pc, ch, offerer }
+        this.links = new Map();     // id -> { pc, ch, offerer, transport }
         this.room = room;
         this.chats = chats;
         // Replies that may generate at once in this mesh, from the welcome.
@@ -622,6 +622,24 @@ export class Mesh {
     // Whether a message can be sent to this peer now: the channel is open, not
     // only an RTCPeerConnection gathering ICE.
     linked(id) { return this.#live(id); }
+
+    // What each link actually negotiated: one entry per link, with the
+    // candidate types ICE settled on (`host`, `srflx`, `prflx` or `relay`) at
+    // each end. `relayed` is true when either end is the TURN relay, which is
+    // the whole point of reading this: `relayOnly` forces a relay, but a
+    // direct tab (?direct=1) falls back to one silently when two peers cannot
+    // reach each other, and the fallback costs bandwidth the relay polices.
+    //
+    // Reads the field #readTransport() recorded when the channel opened, so
+    // this is a plain getter with no getStats() behind it. `transport` is null
+    // on a link that has not opened, or whose stats could not be read.
+    get transports() {
+        return [...this.links.entries()].map(([id, link]) => ({
+            id,
+            open: link.ch?.readyState === 'open',
+            ...(link.transport ?? { local: null, remote: null, protocol: null, relayed: null }),
+        }));
+    }
 
     // State how many positions this tab can hold. Resolves to the range the
     // server assigns, or null if it assigns none (the capacity is below the
@@ -1095,12 +1113,59 @@ export class Mesh {
             this.#retries.delete(link.id);
             this.#flush();
             this.onChange?.();
+            // Diagnostics only, and not awaited: the link is already usable.
+            this.#readTransport(link).catch(() => { /* reported inside */ });
         });
         ch.addEventListener('close', () => {
             this.#linkFailed(link, 'closed');
             this.#flush();
             this.onChange?.();
         });
+    }
+
+    // Record which candidate pair ICE settled on, once, when the channel
+    // opens, and log it. Nothing in the mesh reads the result: it is here so
+    // that a GPU peer's log says whether its link to another GPU went direct
+    // or through the relay, which is otherwise invisible from outside the
+    // browser (see `transports`). Any failure leaves `link.transport` null;
+    // this must never affect the link.
+    async #readTransport(link) {
+        let pair = null, local = null, remote = null;
+        try {
+            const stats = await link.pc.getStats?.();
+            if (!stats) return;
+            // The pair in use. An ICE restart can leave an older nominated
+            // pair in the report, so succeeded wins over nominated alone.
+            for (const r of stats.values()) {
+                if (r.type !== 'candidate-pair') continue;
+                if (r.state === 'succeeded' && r.nominated) { pair = r; break; }
+                if (r.state === 'succeeded' || (r.nominated && !pair)) pair = r;
+            }
+            if (!pair) return;
+            local = stats.get(pair.localCandidateId);
+            remote = stats.get(pair.remoteCandidateId);
+        } catch (err) {
+            console.warn(`peer ${link.id}: could not read the link's transport: ${err.message}`);
+            return;
+        }
+        // A link let go while getStats() was in flight is not worth reporting.
+        if (link.dead || this.links.get(link.id) !== link) return;
+
+        const t = {
+            local: local?.candidateType ?? null,
+            remote: remote?.candidateType ?? null,
+            protocol: local?.protocol ?? null,
+            relayed: local?.candidateType === 'relay' || remote?.candidateType === 'relay',
+        };
+        link.transport = t;
+        // Relayed is expected on a relay-only tab and notable on a direct one.
+        const how = t.relayed
+            ? (this.relayOnly ? 'through the TURN relay, as this tab asks for'
+                              : 'through the TURN relay: no direct route was found')
+            : 'direct';
+        console.info(`link to peer ${link.id}: ${t.local} to ${t.remote} over `
+            + `${t.protocol ?? '?'} (${how})`);
+        this.onChange?.();
     }
 
     // Detect a link that will not open or has failed: its ICE failed, its
