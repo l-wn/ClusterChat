@@ -65,6 +65,29 @@ const say = (s, err = false) => {
 const events = [];
 let engine = null;
 
+// Tasks over 50ms on the main thread, which is where a missed signaling ping
+// comes from: the socket's message listener, the ack timers and WebRTC's
+// callbacks all wait behind whatever is running. Counted here rather than in
+// web/net.js so a real tab carries nothing. `stats().longtasks` is null where
+// the entry type is unsupported, which is not the same as "none seen".
+let longtasks = null;
+function watchLongTasks() {
+    if (typeof PerformanceObserver !== 'function') return;
+    const seen = { count: 0, totalMs: 0, maxMs: 0 };
+    try {
+        new PerformanceObserver((list) => {
+            for (const e of list.getEntries()) {
+                seen.count++;
+                seen.totalMs += e.duration;
+                seen.maxMs = Math.max(seen.maxMs, e.duration);
+            }
+        }).observe({ type: 'longtask', buffered: true });
+    } catch {
+        return;              // not supported here; stays null
+    }
+    longtasks = seen;
+}
+
 let CHAT = 'transcript';
 let TURN_RE = stopRe(CHAT);
 let booted = null;
@@ -89,6 +112,7 @@ export async function boot() {
     LABEL = q.get('label') ?? ROLE;
     WIRE = q.get('wire') === 'bc' ? 'bc' : 'rtc';
     log = document.getElementById('log');
+    watchLongTasks();
 
     // Installed before the Engine is created, so no link is negotiated over
     // the real WebRTC API first.
@@ -362,6 +386,10 @@ export const api = {
             } : null,
             events: events.map((e) => ({ type: e.type, at: Math.round(e.at) })),
             nMax: engine.ctxMax,
+            // null where the browser has no longtask entries, not zero.
+            longtasks: longtasks && { count: longtasks.count,
+                                      totalMs: Math.round(longtasks.totalMs),
+                                      maxMs: Math.round(longtasks.maxMs) },
         };
     },
 
