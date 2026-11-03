@@ -49,8 +49,10 @@ signaling server over real sockets, a chain of Runners over a stub GPU, and
 `mesh.test.mjs`: N routers on a simulated wire, including a seeded soak that
 kills peers at random (`--seed N`) and a fuzzer (`--fuzz N --fuzz-seed S`).
 
-`npm run test:gpu` needs `google-chrome` and a real GPU (it aborts on a
-software adapter). It builds `weights/tiny-test` (`tools/tinymodel.mjs`, the
+`npm run test:gpu` needs Chrome and a real GPU (it aborts on a software
+adapter). It takes the binary from `$CHROME`, else the first of
+`google-chrome`, `google-chrome-stable`, `chromium` or `chromium-browser` on
+`PATH`. It builds `weights/tiny-test` (`tools/tinymodel.mjs`, the
 real architecture at 1.3 MB) and runs `tools/mesh.gpu.test.mjs`: several people
 prompting at once across many real tabs, the real signaling server and real
 datachannels, with greedy decoding diffed against a single peer. Options:

@@ -15,9 +15,9 @@
 // Use Playwright if those are needed.
 
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, accessSync, constants } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, delimiter } from 'node:path';
 import WebSocket from 'ws';
 
 // Headless WebGPU on Linux needs Vulkan through ANGLE and the GPU sandbox
@@ -46,9 +46,31 @@ const FLAGS = [
     '--no-default-browser-check',
 ];
 
+// The names Chrome is installed under, in order of preference. Debian's
+// package is `google-chrome-stable` and Google's own tarball is
+// `google-chrome`, so a harness that hard-codes either fails on half the
+// machines with `spawn google-chrome ENOENT`.
+const CHROME_NAMES = ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser'];
+
+// The Chrome binary to spawn: $CHROME if set, else the first of CHROME_NAMES
+// on PATH. Throws naming every name tried, since the alternative is an ENOENT
+// that does not say what was looked for.
+export function chromeBinary(env = process.env) {
+    if (env.CHROME) return env.CHROME;
+    const dirs = (env.PATH ?? '').split(delimiter).filter(Boolean);
+    for (const name of CHROME_NAMES) {
+        for (const dir of dirs) {
+            const path = join(dir, name);
+            try { accessSync(path, constants.X_OK); return path; } catch { /* next */ }
+        }
+    }
+    throw new Error(`no Chrome on PATH (tried ${CHROME_NAMES.join(', ')}). `
+        + 'Install one, or set CHROME to the binary.');
+}
+
 export async function launch({ port = 0, verbose = false } = {}) {
     const profile = mkdtempSync(join(tmpdir(), 'clusterchat-harness-'));
-    const chrome = spawn('google-chrome', [
+    const chrome = spawn(chromeBinary(), [
         ...FLAGS,
         `--remote-debugging-port=${port}`,
         `--user-data-dir=${profile}`,
