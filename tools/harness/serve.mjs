@@ -74,7 +74,14 @@ export function serve({ root, signalPort, onReport } = {}) {
         // Single ranges only, which is all it requests.
         const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range ?? '');
         const type = TYPES[extname(path)] ?? 'application/octet-stream';
+        // The harness pages run their Engine in a worker that reads each
+        // link's bufferedAmount out of a SharedArrayBuffer. That needs the
+        // page cross-origin isolated, as Caddyfile makes production — without
+        // these two the worker silently falls back to its estimate and the
+        // shared-memory path is never exercised by the suite.
         const head = { 'content-type': type, 'accept-ranges': 'bytes',
+                       'cross-origin-opener-policy': 'same-origin',
+                       'cross-origin-embedder-policy': 'require-corp',
                        'cache-control': 'no-store' };
 
         if (range) {

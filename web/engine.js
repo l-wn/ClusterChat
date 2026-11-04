@@ -16,6 +16,7 @@ import { Runner, KEEP_WARM_MS } from './model/stage.js';
 import { encode, decode, source as tokenizerSource } from './model/tokenizer.js';
 import { runAllTests } from './dev/kernels.test.js';
 import { smokeForward } from './dev/smoke.js';
+import { ContextFullError } from './errors.js';
 import { Mesh } from './net.js';
 import { makeRouter, makeConversation, T_MAX } from './route.js';
 import { blockBytes, endBytes, mtpBytes, floorBlocks, positions, describeRange, DEFAULT_CTX, SLOTS,
@@ -53,14 +54,12 @@ const gib = (b) => `${(b / 2 ** 30).toFixed(2)} GiB`;
 const keepChunk = (samples, a) => samples.push({ kind: 'prefill', n: a.n, rt: a.rt,
     ...(a.link && { link: a.link }), trace: a.trace ?? [] });
 
-export class ContextFullError extends Error {
-    constructor(needed, room, ctx) {
-        super(`this prompt needs ${needed} tokens and only ${room} are left in the ` +
-            `${ctx}-token context`);
-        this.needed = needed;
-        this.room = room;
-    }
-}
+// Defined in web/errors.js and re-exported here, so the page can test
+// `instanceof` without importing this module and the whole model layer with
+// it. Every existing `import { ContextFullError } from './engine.js'` still
+// resolves. Imported as well as re-exported, because a bare `export … from`
+// binds nothing locally and #prepare() constructs one.
+export { ContextFullError };
 
 export class Engine {
     #net = null;

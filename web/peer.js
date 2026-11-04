@@ -1,11 +1,18 @@
-// A peer in the mesh: the DOM layer around one Engine (web/engine.js), which
-// joins the mesh, holds and grows a range, and generates tokens. This file
-// boots the page, wires events, picks the chat format, and renders the
-// transcript, the chat list, the health line, the Contribute drawer and the
-// piece bar. The page calls a mesh a "cluster" and a peer a "computer".
+// A peer in the mesh: the DOM layer around one serving worker
+// (web/serve-client.js). Behind that client is the Engine (web/engine.js),
+// which joins the mesh, holds and grows a range, and generates tokens — on a
+// thread of its own, so nothing here waits behind a prefill. This file boots
+// the page, wires events, picks the chat format, and renders the transcript,
+// the chat list, the health line, the Contribute drawer and the piece bar. The
+// page calls a mesh a "cluster" and a peer a "computer".
+//
+// What stays on this thread: the DOM, the saved chats (web/history.js, which
+// is IndexedDB and a cross-tab BroadcastChannel), the invite in the URL
+// fragment (web/room.js, which needs `location` and sessionStorage), and the
+// RTCPeerConnections, the one thing a worker cannot have (web/rtc-host.js).
 
 import { dimsFromManifest } from './model/loader.js';
-import { Engine, ContextFullError } from './engine.js';
+import { EngineClient } from './serve-client.js';
 import { positions, coverage, holders, holding, filling, describeRange, storedBytes, costDims,
          blockBytes, blockWeightBytes, endBytes, mtpBytes } from './split.js';
 import { chatFormat, stopRe } from './prompt.js';
@@ -15,7 +22,7 @@ import { summarize, formatLine, formatText } from './profile.js';
 import { readInvite, inviteModel, openRoom, inviteUrl, cleanName, NAME_MAX, nameKey, creatorKey, chatsKey, sessionsKey, ctxKey } from './room.js';
 import { saveChoice } from './welcome.js';
 import { lendSlider, limitGb, MAX_GB, DEFAULT_GB } from './lend.js';
-import { PROBLEMS, classify, report } from './errors.js';
+import { PROBLEMS, classify, report, ContextFullError } from './errors.js';
 import { openHistory, idbBackend, memoryBackend, newRecord, groupByDay } from './history.js';
 
 // The turn wrapper and the regex that cuts a runaway reply, from the
@@ -847,17 +854,23 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
     // ?warm=0: no keep-warm kernel between jobs (stage.js KEEP_WARM_MS).
     // ?batch=0: each job in a pass of its own (stage.js #batchWith).
     const params = new URLSearchParams(location.search);
-    engine = new Engine({ onEvent: handleEngineEvent,
-                          mtp: params.get('mtp') !== '0',
-                          warm: params.get('warm') !== '0',
-                          batch: params.get('batch') !== '0' });
+    engine = new EngineClient({ onEvent: handleEngineEvent,
+                                mtp: params.get('mtp') !== '0',
+                                warm: params.get('warm') !== '0',
+                                batch: params.get('batch') !== '0' });
 
     let manifest;
     try {
-        ({ manifest } = await engine.connect({ room, relayOnly: !directParam(),
-                                               chats: creatorChats(secret),
-                                               sessions: creatorSessions(secret),
-                                               ctx: creatorCtx(secret) }));
+        // The invite, not the room: openRoom()'s result closes over a
+        // non-extractable CryptoKey and cannot be cloned, so the worker
+        // derives the same room from the same secret. This side keeps its own
+        // for `historyTag` (the saved chats) and `tag` (the header chip).
+        ({ manifest } = await engine.connect({
+            invite: { secret, model: inviteModel(location.hash) },
+            relayOnly: !directParam(),
+            chats: creatorChats(secret),
+            sessions: creatorSessions(secret),
+            ctx: creatorCtx(secret) }));
     } catch (err) {
         console.warn('connect failed:', err);
         ui.title.textContent = 'ClusterChat';

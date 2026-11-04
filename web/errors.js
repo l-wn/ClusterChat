@@ -52,3 +52,18 @@ export function report(key, err) {
     if (err != null) console.error(`[${p.code}]`, err);
     return message(key);
 }
+
+// Thrown by engine.generate() when a prompt does not fit the context window.
+// It lives here rather than in web/engine.js so the main thread can test
+// `instanceof` without importing the engine — once the engine runs in a
+// worker, importing it would pull the kernels and the whole model layer back
+// into the page. web/engine.js re-exports it, so every existing import of it
+// from there still resolves.
+export class ContextFullError extends Error {
+    constructor(needed, room, ctx) {
+        super(`this prompt needs ${needed} tokens and only ${room} are left in the ` +
+            `${ctx}-token context`);
+        this.needed = needed;
+        this.room = room;
+    }
+}

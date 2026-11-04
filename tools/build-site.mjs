@@ -2,10 +2,10 @@
 //
 // It is an allowlist: a file reaches dist/ only if a page references it. For
 // each page, the <script src> and <link href> files it references are copied,
-// then every module they import, recursively. This includes
-// web/dev/kernels.test.js and web/dev/smoke.js (engine.js runs them as its
-// GPU self-checks) and excludes dev.html, the benchmarks, tools/, oracle/ and
-// the repo's dotfiles.
+// then every module they import, recursively, plus any worker they start and
+// everything it imports. This includes web/dev/kernels.test.js and
+// web/dev/smoke.js (engine.js runs them as its GPU self-checks) and excludes
+// dev.html, the benchmarks, tools/, oracle/ and the repo's dotfiles.
 //
 //   node tools/build-site.mjs        # or: npm run build
 //
@@ -59,12 +59,22 @@ function underWeb(file) {
 // Relative specifiers only: the app has no bare imports and no bundler.
 const IMPORT_RE = /\b(?:import|export)\s[^'"`]*?from\s*['"](\.{1,2}\/[^'"]+)['"]|\bimport\s*\(?\s*['"](\.{1,2}\/[^'"]+)['"]/g;
 
+// A worker entry point, which IMPORT_RE cannot see: the module is a string
+// argument, not a specifier. Without this the worker and its whole import
+// graph would be missing from dist/ and 404 in production only — everywhere
+// else serves the repo itself, where the file is simply there. Matched on
+// `new URL(…, import.meta.url)` because that is the only form that resolves
+// correctly from a module.
+const WORKER_RE = /new\s+Worker\s*\(\s*new\s+URL\s*\(\s*['"](\.{1,2}\/[^'"]+)['"]\s*,\s*import\.meta\.url/g;
+
 function crawlModule(file) {
     const published = underWeb(file);
     if (out.has(published)) return;
     add(published, file);
     const src = readFileSync(file, 'utf8');
-    for (const m of src.matchAll(IMPORT_RE)) crawlModule(resolve(dirname(file), m[1] ?? m[2]));
+    for (const re of [IMPORT_RE, WORKER_RE]) {
+        for (const m of src.matchAll(re)) crawlModule(resolve(dirname(file), m[1] ?? m[2]));
+    }
 }
 
 // A page's local scripts and stylesheets. Absolute paths (/favicon.svg) are

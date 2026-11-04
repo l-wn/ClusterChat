@@ -7,7 +7,7 @@
 // to that. Real ICE adds a second per link, a full mesh of workers has O(n^2)
 // links, and ICE can fail for reasons unrelated to the model.
 //
-// This file installs a replacement for `window.RTCPeerConnection` that
+// This file installs a replacement for `globalThis.RTCPeerConnection` that
 // implements the methods net.js uses, over a BroadcastChannel, which is
 // ordered, reliable, cross-tab and carries ArrayBuffers. net.js is unchanged:
 // the offer and answer go through the real signaling server,
@@ -144,9 +144,12 @@ class BroadcastPeerConnection extends EventTarget {
     }
 }
 
-// Installed on the window, not injected through net.js, so net.js needs no
-// test hook.
+// Installed on the global, not injected through net.js, so net.js needs no
+// test hook. That global is the serving worker's, not the page's: the Engine
+// and net.js run in there (web/serve-host.js), which is also why `--wire bc`
+// needs no RTC proxy at all — BroadcastChannel works in a worker, and one
+// worker per tab keeps this file's one-realm-per-peer assumption.
 export function installBroadcastWire() {
-    window.RTCPeerConnection = BroadcastPeerConnection;
+    globalThis.RTCPeerConnection = BroadcastPeerConnection;
     return { wire: 'bc', maxMessage: MAX_MESSAGE };
 }

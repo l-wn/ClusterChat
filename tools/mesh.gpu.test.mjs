@@ -1195,14 +1195,22 @@ function check(row, reference) {
     // delays a signaling pong, an ack timer and WebRTC's own callbacks.
     // Reported, never asserted: the number is a property of this GPU. null
     // means the browser has no longtask entries, which is not "none seen".
-    const lt = (row.stats ?? []).map((st) => st.longtasks).filter(Boolean);
-    if (lt.length) {
-        const count = lt.reduce((n, x) => n + x.count, 0);
-        const total = lt.reduce((n, x) => n + x.totalMs, 0);
-        const worst = Math.max(...lt.map((x) => x.maxMs));
-        console.log(`    main thread: ${count} tasks over 50ms across ${lt.length} tabs, ` +
+    //
+    // The serving peer runs in a worker, so this should now be near zero —
+    // which is the point of it. The line below is the same measure on the
+    // worker's side, where the work actually is: a PerformanceObserver cannot
+    // see across realms, so without it a fall to zero here would not say
+    // whether the contention moved or merely went out of view.
+    const stalls = (name, xs) => {
+        if (!xs.length) return;
+        const count = xs.reduce((n, x) => n + x.count, 0);
+        const total = xs.reduce((n, x) => n + x.totalMs, 0);
+        const worst = Math.max(...xs.map((x) => x.maxMs));
+        console.log(`    ${name}: ${count} stalls over 50ms across ${xs.length} tabs, ` +
             `${total}ms in total, worst ${worst}ms`);
-    }
+    };
+    stalls('main thread', (row.stats ?? []).map((st) => st.longtasks).filter(Boolean));
+    stalls('serving worker', (row.stats ?? []).map((st) => st.lag).filter(Boolean));
 
     const ladder = all.flatMap((r) => r.events ?? []);
     const repairs = ladder.filter((e) => e === 'repair').length;

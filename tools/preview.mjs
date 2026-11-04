@@ -19,8 +19,8 @@ const TYPES = {
     '.webmanifest': 'application/manifest+json', '.png': 'image/png', '.jpg': 'image/jpeg',
 };
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; " +
-    "connect-src 'self' https://weights.clusterchat.io; manifest-src 'self'; object-src 'none'; " +
-    "base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
+    "connect-src 'self' https://weights.clusterchat.io; worker-src 'self'; manifest-src 'self'; " +
+    "object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'";
 
 const isFile = async (p) => { try { return (await stat(p)).isFile(); } catch { return false; } };
 
@@ -35,6 +35,10 @@ createServer(async (req, res) => {
     res.writeHead(status, {
         'Content-Type': TYPES[extname(file)] ?? 'application/octet-stream',
         'Content-Security-Policy': CSP,
+        // As Caddyfile sets them: together they make the page cross-origin
+        // isolated, which the serving worker's SharedArrayBuffer needs.
+        'Cross-Origin-Opener-Policy': 'same-origin',
+        'Cross-Origin-Embedder-Policy': 'require-corp',
         'Cache-Control': 'no-store',
     });
     res.end(await readFile(file));

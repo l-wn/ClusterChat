@@ -8,6 +8,11 @@
 // datachannels. This file adds a way to set what the peer holds, a way to send
 // prompts, and a way to read back what happened.
 //
+// All of that runs in a worker, through web/serve-client.js, exactly as
+// web/peer.js runs it — so the rows here exercise the thread boundary a real
+// tab has, and the token-exact replay assertions catch any reordering it
+// introduces. runTurn() stays on this side, as it does on the page.
+//
 // Query parameters
 // ----------------
 //   role=worker|spectator   serve blocks, or only prompt
@@ -37,11 +42,10 @@
 // each repeat, and a spectator never runs a block. A spectator here is a tab
 // that only prompts, as in the mesh.
 
-import { Engine, ContextFullError } from '../engine.js';
+import { EngineClient } from '../serve-client.js';
+import { ContextFullError } from '../errors.js';
 import { chatFormat, stopRe } from '../prompt.js';
 import { runTurn } from '../turn.js';
-import { installBroadcastWire } from './bcwire.js';
-import { openRoom } from '../room.js';
 
 // Assigned in boot(). Nothing in this module may use `location`, the DOM or
 // the GPU at import time: tools/parse.test.mjs imports every browser module
@@ -114,11 +118,11 @@ export async function boot() {
     log = document.getElementById('log');
     watchLongTasks();
 
-    // Installed before the Engine is created, so no link is negotiated over
-    // the real WebRTC API first.
-    wire = WIRE === 'bc' ? installBroadcastWire() : { wire: 'rtc' };
-
-    engine = new Engine({
+    engine = new EngineClient({
+        // `--wire bc` swaps the datachannel for a BroadcastChannel inside the
+        // worker, before the Engine there is built, so no link is negotiated
+        // over the real WebRTC API first.
+        wire: WIRE,
         onEvent: (type, detail) => {
             if (type === 'change' || type === 'progress') return;   // fire per token
             events.push({ at: performance.now(), type, ...detail });
@@ -127,11 +131,14 @@ export async function boot() {
         },
         batch: q.get('batch') !== '0',
     });
+    wire = { wire: WIRE };
 
     booted = (async () => {
-        const room = await openRoom(q.get('mesh') || null,
-            { overrideToken: q.get('meshToken') || null });
-        const { manifest, canPrompt } = await engine.connect({ room,
+        // The invite is derived in the worker: openRoom() closes over a
+        // non-extractable CryptoKey, so the room object cannot be cloned.
+        const { manifest, canPrompt } = await engine.connect({
+            invite: { secret: q.get('mesh') || null,
+                      overrideToken: q.get('meshToken') || null },
             relayOnly: q.get('relay') === '1' });
         CHAT = chatFormat(manifest);
         TURN_RE = stopRe(CHAT);
@@ -168,7 +175,7 @@ export async function boot() {
         // It has to be in place before #growClaim starts: a Runner that has run
         // no job counts as idle, so the first growth step is taken with no
         // GROWTH_QUIET_MS wait, and a limit set after boot() resolves races it.
-        if (q.has('vramlimit')) engine.setVramLimit(Number(q.get('vramlimit')));
+        if (q.has('vramlimit')) await engine.setVramLimit(Number(q.get('vramlimit')));
         const r = await engine.serve({ at: placement(), blocks, sessions, pageTokens, floor, waitMs });
         Object.assign(out, { role: r.role, held: r.held, note: r.note, error: r.error });
         // The adapter this tab got. A headless Chrome without the Vulkan flags
@@ -237,7 +244,7 @@ async function attempt(text, opts, { retryBusy = 0, backoffMs = 200, fresh = tru
             return { ...r, busyWaits: waited };
         }
         waited++;
-        if (fresh) engine.reset();
+        if (fresh) await engine.reset();
         await new Promise((res) => setTimeout(res, backoffMs));
     }
 }
@@ -305,7 +312,7 @@ export const api = {
         // One call is one conversation. With `fresh` each prompt resets below.
         // Without it the whole list is one chat, reset here so it does not
         // continue the previous call's context.
-        if (!fresh) engine.reset();
+        if (!fresh) await engine.reset();
         progress.running = true;
         progress.done = 0;
         progress.total = prompts.length;
@@ -316,7 +323,7 @@ export const api = {
             // is serving (engine.js's GROWTH_QUIET_MS), so a run with no gaps
             // never grows a claim.
             if (gapMs && i) await new Promise((res) => setTimeout(res, gapMs));
-            if (fresh) engine.reset();
+            if (fresh) await engine.reset();
             const r = await attempt(text, { ...opts, ...perTurn?.[i] }, { retryBusy, backoffMs, fresh });
             if (!r.ok) progress.errors++;
             out.push(r);
@@ -334,62 +341,58 @@ export const api = {
     // The VRAM limit, as peer.html's field sets it. `null` is the blank field:
     // no limit. JSON has no Infinity, so the driver sends null. Returns what
     // this peer holds, in MiB, so a caller can compare it against a later read.
-    setVramLimit(bytes = null) {
-        engine.setVramLimit(bytes ?? Infinity);
-        return Math.round(engine.vramBytes / 2 ** 20);
+    async setVramLimit(bytes = null) {
+        return Math.round((await engine.setVramLimit(bytes ?? Infinity)) / 2 ** 20);
     },
 
     // This peer's state at the end. The runner numbers show whether there was
     // KV pressure: `live` is how many sessions hold frames and `slots` is how
     // many frames exist.
-    stats() {
-        const net = engine.net;
-        const r = engine.runner;
-        // Uses net.coverage, the getter that gates a prompt, so the harness
-        // reports the same number.
-        const cov = net?.positions ? net.coverage : null;
+    //
+    // Async now, because the engine runs in a worker: everything below `label`
+    // is its snapshot (web/serve-host.js), built there from the same getters
+    // this function used to read directly. tools/harness/cdp.mjs evaluates with
+    // awaitPromise, so the driver's calls are unchanged.
+    async stats() {
+        const s = await engine.stats();
+        const cov = s.net?.coverage ?? null;
         return {
-            label: LABEL, id: net?.id ?? null, role: engine.role,
-            ctxLen: engine.ctxLen, ran: engine.ran,
-            peers: net?.peers?.length ?? 0,
+            label: LABEL, id: s.net?.id ?? null, role: s.role,
+            ctxLen: s.ctxLen, ran: s.ran,
+            peers: s.net?.peers?.length ?? 0,
             covered: cov ? `${cov.covered}/${cov.total}` : null,
             r: cov?.r ?? null,
             // The stretches no ready peer holds, as half-open position ranges.
             holes: cov?.holes ?? [],
-            staffed: net?.staffed ?? false,
-            online: net?.online ?? false,
-            connected: net?.connected ?? false,
-            links: net?.links ? [...net.links.keys()] : [],
+            staffed: s.net?.staffed ?? false,
+            online: s.net?.online ?? false,
+            connected: s.net?.connected ?? false,
+            links: s.net?.links ?? [],
             // What ICE settled on per link (net.js's `transports`): whether a
             // GPU-to-GPU link went direct or fell back to the TURN relay.
-            transports: net?.transports ?? [],
+            transports: s.net?.transports ?? [],
             // `open`: the peers with an open channel, the only ones a message
             // can reach. `roster`: every peer id this tab knows of.
-            open: net?.links ? [...net.links.keys()].filter((id) => net.linked(id)) : [],
-            roster: net?.peers?.map((p) => p.id) ?? [],
-            private: net?.room?.private ?? false,
-            authFailures: net?.authFailures ?? 0,
-            refused: net?.refused ?? null,
+            open: s.net?.open ?? [],
+            roster: s.net?.peers?.map((p) => p.id) ?? [],
+            private: s.net?.room?.private ?? false,
+            authFailures: s.net?.authFailures ?? 0,
+            refused: s.net?.refused ?? null,
             // Links a held ready/have announcement is waiting on (net.js).
-            linking: net?.linking ?? null,
-            runner: r ? {
-                lo: r.lo, hi: r.hi, have: r.have,
-                live: r.live.size, slots: r.live.size + r.free.length,
-                cuts: r.cuts.size, logs: r.logs.size,
-                // The pool: how many pages are free, and how many tokens one
-                // page holds. `pagesFree` at 0 with live sessions means page
-                // pressure, not frame pressure.
-                pagesFree: r.pool.free.length, pagesTotal: r.pool.nPages,
-                pageTokens: r.pool.pageTokens,
-                vramMiB: Math.round(engine.vramBytes / 2 ** 20),
-                ...r.counts,
-            } : null,
+            linking: s.net?.linking ?? null,
+            runner: s.runner,
             events: events.map((e) => ({ type: e.type, at: Math.round(e.at) })),
-            nMax: engine.ctxMax,
-            // null where the browser has no longtask entries, not zero.
+            nMax: s.ctxMax,
+            // Tasks over 50ms on *this* thread. Near zero is now the point:
+            // the work moved to the worker. null where the browser has no
+            // longtask entries, not zero.
             longtasks: longtasks && { count: longtasks.count,
                                       totalMs: Math.round(longtasks.totalMs),
                                       maxMs: Math.round(longtasks.maxMs) },
+            // The same measure on the worker's side, where the work now is.
+            // `longtask` entries are per-realm, so the observer above cannot
+            // see them; this is the drift of a timer in there.
+            lag: s.lag ?? null,
         };
     },
 

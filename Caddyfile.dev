@@ -29,6 +29,16 @@
 		reverse_proxy 127.0.0.1:{$SIGNAL_PORT:8081}
 	}
 
+	# The chat page runs its serving peer in a worker that reads each link's
+	# bufferedAmount out of a SharedArrayBuffer, which needs the page to be
+	# cross-origin isolated. Production sets these in Caddyfile's
+	# security-headers; without them here the worker falls back to its own
+	# over-estimate and the shared-memory path goes untested locally.
+	header {
+		Cross-Origin-Opener-Policy same-origin
+		Cross-Origin-Embedder-Policy require-corp
+	}
+
 	handle {
 		# Production's addresses: / is the landing page, /chat and /create
 		# the app's pages. The site pages and their assets (/tokens.css,

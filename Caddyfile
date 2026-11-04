@@ -19,11 +19,21 @@
 		X-Content-Type-Options nosniff
 		X-Frame-Options DENY
 		Cross-Origin-Opener-Policy same-origin
+		# COOP and COEP together make the page cross-origin isolated, which is
+		# what SharedArrayBuffer needs: the serving worker reads each link's
+		# bufferedAmount out of shared memory, synchronously, on the hot path
+		# (web/serve-protocol.js). Under require-corp every cross-origin
+		# subresource must send Cross-Origin-Resource-Policy or be a valid CORS
+		# response; the only one is the weights host, which model/loader.js
+		# fetches with plain fetch() — CORS for a cross-origin URL — and which
+		# answers with Access-Control-Allow-Origin for this origin. Everything
+		# else (fonts, icons, the signaling wss) is same-origin.
+		Cross-Origin-Embedder-Policy require-corp
 		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()"
 		# Report-only until a full session shows no violations. Then rename it
 		# to Content-Security-Policy. connect-src 'self' covers the same-origin
 		# wss.
-		Content-Security-Policy-Report-Only "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' {$WEIGHTS_ORIGIN:https://weights.clusterchat.io}; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+		Content-Security-Policy-Report-Only "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self' {$WEIGHTS_ORIGIN:https://weights.clusterchat.io}; worker-src 'self'; manifest-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
 	}
 }
 
