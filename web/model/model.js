@@ -276,22 +276,37 @@ export function pageAt(frame, j) {
 //
 // All or nothing, unlike ensurePages: a frame left holding half a prefix would
 // be admitted with a cache that does not match the `past` it was admitted at.
+// Checked before anything is held, so a refusal leaves the pool untouched.
 export function adoptPages(device, pool, frame, pages) {
     if (frame.owned.length || pages.length > frame.maxPages) return false;
     for (const phys of pages) {
-        if (!Number.isInteger(phys) || phys < 0 || phys >= pool.nPages) {
-            for (const p of frame.owned) if (--pool.refs[p] === 0) pool.free.push(p);
-            frame.owned.length = 0;
-            return false;
-        }
+        if (!Number.isInteger(phys) || phys < 0 || phys >= pool.nPages) return false;
+    }
+    refPages(pool, pages);
+    frame.owned.push(...pages);
+    device.queue.writeBuffer(frame.pages, 0, new Uint32Array(pages));
+    return true;
+}
+
+// Hold pages without a frame, and let them go again. A probe answers from the
+// content index and the pages it named must still hold those bytes when the
+// prompt's first job arrives, so the probe takes a lease on them: `refs > 0`
+// keeps them off `free`, which is what stops #pagesFor reclaiming them and
+// ensurePages handing them out. Adopting then bumps `refs` once more and the
+// lease is dropped, leaving the frame as the only holder.
+export function refPages(pool, pages) {
+    for (const phys of pages) {
         if (pool.refs[phys]++ === 0) {
             const at = pool.free.indexOf(phys);
             if (at >= 0) pool.free.splice(at, 1);
         }
-        frame.owned.push(phys);
     }
-    device.queue.writeBuffer(frame.pages, 0, new Uint32Array(pages));
-    return true;
+}
+
+export function unrefPages(pool, pages) {
+    for (const phys of pages) {
+        if (pool.refs[phys] > 0 && --pool.refs[phys] === 0) pool.free.push(phys);
+    }
 }
 
 // Let go of every page this frame holds. The table is not cleared: entries are

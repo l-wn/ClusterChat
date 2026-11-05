@@ -42,8 +42,13 @@ async function completions(req, res, cluster, body) {
     const model = body.model ?? cluster.info.id;
     const events = cluster.chat(toCore(body, closed(res)));
     await events.next();        // 'start': failing before it gets a status code
+    // `cached_tokens` is what the cluster did not have to compute, which is
+    // this chat's own context plus any prefix the peers already held from
+    // another chat (core.js's `shared`). The two are separate in the CLI's own
+    // line, where which it was matters; to a client they are one number.
     const usage = (u) => ({ prompt_tokens: u.input, completion_tokens: u.output,
-        total_tokens: u.input + u.output, prompt_tokens_details: { cached_tokens: u.cached } });
+        total_tokens: u.input + u.output,
+        prompt_tokens_details: { cached_tokens: u.cached + (u.shared ?? 0) } });
 
     if (!body.stream) {
         let text = '', calls = [], end;

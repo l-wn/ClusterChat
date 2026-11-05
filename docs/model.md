@@ -155,6 +155,27 @@ entry and the index holds only entries that are true. It holds no reference to
 a page, so it costs host RAM only and can never compete with a live chat for
 one. `?share=0` turns the whole thing off.
 
+A page is keyed for every whole page a pass completes, with the logical page
+index in the key, not only for the page the pass ends on: the hash names the
+context up to the pass's end and the index says which page of it this is, so
+the pair names the page's bytes exactly. Keying only the last would leave the
+earlier pages unaddressable whenever a chunk is wider than a page
+(`?pages=16`), which is a prefix that could never be adopted.
+
+Reading them back is `Runner.probe()`: it walks the logical pages in order,
+looking each up under the hash of the chunk that page's last row falls in, and
+stops at the first miss, so the run it reports is contiguous from page 0. It
+refuses outright for a range that crosses no block, one that crosses a
+linear_attention block, or a session that already has a frame here — the same
+rules that decide what is keyed, so the index is self-consistently adoptable.
+The answer is in chunks rather than pages, because a page size is a peer's own
+and the enqueuer knows none of them, so it is truncated to where a page
+boundary and a chunk boundary meet. `adoptPages` then points a fresh frame's
+first pages at them and `cache.fed` is seeded to where they reach, for the
+blocks that job crosses alone. See architecture.md, *Sharing a prefix*, for the
+probe, the lease that holds a page between the answer and the first chunk, and
+why a rewind into a page two chats hold is refused.
+
 ## Gated DeltaNet block (Qwen3.8-27B linear attention)
 
 No KV cache: each session carries a fixed-size recurrent state per layer,

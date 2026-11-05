@@ -9,12 +9,16 @@
 // cluster.chat(req) yields
 //   { type: 'start', tokens, cached }   the request has a seat and feeds
 //                                       `tokens` new tokens after `cached`
+//                                       (of which the peers may already hold a
+//                                       prefix from another chat: `shared` on
+//                                       the 'end' event, once it is known)
 //                                       reused ones. Errors before this are
 //                                       the request's, not the reply's
 //   { type: 'text', text }              a piece of the reply, in order
 //   { type: 'call', id, name, args }    a tool call, after the text
 //   { type: 'end', stop, usage }        stop: 'end' | 'length' | 'tool' | 'stopped'
-//                                       usage: { input, output, cached } in tokens
+//                                       usage: { input, output, cached, shared }
+//                                       in tokens
 // and throws an ApiError when the request cannot run.
 //
 // Agents send the whole conversation every time. The cluster keeps the last
@@ -92,7 +96,10 @@ export function makeCluster({ engine, template, info, sampling = {}, count: toke
             }
             const plan = await prepare(req);
             await seat(req.signal);
-            try { yield { type: 'start', tokens: plan.fresh, cached: plan.cached }; yield* turn(req, plan); } finally { net.unseat(); }
+            try {
+                yield { type: 'start', tokens: plan.fresh, cached: plan.cached };
+                yield* turn(req, plan);
+            } finally { net.unseat(); }
         } finally {
             release();
         }
@@ -286,7 +293,13 @@ export function makeCluster({ engine, template, info, sampling = {}, count: toke
         const stop = ids.length ? 'tool' : stopped === 'stopped' ? 'stopped'
             : stopped === 'length' || stopped === 'context' ? 'length' : 'end';
         yield { type: 'end', stop,
-                usage: { input: cached + result.promptTokens, output: result.ids.length, cached } };
+                // `cached`: tokens this chat already had on the peers.
+                // `shared`: tokens of this prompt the peers held from another
+                // chat, so they were never sent (route.js's probe). Two
+                // sessions in different directories share no chat but almost
+                // all of their prompt, which is the whole point.
+                usage: { input: cached + result.promptTokens, output: result.ids.length, cached,
+                         shared: engine.lastShared } };
     }
 
     const forget = (entry) => {

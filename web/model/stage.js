@@ -18,13 +18,14 @@ import { F32, makeStorage, makeReadback, readF32, gatherEmbedNoPos, rmsnorm, mat
          withPass, counters, copyF32, topkRows, topkPairs, roundF16, GEMV_ROWS_MAX } from './kernels.js';
 import { blockSegs, makeSegScratch, makeCache, makeScratch, makeRecurrentState, recurrentStateBytes,
          makePagePool, makeSessionFrame, ensurePages, freePages, pageAt,
-         dropIndex, putIndex, makeReplayLayer,
+         dropIndex, putIndex, adoptPages, refPages, unrefPages, makeReplayLayer,
          replayLayerBytes, mtpBlock, mtpChain, makeMtpScratch } from './model.js';
 import { makeGpuProf } from './gpuprof.js';
 import { sampleFromLogitsRow } from './generate.js';
 import { sampleFromCandidates, candidatesFor, TOPK_MAX } from './sampling.js';
 import { toF16, fromF16 } from '../f16.js';
-import { positions, blockRange, kvRowBytes, PAGE_TOKENS, IDLE_MS, WAIT_MS, SPEC_COLS } from '../split.js';
+import { positions, blockRange, kvRowBytes, PAGE_TOKENS, IDLE_MS, WAIT_MS, LEASE_MS,
+         SPEC_COLS } from '../split.js';
 
 // The session id a warm-up pass runs under. Peer-minted ids are
 // `${peerId}-${base36}`, so it cannot collide with a chat.
@@ -107,7 +108,8 @@ export class Runner {
     // at a time by append(), `hi` (the default) for one given a whole range.
     constructor(device, d, w, { lo, hi, have = hi, nMax, tMax, slots = 5,
                                 sessions = slots, pageTokens = PAGE_TOKENS,
-                                idleMs = IDLE_MS, waitMs = WAIT_MS, specSlots = slots,
+                                idleMs = IDLE_MS, waitMs = WAIT_MS, leaseMs = LEASE_MS,
+                                specSlots = slots,
                                 keepWarmMs = 0, batchRows = GEMV_ROWS_MAX, share = true,
                                 peerId = '' }) {
         const [blockLo, blockHi] = blockRange(lo, hi, d.n_layer);
@@ -222,7 +224,12 @@ export class Runner {
                         nospec: 0, batched: 0, batchedJobs: 0,
                         // Pages content-addressed, and entries dropped because
                         // the page's bytes changed (#indexPages).
-                        indexed: 0, indexDropped: 0 };
+                        indexed: 0, indexDropped: 0,
+                        // The read side: probes answered, pages handed to a
+                        // chat that did not compute them, and adopts refused
+                        // because the lease was gone by the time the job came
+                        // (#probe, #cacheFor).
+                        probed: 0, adopted: 0, adoptRefused: 0 };
 
         // Speculative decoding's replay slots (see #specSlot()): at most
         // `specSlots` sessions speculate through this Runner's linear_attention
@@ -239,6 +246,11 @@ export class Runner {
         this.share = share;
         // This peer's id, which goes in a page's key: see #pageKey().
         this.peerId = peerId;
+        // Pages a probe has promised a session but no frame holds yet:
+        // session -> { pages, at }, one per session. See probe() and
+        // split.js's LEASE_MS.
+        this.leases = new Map();
+        this.leaseMs = leaseMs;
 
         // Keep-warm (see KEEP_WARM_MS). 0 turns it off.
         this.keepWarmMs = keepWarmMs;
@@ -877,6 +889,7 @@ export class Runner {
         this.cuts.delete(session);
         this.logs.delete(session);
         this.refused.delete(session);
+        this.#unlease(session);
         // Also remove its jobs from the waiting list.
         const mine = this.waiting.filter((j) => j.h.s === session);
         if (mine.length) {
@@ -972,7 +985,7 @@ export class Runner {
         return new Error(msg);
     }
 
-    #cacheFor(session, past) {
+    #cacheFor(session, past, adopt = null) {
         // Warm-up has its own one-row cache, so warming a new position while
         // serving never evicts a live chat.
         if (session === WARMUP) {
@@ -989,7 +1002,14 @@ export class Runner {
         // The session already has a job waiting. This one waits behind it,
         // whatever its `past`, so the session's jobs run in arrival order.
         if (this.waiting.some((j) => j.h.s === session)) throw WAIT;
-        if (past > 0) throw this.#cold(session, `session ${session} is no longer cached here`);
+        // A session adopting a prefix arrives at `past = chunks * tMax` with no
+        // frame here, which is otherwise exactly the shape of a cache that is
+        // gone. It takes a frame as a session at position 0 does, and the pages
+        // its own probe leased come with it. #prepare has already checked the
+        // lease; nothing is swept here, since a frame is not a page.
+        if (past > 0 && !adopt) {
+            throw this.#cold(session, `session ${session} is no longer cached here`);
+        }
         // First come, first served: a new session does not take a frame while
         // other sessions are waiting for one.
         if (this.waiting.length && this.turn !== session) throw WAIT;
@@ -1008,6 +1028,7 @@ export class Runner {
             this.cuts.delete(oldest);
             this.logs.delete(oldest);
             this.#specRelease(oldest);
+            this.#unlease(oldest);
         }
         // A reused frame holds the previous session's state. For KV that is
         // harmless: scatter_kv overwrites every row before attention reads it.
@@ -1023,6 +1044,29 @@ export class Runner {
             this.device.queue.submit([enc.finish()]);
         }
         cache.used = true;
+        // Point the frame's first pages at the ones the probe named, before it
+        // is live: a frame left holding half a prefix would be admitted with a
+        // cache that does not match the `past` it was admitted at.
+        //
+        // The lease and the frame both hold the pages for a moment, so the
+        // count goes 1 -> 2 -> 1 and the page is never momentarily free.
+        if (adopt) {
+            if (!adoptPages(this.device, this.pool, cache, adopt.pages)) {
+                this.#unlease(session);
+                this.free.push(cache);
+                this.counts.adoptRefused++;
+                // Not a cold cache: nothing repairs or rebuilds a capacity
+                // refusal, and a rebuild here would re-feed the whole prefix
+                // the adopt exists to skip.
+                throw this.#atCapacity('adopted pages', session);
+            }
+            this.#unlease(session);
+            this.counts.adopted += adopt.pages.length;
+        } else {
+            // Probed, then admitted at position 0 anyway (the answer was 0, or
+            // another peer's was). The lease is dead weight.
+            this.#unlease(session);
+        }
         // Rows each block holds for this session, and the last verify job each
         // block ran if the session has not moved on since. See #checkFed().
         cache.fed = new Map();
@@ -1032,7 +1076,7 @@ export class Runner {
         // `fed` is per block and a session can enter an overlapping peer at two
         // cursors, so it has no single answer; the pages do, because every
         // block in the pool shares one page table. See #indexPages().
-        cache.hi = 0;
+        cache.hi = adopt ? past : 0;
 
         cache.lastUse = performance.now();
         this.live.set(session, cache);
@@ -1115,6 +1159,10 @@ export class Runner {
     // evicted; the job is refused.
     #pagesFor(session, frame, tokens) {
         if (ensurePages(this.device, this.pool, frame, tokens)) return;
+        // Leases first: an expired one is pages nobody came back for, and it
+        // costs nothing to give them up, where evicting a live session costs a
+        // whole conversation.
+        if (this.#sweepLeases() && ensurePages(this.device, this.pool, frame, tokens)) return;
         for (;;) {
             const id = this.#evictable();
             if (id == null || id === session) break;
@@ -1125,12 +1173,17 @@ export class Runner {
             this.cuts.delete(id);
             this.logs.delete(id);
             this.#specRelease(id);
+            this.#unlease(id);
             this.counts.evicted++;
             if (ensurePages(this.device, this.pool, frame, tokens)) return;
         }
         // Nothing left to reclaim. If this context is larger than the pool, it
         // is a configuration error and waiting will not help. Otherwise every
         // live chat is active and the job is refused for capacity.
+        // Last: every lease, however new. A session that cannot run beats a
+        // probe that may never turn into a prompt, and the probe's enqueuer
+        // falls back to sending the prefix in full.
+        if (this.#sweepLeases(true) && ensurePages(this.device, this.pool, frame, tokens)) return;
         if (Math.ceil(tokens / this.pool.pageTokens) > frame.maxPages
             || this.pool.nPages < Math.ceil(tokens / this.pool.pageTokens)) {
             throw new Error(`the KV pool cannot fit ${tokens} tokens for session ` +
@@ -1174,11 +1227,18 @@ export class Runner {
     // kernel writes somewhere this method has never heard of.
     //
     // A page is indexed only when the pass appended exactly at the mark and
-    // ended on a page boundary, so `hash` names exactly the ids the page holds.
-    // Never from a replay, a verify or a rollback, and never from a range that
-    // crosses no block at all (a head-only or embedding-only hop writes no KV)
-    // or one that crosses a linear_attention block, whose recurrent state lives
-    // on the frame and is not shared.
+    // ended on a page boundary, so `hash` names exactly the ids the context
+    // holds up to that point. Never from a replay, a verify or a rollback, and
+    // never from a range that crosses no block at all (a head-only or
+    // embedding-only hop writes no KV) or one that crosses a linear_attention
+    // block, whose recurrent state lives on the frame and is not shared.
+    //
+    // Every whole page the pass completed is keyed, not only its last, with the
+    // logical page index in the key. `hash` names the context up to the pass's
+    // end, and page `j` within it is the rows at `[j*P, (j+1)*P)` of that
+    // context, so the pair names the page's bytes exactly. Keying only the last
+    // page would leave the earlier ones unaddressable whenever a chunk is wider
+    // than a page (`?pages=16`), which is a prefix that can never be adopted.
     //
     // The rules are deliberately lopsided: a page not indexed costs a
     // recompute, a page indexed wrongly costs wrong tokens and no error.
@@ -1195,10 +1255,147 @@ export class Runner {
         for (let p = first; p < last; p++) {
             if (!this.pool.K[p - 1 - this.blockLo]) return;   // linear_attention
         }
-        const page = pageAt(cache, end / P - 1);
-        if (page === undefined) return;
-        putIndex(this.pool, this.#pageKey(h, to), page);
-        this.counts.indexed++;
+        const key = this.#pageKey(h, to);
+        // From where the pass started to the last page it completed. Pages
+        // below that were completed by an earlier pass and keyed by it; the
+        // drop loop above has just cleared every one from here up, so nothing
+        // is keyed twice. A pass narrower than a page still completes the page
+        // it ends on, which is why this starts where the drop loop does.
+        for (let j = Math.floor(h.past / P); j < end / P; j++) {
+            const page = pageAt(cache, j);
+            if (page === undefined) return;
+            putIndex(this.pool, `${key}#${j}`, page);
+            this.counts.indexed++;
+        }
+    }
+
+    // The chunk whose pass keys logical page `j`, and so which of a prompt's
+    // hashes names it: the chunk this page's last row falls in. A pass is
+    // indexed only when it ends on a page boundary, so with a page wider than
+    // a chunk that is the chunk ending at `(j+1)*P`, and with a page narrower
+    // than a chunk it is the one chunk the whole page lies inside.
+    //
+    // Both only mean anything when one of the two divides the other. A page
+    // and a chunk that share no boundary never key anything at all, since
+    // #indexPages needs `(h.past + n) % P === 0`, so #probe refuses outright.
+    #chunkFor(j) {
+        return Math.ceil((j + 1) * this.pool.pageTokens / this.tMax) - 1;
+    }
+
+    // --- The read side: how far a prefix is held, and the lease on it ---
+
+    // How much of a prompt's prefix this peer already holds, in chunks of
+    // `tMax`. The answer is a chunk count and not a page count because peers
+    // need not agree on a page size, and the enqueuer knows none of them.
+    //
+    // Synchronous and not on the GPU queue: a probe that waited behind a
+    // prefill would defeat its own purpose, and everything it reads is a Map.
+    //
+    // The pages it reports are leased — `refs` bumped, so #pagesFor cannot
+    // reclaim them and ensurePages will not hand them out — until the adopt
+    // consumes the lease or it expires. That is what makes the window between
+    // the answer and the prompt's first job safe, instead of a mid-prompt
+    // rebuild when an entry is reclaimed inside it.
+    probe(h, want) {
+        this.#sweepLeases();
+        // First, and whatever the answer: `to` is in the key, and a probe
+        // routes by cursor exactly as a job does, so the cut it fixes here is
+        // the cut the first job would have fixed anyway.
+        const to = this.#exit(h.s, h.pos, want);
+        if (!this.share || !Array.isArray(h.hashes) || !h.hashes.length) return 0;
+        // A session with a frame here cannot adopt: adoptPages needs an empty
+        // one, and this session already has rows of its own.
+        if (this.live.has(h.s)) return 0;
+        const first = Math.max(h.pos, 1), last = Math.min(to, this.d.n_layer + 1);
+        // A hop that crosses no block writes no KV, and a linear_attention
+        // block's recurrent state lives on the frame and is not shared. Both
+        // mirror #indexPages, so the index is self-consistently adoptable.
+        if (first >= last) return 0;
+        for (let p = first; p < last; p++) {
+            if (!this.pool.K[p - 1 - this.blockLo]) return 0;
+        }
+        const P = this.pool.pageTokens, T = this.tMax;
+        if (P % T && T % P) return 0;         // no page boundary is a chunk boundary
+        // One lease per session, so a client cannot hold the index down by
+        // probing repeatedly, and the pool is never short of frames' worth of
+        // leases.
+        if (!this.leases.has(h.s) && this.leases.size >= this.sessions) return 0;
+
+        // The longest run of pages from page 0, contiguous: a gap cannot be
+        // skipped, because the prompt resumes at one position.
+        const pages = [];
+        for (let j = 0; ; j++) {
+            const i = this.#chunkFor(j);
+            if (i >= h.hashes.length) break;
+            const key = `${this.#pageKey({ ...h, hash: h.hashes[i] }, to)}#${j}`;
+            const phys = this.pool.index.get(key);
+            if (phys === undefined) break;
+            pages.push(phys);
+        }
+        // Answer only where a page boundary and a chunk boundary coincide, so
+        // the number means the same on this peer and on the enqueuer.
+        const span = Math.max(P, T);
+        const n = Math.floor(pages.length * P / span) * span / P;
+        if (!n) return 0;
+
+        this.#lease(h.s, pages.slice(0, n));
+        this.counts.probed++;
+        return n * P / T;
+    }
+
+    // Whether this peer already holds a prompt's first page behind the cut
+    // `to`. route.js's plan() reads it so prefix affinity is an input to the
+    // Join rule it already has, rather than a second rule beside it.
+    hasPrefix(h, to) {
+        if (!this.share || !Array.isArray(h.hashes) || !h.hashes.length) return false;
+        const i = this.#chunkFor(0);
+        if (i >= h.hashes.length) return false;
+        return this.pool.index.has(`${this.#pageKey({ ...h, hash: h.hashes[i] }, to)}#0`);
+    }
+
+    // The pages this job may adopt, or null if it may not.
+    //
+    // `h.adopt` is the minimum over the whole path, which can be shorter than
+    // what this peer's own probe found, so only the first `adopt` chunks of the
+    // lease are taken. The header names no pages at all: a count larger than
+    // the lease, or one with no lease behind it, is refused rather than served
+    // from pages nobody promised.
+    #adoptable(h) {
+        const lease = this.leases.get(h.s);
+        if (!lease || performance.now() - lease.at >= this.leaseMs) return null;
+        const want = h.adopt * this.tMax / this.pool.pageTokens;
+        if (!Number.isInteger(want) || want < 1 || want > lease.pages.length) return null;
+        if (h.past !== h.adopt * this.tMax) return null;
+        return { pages: lease.pages.slice(0, want) };
+    }
+
+    #lease(session, pages) {
+        this.#unlease(session);
+        refPages(this.pool, pages);
+        this.leases.set(session, { pages, at: performance.now() });
+    }
+
+    // Drop one session's lease, if it has one. Returns whether it did.
+    #unlease(session) {
+        const lease = this.leases.get(session);
+        if (!lease) return false;
+        this.leases.delete(session);
+        unrefPages(this.pool, lease.pages);
+        return true;
+    }
+
+    // Leases nobody came back for. Swept where pages are wanted rather than on
+    // a timer, since that is the only place an unconsumed one costs anything.
+    // `all` drops every lease however new: a live session that cannot get a
+    // page beats a probe that may never turn into a prompt.
+    #sweepLeases(all = false) {
+        if (!this.leases.size) return false;
+        const now = performance.now();
+        let freed = false;
+        for (const [session, lease] of [...this.leases]) {
+            if (all || now - lease.at >= this.leaseMs) freed = this.#unlease(session) || freed;
+        }
+        return freed;
     }
 
     // Everything the index held. Called where a claim grows: the page gains a
@@ -1347,11 +1544,49 @@ export class Runner {
                 && drafts.every((id) => Number.isInteger(id) && id >= 0))) {
             throw new Error(`a verify job needs 1–${SPEC_COLS - 1} draft ids, one fewer than its ${T} tokens`);
         }
-        const cache = this.#cacheFor(h.s, h.past);
+        // `adopt` is the chunk count a probe answered for this session, served
+        // from the lease that probe left here. A session that already has a
+        // frame ignores it: that is a first chunk re-sent by a repair, and the
+        // cache it continues is its own.
+        let adopting = null;
+        if (h.adopt > 0 && h.s !== WARMUP && !this.live.has(h.s)) {
+            adopting = this.#adoptable(h);
+            if (!adopting) {
+                // Refused for capacity, not as a cold cache: nothing repairs or
+                // rebuilds a `busy`, where a cold refusal here would have the
+                // enqueuer rebuild the very prefix the adopt was skipping.
+                this.counts.adoptRefused++;
+                throw this.#atCapacity('adopted pages', h.s);
+            }
+        }
+        const cache = this.#cacheFor(h.s, h.past, adopting);
         // The block positions this job runs: from the cursor (or position 1,
         // if the cursor is the embedding) up to the session's cut or the head,
         // whichever is first.
         const first = Math.max(at, 1), last = Math.min(to, d.n_layer + 1);
+        // An adopted prefix is rows, not a fed count: seed one so #checkFed
+        // sees a cache that reaches this job's `past`. Only the blocks this job
+        // crosses, not every block — a session can enter an overlapping peer at
+        // two cursors whose ranges advance independently, which is why
+        // `cache.hi` exists at all.
+        if (adopting) for (let p = first; p < last; p++) cache.fed.set(p - 1, h.past);
+        // Once a page can be held by two frames, a rewrite below the frame's
+        // high-water mark would scribble on rows another chat is reading, and
+        // #checkFed's full-attention branch permits exactly that. A replay
+        // re-feeds rows from the boundary log, which are the same bytes by
+        // construction (docs/architecture.md, Wire format), so only a rewind or
+        // a rollback can do harm. Refused as cold, which rebuilds: copying the
+        // page instead is much more code, and a rewind only trims a stop
+        // sequence off the end of a reply, far above any shared prefix.
+        if (h.s !== WARMUP && !h.replay && h.past < (cache.hi ?? 0)) {
+            const P = this.pool.pageTokens;
+            for (let j = Math.floor(h.past / P); j < cache.owned.length; j++) {
+                if (this.pool.refs[pageAt(cache, j)] > 1) {
+                    throw this.#cold(h.s, `session ${h.s} would rewrite page ${j}, which ` +
+                        'another chat holds');
+                }
+            }
+        }
         const { reset, keep } = h.s === WARMUP ? { reset: [], keep: null }
             : this.#checkFed(h.s, cache, at, last, h.past, !!h.auto, !!h.rb);
         // The replay slot, when a linear_attention block here snapshots (a

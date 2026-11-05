@@ -146,6 +146,7 @@ function snapshot(engine, convIds, cache) {
         history: engine.history,
         runner: runnerSnapshot(engine),
         congestion: engine.congestion,
+        share: engine.share,
         capacity: capacityTable(engine, cache),
     };
 }

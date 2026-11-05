@@ -154,6 +154,19 @@ const SCENARIOS = [
     // Every reply must arrive and match.
     { name: 'drop', workers: deep(12), askers: 3, sessions: 4, kill: { after: 0.35 } },
 
+    // Sharing a prefix between chats. Two askers send the same long prompts,
+    // each turn in a fresh chat, so the second chat's probe finds the pages the
+    // first filled and the prefix is never sent again. Prompts here are a few
+    // hundred tokens: only a prompt that fills whole pages can be shared, and
+    // the matrix's short ones never do.
+    //
+    // The assertion that matters is token identity, which `replay` makes
+    // against a one-peer run of the same prompts: a page adopted behind a
+    // different path, or holding something other than what its key says, is
+    // otherwise silent.
+    { name: 'share', workers: chain(3), askers: 2, sessions: 4, long: true, replay: true,
+      promptCount: 4 },
+
     // Paging must not change the output. The same setup with pages a quarter
     // the size, which changes how many pages a context spans and where page
     // boundaries fall in attn_av_gqa's loop.
@@ -307,10 +320,10 @@ const WORDS = ('the a of and to in is it that was for on are with as his they be
     + 'your how said an each she which do their time if will way about many then them write')
     .split(' ');
 
-function prompts(n, rand) {
+function prompts(n, rand, long = LONG) {
     const out = [];
     for (let i = 0; i < n; i++) {
-        const len = LONG ? 120 + Math.floor(rand() * 180) : 2 + Math.floor(rand() * 18);
+        const len = long ? 120 + Math.floor(rand() * 180) : 2 + Math.floor(rand() * 18);
         const words = [];
         for (let j = 0; j < len; j++) words.push(WORDS[Math.floor(rand() * WORDS.length)]);
         out.push(`${words.join(' ')}?`);
@@ -323,8 +336,13 @@ const PROMPT_LIST = prompts(PROMPTS, rng(SEED));
 // A scenario that needs a different number of turns draws them from the same
 // seed, so its first N prompts are the matrix's first N and a reference
 // recorded for one is valid for the other.
-const promptsFor = (scenario) => scenario.promptCount
-    ? prompts(scenario.promptCount, rng(SEED)) : PROMPT_LIST;
+//
+// `long` draws prompts of a few hundred tokens instead. Those do not match the
+// matrix's, so such a row has no shared reference and is checked by `replay`
+// against a one-peer run of its own prompts.
+const promptsFor = (scenario) => scenario.long
+    ? prompts(scenario.promptCount ?? PROMPTS, rng(SEED), true)
+    : scenario.promptCount ? prompts(scenario.promptCount, rng(SEED)) : PROMPT_LIST;
 
 // Two prompts that end in the same words and differ before them. If the
 // model's next token depended only on its last token, both would give the same
@@ -1330,6 +1348,10 @@ function check(row, reference) {
             admits > 1, `only ${admits} peer admitted the session, so no cut existed`);
     }
     if (expectHole || expectFull) return;    // these rows compare no tokens
+    // A row with its own prompts cannot be compared with the matrix's
+    // reference, which answered different text. `replay` above has already
+    // held it to a one-peer run of its own prompts, which is the same check.
+    if (row.scenario?.long) return;
 
     const wrong = [];
     for (const run of row.runs) {
@@ -1410,7 +1432,22 @@ function verdict(rows, reference) {
         // invalidated. Reported, never asserted: both follow the scenario.
         console.log(`${''.padEnd(12)} pages:   ${sum('indexed')} keyed, ` +
             `${sum('indexDropped')} dropped, ` +
-            `${w.map((x) => x.runner.indexSize ?? 0).join('/')} held`);
+            `${w.map((x) => x.runner.indexSize ?? 0).join('/')} held, ` +
+            `${sum('probed')} probed, ${sum('adopted')} adopted, ` +
+            `${sum('adoptRefused')} refused`);
+    }
+
+    // The read side must actually have fired somewhere, or the `share` row
+    // proves only that two askers sending the same text agree — which it would
+    // with no sharing at all.
+    const shareRow = rows.find((r) => r.name === 'share');
+    if (shareRow) {
+        const adopted = shareRow.stats.filter((x) => x.runner)
+            .reduce((n, x) => n + (x.runner.adopted ?? 0), 0);
+        ok('share: a later chat was handed pages an earlier one filled',
+            adopted > 0, `no peer adopted a page: ${shareRow.stats.filter((x) => x.runner)
+                .map((x) => `${x.id} keyed ${x.runner.indexed} probed ${x.runner.probed}`)
+                .join(', ')}`);
     }
 
     const pressure = rows.flatMap((row) => row.stats.filter((s) => s.runner)

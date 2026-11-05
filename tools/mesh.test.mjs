@@ -92,7 +92,8 @@ const RECURRENT = /^R\d+$/;
 // The proxy Runner. Every guard under test is the real Runner's. The proxy
 // adds the toy forward pass and one ledger assertion that the real Runner
 // cannot make, because it never sees more than one job's context.
-function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null, sessions = null) {
+function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null, sessions = null,
+                    opts = {}) {
     // Each peer has its own GPU and trace. With a shared trace, a replay into
     // one peer while another is working would be recorded as one run.
     const { device, setFill, resetTrace, takeTrace, passes } = makeGpu();
@@ -110,12 +111,19 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null
         // `peerId`: a page's content key names the peer that ran the cut, so
         // two holders of one range never collide (stage.js's #pageKey).
         { lo, hi, have, nMax: 4 * T_MAX, tMax: T_MAX, slots, idleMs, waitMs: 0, peerId: id,
-          ...(specSlots != null && { specSlots }), ...(sessions != null && { sessions }) });
+          ...(specSlots != null && { specSlots }), ...(sessions != null && { sessions }),
+          ...opts });
 
-    // `${session}|${tag}` -> the prefix fold, one entry per token position.
-    // Stored by position, like the KV cache it models, so re-running a
-    // position with the same input changes nothing and a replay does not look
-    // like corruption.
+    // `${physical page}|${tag}` -> the prefix fold, one entry per position in
+    // the page. Stored by position, like the KV cache it models, so re-running
+    // a position with the same input changes nothing and a replay does not
+    // look like corruption.
+    //
+    // Keyed by the *page*, not by the session, because a page can be held by
+    // two frames at once (model.js's `refs`) and a session that adopts one
+    // reads bytes another session wrote. Keyed by session, an adoption that
+    // handed a session the wrong page would fold cleanly and the ledger would
+    // report no violation.
     const kv = new Map();
     // `${session}|${tag}` -> { st, win }: the recurrent fold (see RECURRENT),
     // and while the session's last job was a verify, `win`: where it started,
@@ -156,6 +164,12 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null
         get active() { return real.active; },
         get queueMs() { return real.queueMs; },
         groups: (pos) => real.groups(pos),
+        // Read by route.js's probe path: how far this peer holds a prompt's
+        // prefix, and whether a candidate cut already has it (plan()'s Join).
+        // Both are synchronous and off the proxy's queue, like the real
+        // Runner's: a probe that waited behind a prefill would defeat itself.
+        probe: (h, want) => real.probe(h, want),
+        hasPrefix: (h, to) => real.hasPrefix(h, to),
         resetTrace, takeTrace,
         holds: (p) => real.holds(p),
         append: (w) => real.append(w),
@@ -210,6 +224,23 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null
             // values (a replay after a repair, the job after the verify).
             if (!seen) fed.set(fk, seen = { len: 0, at: new Uint32Array(real.nMax),
                                             tent: new Uint8Array(real.nMax) });
+            // A session that adopted a prefix enters above anything fed to it
+            // here: those rows are in pages another session filled. fold()
+            // only runs once the real Runner has admitted the job, and it
+            // admits an adopt only against a lease its own probe left, so the
+            // pages are the ones it promised. Whether they hold what their key
+            // says is checked by `kv` below, which is keyed by page: an
+            // adoption of the wrong page folds to a different digest and comes
+            // out as a wrong token. Nothing recorded these positions' inputs
+            // here, so only the length is taken.
+            if (h.adopt && seen.len < h.past) {
+                seen.len = h.past;
+                // `tent` means "this harness did not record what is here", so
+                // a later job re-feeding one of these positions is not a peer
+                // contradicting itself. It records the real value as it goes,
+                // and every re-feed after that is checked as usual.
+                seen.tent.fill(1, 0, h.past);
+            }
             if (h.past > seen.len) {
                 world.violation(`peer ${id}: session ${h.s} entered at ${h.pos} with ` +
                     `past=${h.past}, but only ${seen.len} positions have been fed there`);
@@ -262,11 +293,35 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null
                         d = mix(d, e.st);
                     }
                     if (HAS_KV.test(t)) {
-                        const k = `${h.s}|${t}`;
+                        const P = real.pool.pageTokens;
+                        // The frame is in `live` by now: #cacheFor took it and
+                        // #pagesFor filled its table before the pass ran. The
+                        // warm-up cache is not pooled and never folds here.
+                        const owned = real.live.get(h.s)?.owned;
+                        const j = Math.floor(p / P), o = p % P;
+                        const k = `${owned ? owned[j] : h.s}|${t}`;
                         let pref = kv.get(k);
-                        if (!pref) kv.set(k, pref = new Uint32Array(real.nMax));
-                        pref[p] = mix(p ? pref[p - 1] : SEED, d);
-                        d = mix(d, pref[p]);
+                        if (!pref) kv.set(k, pref = new Uint32Array(P));
+                        // Across a page boundary the fold continues from the
+                        // previous logical page's last row, so a page whose
+                        // bytes are not what its key says folds to a different
+                        // digest and comes out as a wrong token. A page nothing
+                        // has written is a position attended back to that no
+                        // page here holds.
+                        let seed = SEED;
+                        if (o) {
+                            seed = pref[o - 1];
+                        } else if (p) {
+                            const below = kv.get(`${owned ? owned[j - 1] : h.s}|${t}`);
+                            if (below === undefined) {
+                                world.violation(`peer ${id}: session ${h.s} attends back to ` +
+                                    `position ${p - 1} at ${t}, which no page here holds`);
+                            } else {
+                                seed = below[P - 1];
+                            }
+                        }
+                        pref[o] = mix(seed, d);
+                        d = mix(d, pref[o]);
                     }
                     d &= 0xffffff;
                 }
@@ -296,13 +351,17 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null
         if (!filled) fold(takeTrace(), null);
 
         // The toy follows the real Runner. A session the real Runner evicted
-        // loses its toy state too. Otherwise the next job would be answered
-        // from a prefix whose KV was evicted, and the eviction would go
-        // unnoticed.
-        for (const m of [kv, rec]) {
-            for (const k of [...m.keys()]) {
-                if (!real.live.has(k.slice(0, k.indexOf('|')))) m.delete(k);
-            }
+        // loses its recurrent fold too. Otherwise the next job would be
+        // answered from a state whose buffers were evicted, and the eviction
+        // would go unnoticed.
+        //
+        // `kv` is not swept: it is keyed by page, bounded by the pool, and
+        // write-through. A page handed to another session has the same offsets
+        // overwritten as that session writes its rows, which is exactly what
+        // the real KV does — and a page that outlives its session staying
+        // addressable is the whole point of the content index.
+        for (const k of [...rec.keys()]) {
+            if (!real.live.has(k.slice(0, k.indexOf('|')))) rec.delete(k);
         }
 
         // Three result shapes: a token, a hidden state to hand on, or neither
@@ -334,7 +393,8 @@ class World {
     // it fail for reasons unrelated to routing.
     constructor({ maxRepairs, maxFixes, maxLocalReplay, hybrid = false, hybridRouter = hybrid,
                   idleMs = 0, ackRate = Infinity, toyVocab = null, prefillWindow,
-                  ackCap = 45, rebuildBackoff = 0 } = {}) {
+                  ackCap = 45, rebuildBackoff = 0, share, leaseMs, probeTimeout,
+                  dropProbes = false } = {}) {
         // How many distinct tokens the toy model samples. A small one makes
         // replies repeat, so prompt lookup finds drafts and some are accepted.
         this.toyVocab = toyVocab;
@@ -363,6 +423,17 @@ class World {
         // here so a zombie is still declared dead quickly; a test about the
         // re-arm itself raises it.
         this.ackCap = ackCap;
+        // Prefix sharing off, as `?share=0` does, so a probe answers 0 and
+        // every prompt runs in full. And how long a probe's page lease is held
+        // (model/split.js's LEASE_MS): 0 expires one immediately.
+        this.share = share;
+        this.leaseMs = leaseMs;
+        // How long a prompt waits for its prefix probe (route.js's
+        // PROBE_TIMEOUT_MS), and whether probes reach the peers at all.
+        // `dropProbes` is a mesh of peers older than this tab: they do not
+        // know what a probe is, so nothing ever answers one.
+        this.probeTimeout = probeTimeout;
+        this.dropProbes = dropProbes;
         // Pause before a second rebuild (route.js's REBUILD_BACKOFF_MS). 0 in
         // most of this suite, whose timings are tuned to a 500ms jobTimeout.
         this.rebuildBackoff = rebuildBackoff;
@@ -370,7 +441,7 @@ class World {
         this.tabs = new Map();    // id -> { net, router, runner }
         this.zombies = new Set(); // peers whose links look open and drop everything
         this.violations = [];
-        this.wire = [];           // every message sent: { from, to, k, addr }
+        this.wire = [];           // every message sent: { from, to, k, addr, bytes, … }
         this.slowLinks = new Map();   // `${from}>${to}` -> a slow link; see slowLink()
         this.backedUp = new Set();    // `${from}>${to}` links above net.js's high-water mark
     }
@@ -391,7 +462,9 @@ class World {
         });
 
         const runner = lo == null ? null
-            : peerRunner(this, id, lo, hi, have, slots, this.idleMs, specSlots, sessions);
+            : peerRunner(this, id, lo, hi, have, slots, this.idleMs, specSlots, sessions,
+                         { ...(this.share !== undefined && { share: this.share }),
+                           ...(this.leaseMs !== undefined && { leaseMs: this.leaseMs }) });
         const tab = { id, net, runner, repairs: 0, fixes: [], sessions: [],
                       progress: [], cancelled: false };
 
@@ -416,6 +489,8 @@ class World {
             net,
             runner: () => tab.runner,
             hybrid: this.hybridRouter,
+            ...(this.share === undefined ? {} : { share: this.share }),
+            ...(this.probeTimeout === undefined ? {} : { probeTimeout: this.probeTimeout }),
             // false makes the head answer loop jobs without feeding.
             closedLoop,
             onRepair: (err, tokens, reason) => {
@@ -457,14 +532,20 @@ class World {
         // header. They differ when a message is relayed through the entry
         // point. An assertion about who an `err` is addressed to must read
         // `addr`.
-        const { header: sent } = unpack(buf);
+        const { header: sent, payload: body } = unpack(buf);
+        // `bytes` is the f16 payload this message carried. It is what
+        // separates skipping a prefix outright from replaying its rows anyway:
+        // a prompt that adopts its prefix must put zero bytes on the wire for
+        // it, and nothing else catches a regression into sending them.
         this.wire.push({ from, to, k: sent.k, addr: sent.to, s: sent.s, pos: sent.pos,
                          replay: !!sent.replay, past: sent.past, n: sent.n, prof: sent.prof,
                          opts: sent.opts, loop: !!sent.loop, fed: sent.fed, auto: !!sent.auto,
                          drafts: sent.drafts, rowOpts: sent.rowOpts, tokens: sent.tokens,
                          nospec: !!sent.nospec,
                          rb: !!sent.rb, fill: !!sent.fill,
-                         hash: sent.hash, path: sent.path });
+                         hash: sent.hash, path: sent.path,
+                         chunks: sent.chunks, each: sent.each, adopt: sent.adopt,
+                         bytes: body?.byteLength ?? 0 });
         const slow = this.slowLinks.get(`${from}>${to}`);
         const later = (fn) => {
             if (!slow) return queueMicrotask(fn);
@@ -480,6 +561,7 @@ class World {
             slow.until = Math.max(now + slow.ms(sent), slow.until);
             setTimeout(fn, slow.until - now);
         };
+        if (this.dropProbes && sent.k === 'probe') return;
         later(() => {
             // Checked again at delivery: a peer can close its tab after the
             // send, and the real wire drops messages in flight.
@@ -677,14 +759,16 @@ console.log('\ncontent-addressing: every peer on a path keys the pages it filled
         keys[0].filter((k) => keys[1].includes(k)).length, 0);
 
     // A second chat with the same prefix on the same path is the point: the
-    // same text through the same cuts must produce the same keys.
+    // same text through the same cuts must produce the same keys, so the probe
+    // finds them and the pages are adopted rather than filled again. Only the
+    // chunks before the last are offered, so a two-chunk prompt shares one.
     asker.router.newChat();
     await generate(asker, long, 1, { whole: true });
     eq('the same prompt on the same path keys the same pages',
         runners.map((r) => [...r.pool.index.keys()].sort()), keys);
     eq('so the index did not grow', runners.map((r) => r.pool.index.size), [PAGES, PAGES]);
-    eq('though every page was filled again', runners.map((r) => r.counts.indexed),
-        [PAGES * 2, PAGES * 2]);
+    eq('and the shared page was adopted, not filled again',
+        runners.map((r) => [r.counts.adopted, r.counts.indexed]), [[1, PAGES], [1, PAGES]]);
 
     // Different text, same path: different keys.
     const other = long.map((x, i) => (i === 0 ? x + 1 : x));
@@ -754,6 +838,233 @@ console.log('\ncontent-addressing: every peer on a path keys the pages it filled
     await w.sync();
     eq('a hash that does not match the ids keys nothing', r.counts.indexed, before);
     eq('and nothing was silently continued', w.violations, []);
+}
+
+console.log('\nadopting a prefix: the probe, and what it skips');
+{
+    // Three chunks, so two are offerable: a prompt must always keep its last
+    // chunk, or the turn has nothing left to send and produces no token.
+    const CHUNKS = 3, SHARE = CHUNKS - 1;
+    const long = Array.from({ length: CHUNKS * T_MAX }, (_, i) => (i * 11) % 90 + 1);
+    const { w, asker } = chain([0, Math.floor(N / 2), N]);
+    const runners = [0, 1].map((id) => w.tabs.get(id).runner.real);
+
+    const first = await generate(asker, long, 1, { whole: true });
+    eq('the first prompt keyed every whole page on both peers',
+        runners.map((r) => r.counts.indexed), [CHUNKS, CHUNKS]);
+
+    asker.router.newChat();
+    w.wire.length = 0;
+    const second = await generate(asker, long, 1, { whole: true });
+    const s2 = asker.sessions.at(-1);
+
+    eq('the same prompt on the same path answers the same token', second, first);
+    // Two probes: the first prompt probed too, and found nothing.
+    eq('the probe found every chunk it was offered',
+        asker.router.shared, { probes: 2, full: 1, partial: 0, headOnly: 0, silent: 0 });
+    eq('so both peers handed it the pages instead of filling them',
+        runners.map((r) => r.counts.adopted), [SHARE, SHARE]);
+    eq('and nothing was silently continued', w.violations, []);
+
+    // The point of the design. Not "the rows were replayed cheaply": no job
+    // for those chunks exists anywhere on the path, so no peer ran a pass for
+    // them and no bytes were sent for them.
+    const jobs = w.wire.filter((m) => m.k === 'job' && m.s === s2);
+    const skipped = jobs.filter((m) => m.past < SHARE * T_MAX);
+    eq('no job was sent for the adopted chunks, on any hop', skipped, []);
+    eq('and no bytes for them either',
+        jobs.reduce((n, m) => n + (m.past < SHARE * T_MAX ? m.bytes : 0), 0), 0);
+    const adopts = jobs.filter((m) => m.adopt !== undefined);
+    ok('the first job of the prompt carries the count, and only it',
+        adopts.length > 0 && adopts.every((m) => m.adopt === SHARE
+            && m.past === SHARE * T_MAX), JSON.stringify(adopts.map((m) => [m.past, m.adopt])));
+    ok('an adopting prompt carries no hashes: its chain cannot be continued',
+        jobs.every((m) => m.hash === undefined), jobs.filter((m) => m.hash).length + ' did');
+
+    // The probe pins the path it measured, so the jobs behind it take the same
+    // one — the cut is in the page's key, and a job down another path would
+    // read pages keyed for a cut it did not go through.
+    const probes = w.wire.filter((m) => m.k === 'probe' && m.s === s2);
+    ok('the probe crossed every hop the jobs then took',
+        probes.length === 2 && probes[1].path?.length === 1,
+        JSON.stringify(probes.map((m) => [m.from, m.to, m.path])));
+    // One logical answer, relayed home through the entry point like a
+    // `filled`, so the wire shows it once per hop.
+    const held = w.wire.filter((m) => m.k === 'held' && m.s === s2);
+    eq('and one answer reached the enqueuer', held.filter((m) => m.to === asker.id).length, 1);
+    eq('with every peer on the path in it', held[0].each.map((e) => e.chunks), [SHARE, SHARE]);
+}
+
+{
+    // The path differs. The second peer's index is cleared, so it holds
+    // nothing even though the first peer holds everything. The answer is the
+    // minimum, which is 0: a page holds the rows a later position attends back
+    // to, not the row at its end, so the first peer must run its blocks over
+    // the whole prefix anyway to feed the second. An upstream-only hit is
+    // worth nothing, and reading from it would be wrong tokens and no error.
+    const long = Array.from({ length: 3 * T_MAX }, (_, i) => (i * 13) % 90 + 1);
+    const { w, asker } = chain([0, Math.floor(N / 2), N]);
+    const runners = [0, 1].map((id) => w.tabs.get(id).runner.real);
+
+    const first = await generate(asker, long, 1, { whole: true });
+    runners[1].pool.index.clear();
+    runners[1].pool.byPage.fill(null);
+
+    asker.router.newChat();
+    w.wire.length = 0;
+    const second = await generate(asker, long, 1, { whole: true });
+    eq('a prefix only the upstream peer holds is not adopted',
+        runners.map((r) => r.counts.adopted), [0, 0]);
+    eq('the probe reports it as a miss, not a partial hit',
+        asker.router.shared, { probes: 2, full: 0, partial: 0, headOnly: 0, silent: 0 });
+    const held = w.wire.filter((m) => m.k === 'held' && m.s === asker.sessions.at(-1));
+    eq('though the answer records that the upstream peer held it',
+        held[0].each.map((e) => e.chunks > 0), [true, false]);
+    eq('and the prompt ran in full, to the same token', second, first);
+    eq('with nothing silently continued', w.violations, []);
+}
+
+{
+    // A partial run. The second peer keeps only the first of the two offerable
+    // chunks, so the minimum is 1 and the prompt starts one chunk in.
+    const long = Array.from({ length: 3 * T_MAX }, (_, i) => (i * 17) % 90 + 1);
+    const { w, asker } = chain([0, Math.floor(N / 2), N]);
+    const runners = [0, 1].map((id) => w.tabs.get(id).runner.real);
+
+    const first = await generate(asker, long, 1, { whole: true });
+    // Drop everything the second peer keyed past its first page.
+    for (const [key, phys] of [...runners[1].pool.index]) {
+        if (!key.endsWith('#0')) { runners[1].pool.index.delete(key); runners[1].pool.byPage[phys] = null; }
+    }
+
+    asker.router.newChat();
+    w.wire.length = 0;
+    const second = await generate(asker, long, 1, { whole: true });
+    eq('each peer hands over as much as the path agrees on, not its own run',
+        runners.map((r) => r.counts.adopted), [1, 1]);
+    eq('counted as a partial hit, with the head not the one holding more',
+        asker.router.shared, { probes: 2, full: 0, partial: 1, headOnly: 0, silent: 0 });
+    const jobs = w.wire.filter((m) => m.k === 'job' && m.s === asker.sessions.at(-1));
+    eq('the chunk before the cut is never sent',
+        jobs.filter((m) => m.past < T_MAX), []);
+    eq('and the reply is identical to the one from a full prefill', second, first);
+    eq('with nothing silently continued', w.violations, []);
+}
+
+{
+    // The cut moved. The first peer grows past its original claim, so a new
+    // session hands off one position later. The second peer's pages are keyed
+    // by the cut they were filled behind, and the first peer's index is
+    // dropped outright because every page it holds now covers a layer it held
+    // nothing for. Both are the same answer: these are a different cache, and
+    // adopting them would be wrong tokens and no error.
+    const long = Array.from({ length: 3 * T_MAX }, (_, i) => (i * 19) % 90 + 1);
+    const { w, asker } = chain([0, 4, N]);
+    const runners = [0, 1].map((id) => w.tabs.get(id).runner.real);
+
+    const first = await generate(asker, long, 1, { whole: true });
+    const keyed = runners[1].pool.index.size;
+    ok('the second peer keyed the prompt behind the old cut', keyed > 0);
+    await w.growEdge(0, 'right');
+
+    asker.router.newChat();
+    const second = await generate(asker, long, 1, { whole: true });
+    eq('a session pinned to another cut adopts nothing',
+        runners.map((r) => r.counts.adopted), [0, 0]);
+    eq('and runs in full, to the same token', second, first);
+    eq('with nothing silently continued', w.violations, []);
+}
+
+{
+    // The lease expired. A probe promises pages it has only looked up, so it
+    // holds them (model.js's refs) until the adopt consumes the lease. Once it
+    // is gone the peer refuses the adopt for capacity — nothing may repair or
+    // rebuild into a cache that is not there — and the enqueuer, which knows it
+    // was skipping a prefix it still has, sends the prompt in full instead of
+    // reporting a cluster that is not actually busy.
+    const long = Array.from({ length: 3 * T_MAX }, (_, i) => (i * 23) % 90 + 1);
+    const { w, asker } = chain([0, N], {}, { leaseMs: 0 });
+    const r = w.tabs.get(0).runner.real;
+
+    const first = await generate(asker, long, 1, { whole: true });
+    const before = r.counts.adopted;
+    asker.router.newChat();
+    const second = await generate(asker, long, 1, { whole: true });
+    ok('an adopt whose lease is gone is refused', r.counts.adoptRefused > 0);
+    eq('and nothing was handed over', r.counts.adopted, before);
+    eq('the prompt runs in full instead, to the same token', second, first);
+    eq('with nothing silently continued', w.violations, []);
+}
+
+{
+    // A forged answer. `held` is not checked against who may answer, because
+    // the adopt names no pages: it consumes the lease that peer's own probe
+    // left. A count larger than the peer promised is refused, never served
+    // from pages nobody named.
+    const long = Array.from({ length: 3 * T_MAX }, (_, i) => (i * 29) % 90 + 1);
+    const { w, asker } = chain([0, N]);
+    const r = w.tabs.get(0).runner.real;
+    await generate(asker, long, 1, { whole: true });
+
+    const before = r.counts.adopted;
+    const s = 'forged';
+    let threw = null;
+    await r.run({ k: 'job', s, key: 'k', from: 100, pos: 0, past: 2 * T_MAX,
+                  n: T_MAX, ids: Array(T_MAX).fill(1), opts: { temp: 0, topK: 0 },
+                  adopt: 2 }, null).catch((e) => { threw = e; });
+    ok('a job claiming an adopt nobody promised is refused',
+        threw !== null, `${threw?.message}`);
+    eq('and nothing was handed over', r.counts.adopted, before);
+    ok('the session took no frame', !r.live.has(s));
+}
+
+{
+    // A mesh older than this tab. Its peers do not know what a probe is, so
+    // nothing ever answers one, and without a limit every new chat would wait
+    // the whole probe timeout for an answer that cannot come. Three silences
+    // and this tab stops asking.
+    //
+    // Silence is not a `held` carrying 0: that answer means the peers do
+    // support sharing and hold nothing, which is every prompt nobody has sent
+    // before.
+    const long = Array.from({ length: 2 * T_MAX }, (_, i) => (i * 37) % 90 + 1);
+    const { w, asker } = chain([0, N], {}, { dropProbes: true, probeTimeout: 20 });
+
+    for (let i = 0; i < 3; i++) {
+        asker.router.newChat();
+        w.wire.length = 0;
+        await generate(asker, long, 1, { whole: true });
+        eq(`prompt ${i + 1} asked and nothing answered`,
+            w.wire.filter((m) => m.k === 'probe').length > 0, true);
+    }
+    eq('three probes went unanswered', asker.router.shared,
+        { probes: 0, full: 0, partial: 0, headOnly: 0, silent: 3 });
+
+    asker.router.newChat();
+    w.wire.length = 0;
+    const got = await generate(asker, long, 1, { whole: true });
+    eq('so the next prompt does not ask at all',
+        w.wire.filter((m) => m.k === 'probe').length, 0);
+    eq('and nothing was counted against it', asker.router.shared.silent, 3);
+    eq('the prompt itself is unaffected', got.length, 1);
+    eq('with nothing silently continued', w.violations, []);
+}
+
+{
+    // Prefix sharing off (?share=0). Nothing is keyed, so nothing is probed
+    // for, and every prompt runs exactly as it did before any of this.
+    const long = Array.from({ length: 3 * T_MAX }, (_, i) => (i * 31) % 90 + 1);
+    const { w, asker } = chain([0, N], {}, { share: false });
+    const r = w.tabs.get(0).runner.real;
+    const first = await generate(asker, long, 1, { whole: true });
+    asker.router.newChat();
+    const second = await generate(asker, long, 1, { whole: true });
+    eq('nothing is keyed', r.pool.index.size, 0);
+    eq('nothing is adopted', [r.counts.adopted, r.counts.probed], [0, 0]);
+    eq('and the probe answers 0, which is today behaviour exactly',
+        asker.router.shared.full, 0);
+    eq('the reply is unchanged', second, first);
+    eq('with nothing silently continued', w.violations, []);
 }
 
 console.log('\none peer holding everything: the reference');

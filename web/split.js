@@ -110,6 +110,15 @@ export function runnerSessions(asked, mesh) {
 // reclaimed after this long.
 export const IDLE_MS = 2000;
 
+// How long a probe's page lease is held. A probe answers from the content
+// index and takes a lease on the pages it named, so they still hold those
+// bytes when the prompt's first job arrives; the adopt consumes it. Long
+// enough for a path's round trip and the first chunk behind it, and short
+// enough that a client that probes and never prompts costs nothing for long.
+// A lease is also dropped the moment a live session needs its pages, so this
+// is a ceiling rather than a reservation.
+export const LEASE_MS = 10000;
+
 // How long a new session waits at a peer with no frame for it before it is
 // refused with `busy`. Waiting is first come, first served. If sessions were
 // refused immediately and retried on their own timers, one could lose every

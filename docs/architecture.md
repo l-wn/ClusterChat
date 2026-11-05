@@ -420,7 +420,15 @@ bytes it arrived in and adds nothing, which is right: a relay computes no rows.
 Only a job carrying a content hash carries it, since the one reader is the KV
 page index (model.md, *Shared prefixes*), where it is what makes two peers'
 pages for the same text distinguishable — a reply is identical for the same
-path, and no more than that.
+path, and no more than that. A `probe` stamps it the same way, so each peer
+looks the prefix up under the cuts the jobs behind it will go through.
+
+Where several exits are open, *Join* also prefers one this peer already holds
+the prompt's prefix behind (`Runner.hasPrefix`), since adopting it skips the
+whole prefill. Prefix affinity is an input to that one rule rather than a rule
+beside it, so a single place decides where a session goes and it already knows
+about batching — and *Balance* spreading two chats with one prefix across two
+exits is the commonest way a shared prefix stops being shared.
 
 ## Wire format
 
@@ -457,6 +465,10 @@ err   { k, s, key, to, from, past, msg, busy?, nospec?, ttl }
 fix   { k, s, key, to, from, at, rows, ttl }       a hand-off was repaired
 free  { k, s, to, ttl }                             the session is over; drop its KV
 halt  { k, s, key, to, ttl }                        stop feeding this session's loop
+probe { k, s, key, from, pos, path?, hashes, chunks?, each?, ttl }
+                                                    how far is this prefix held?
+held  { k, s, key, to, chunks, each, ttl }          the minimum over the path, and
+                                                    each peer's own extent
 ```
 
 - `opts`: the sampler settings plus the repetition summary. The head clamps
@@ -472,6 +484,12 @@ halt  { k, s, key, to, ttl }                        stop feeding this session's 
   back in, `head` is who to send a `halt` to, and `link` is the timing of the
   head's hand-off to the entry.
 - `busy` marks a capacity refusal, which nothing repairs or rebuilds.
+- `probe`/`held`: how much of a new prompt's prefix the path already holds, in
+  chunks of `T_MAX` (see *Sharing a prefix* below). A `probe` routes by cursor
+  as a job does, so it measures and pins the path the jobs will take; nothing
+  acks it, nothing repairs it, and one that does not come back is a miss.
+  `job.adopt` is the answer the enqueuer acted on, carried on the prompt's
+  first chunk.
 - `fill`: a prefill chunk other than the prompt's last (see Sessions and
   generation). The head runs no LM head for it and answers `filled`.
 - `err.past` is the failed job's `past`. The enqueuer drops an `err` below
@@ -597,6 +615,62 @@ ordinary job that samples the first token and opens the loop.
   64-row chunk reads each weight four times from memory, with no register
   tiling or double buffering. pooled's register-tiled, double-buffered GEMM
   made its prefill pass 1.64x faster.
+
+**Sharing a prefix** (`route.js` `probePrefix()`, `Runner.probe()`). A page's
+bytes are a pure function of the tokens that produced it, so the peers keep a
+content index and a chat can be handed pages another chat filled rather than
+compute them again (model.md, *Shared prefixes*). Before the first chunk of a
+new prompt the enqueuer sends a `probe` down the job path carrying one hash per
+chunk; each peer answers how much of the prefix it holds, and the enqueuer
+starts the prefill at the minimum over the path. **The chunks before it are
+never sent**: no job, no payload, no GPU pass, anywhere on the line.
+
+- **The answer is the minimum, and an upstream-only hit is worth nothing.** A
+  page holds the K and V rows a later position attends back to. It does not
+  hold the residual-stream row *at* its end, which is the only thing a peer
+  hands downstream — those rows are in the boundary log, which is per session
+  and dropped on release. So a peer must run its blocks over a position to feed
+  the peer below whatever it has cached, and it can skip a prefix only if
+  nothing below needs those rows, which is to say only if every peer after it
+  skips too. `held.chunks` is therefore the minimum, and `held.each` carries
+  every peer's own extent so an asymmetric hit can be measured.
+- **The answer is a chunk count, not a page count.** Peers need not agree on a
+  page size and the enqueuer knows none of them, so each peer converts the
+  hashes to its own pages and answers in chunks of `T_MAX`. Only the chunks
+  before the prompt's last are offered: a turn with nothing left to send
+  produces no token.
+- **The probe pins the path it measured.** The cut a session hands off at is in
+  a page's key, so a job down another path would read pages keyed for a cut it
+  did not go through. A `probe` routes by cursor exactly as a job does and
+  leaves the same pin, so there is nothing to release when it fails. Prefix
+  affinity is an input to `plan()`'s *Join* rule for the same reason — see
+  *Routing*.
+- **The lease.** A probe answers from the index and bumps each page's refcount,
+  so `#pagesFor` cannot reclaim it and `ensurePages` will not hand it out
+  before the prompt's first chunk arrives to consume it. One lease per session,
+  dropped after `LEASE_MS` (10 s) or the moment a live session needs the pages:
+  a chat that cannot run beats a probe that may never become a prompt.
+- **The adopt names no pages.** `job.adopt` is only a count, served from the
+  lease that peer's own probe left, so a count with no lease behind it is
+  refused rather than answered from pages nobody promised. The refusal is
+  `busy`, because nothing may repair or rebuild into a cache that is not there;
+  the enqueuer, which knows it was skipping a prompt it still has, sends it in
+  full instead.
+- **A rewind into a shared page is refused.** Two live chats can hold one page,
+  and a full-attention rewind would overwrite rows the other is still reading.
+  Such a job is refused as a cold cache, which rebuilds. A replay is not: it
+  re-feeds rows from the boundary log, which are the same bytes.
+- **A prompt that adopts carries no hashes**, so it adds nothing to the index.
+  The peer at position 0 checks a hash against the ids of every chunk before it,
+  and it has none of the adopted ones. What such a prompt does not key is its
+  own divergent tail, since everything it shares it has already adopted.
+- **Adoption is across enqueuers.** A chat may adopt pages another tab produced,
+  which is what makes several agent sessions in different directories share
+  their prompt — they can never share a chat, because the system prompt carries
+  the working directory. The cost is that hit and miss timing is a side channel
+  for "someone else in this mesh prefilled this exact text". Accepted
+  deliberately; vLLM has the same property, and the per-mesh salt keeps a hash
+  from being tested against another cluster. `?share=0` turns it off.
 
 **Batching** (`Runner.#batchWith`). Decode is bound by reading the weights,
 and a pass reads a peer's weights once however many rows it carries. So when a

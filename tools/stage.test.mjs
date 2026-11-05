@@ -701,9 +701,9 @@ console.log('\ncontent-addressing the pages a prompt fills');
     eq('and it is counted', r.counts.indexed, 1);
     const page0 = r.live.get('a').owned[0];
     eq('under a key naming the ids, the cut and this peer',
-        [...r.pool.index.keys()], [`h16:4@p1:-`]);
-    eq('pointing at the page the session filled', r.pool.index.get('h16:4@p1:-'), page0);
-    eq('and the reverse map agrees', r.pool.byPage[page0], 'h16:4@p1:-');
+        [...r.pool.index.keys()], [`h16:4@p1:-#0`]);
+    eq('pointing at the page the session filled', r.pool.index.get('h16:4@p1:-#0'), page0);
+    eq('and the reverse map agrees', r.pool.byPage[page0], 'h16:4@p1:-#0');
 
     // A rewind: the next job starts inside a page that is already whole, so
     // whatever the key said is no longer in there.
@@ -738,7 +738,197 @@ console.log('\ncontent-addressing the pages a prompt fills');
     eq('still addressable after release', tight.pool.index.size, 1);
     await tightFeed('b', 'z');
     eq('but the page handed to another session holds only its entry',
-        [...tight.pool.index.keys()], ['z16:4@p1:-']);
+        [...tight.pool.index.keys()], ['z16:4@p1:-#0']);
+}
+
+console.log('\nthe probe: how far a prefix is held, and the lease on it');
+{
+    // pageTokens 16 against tMax 4: four chunks fill a page, so the chunk whose
+    // hash keys a page is the fourth, and a probe that answers "one page" must
+    // answer "four chunks". That is the arithmetic a real cluster never
+    // exercises, where a chunk is exactly a page.
+    const r = new Runner(device, D, weightsFor(0, 4),
+        { lo: 0, hi: 4, nMax: 32, tMax: 4, slots: 2, sessions: 2, pageTokens: 16,
+          idleMs: 0, peerId: 'p1' });
+    const job = (s, past, n = 4, hash, extra = {}) => r.run(
+        { k: 'job', s, pos: 0, past, n, ids: Array(n).fill(1), opts: {},
+          ...(hash && { hash }), ...extra }, null);
+    const feed = async (s, from, to, tag) => {
+        for (let past = from; past < to; past += 4) {
+            await job(s, past, 4, (past + 4) % 16 === 0 ? `${tag}${past + 4}` : undefined);
+        }
+    };
+    // The hashes the enqueuer would send for a prompt of this many chunks.
+    const hashes = (tag, chunks) => Array.from({ length: chunks },
+        (_, i) => `${tag}${(i + 1) * 4}`);
+    const probe = (s, hs, extra = {}) => r.probe({ k: 'probe', s, pos: 0, hashes: hs,
+                                                   ...extra }, 4);
+
+    await feed('a', 0, 16, 'h');
+    eq('one page is keyed', r.pool.index.size, 1);
+    const page0 = r.live.get('a').owned[0];
+
+    eq('a probe over the chunks that filled it answers all four',
+        probe('b', hashes('h', 4)), 4);
+    eq('leaving the page leased, so nothing can take it', r.pool.refs[page0], 2);
+    ok('and out of the pool', !r.pool.free.includes(page0));
+    eq('counted', r.counts.probed, 1);
+
+    // The run must be contiguous from page 0: a prompt resumes at one
+    // position, so a gap cannot be skipped.
+    eq('a probe whose first page is unknown answers 0', probe('c', hashes('z', 4)), 0);
+    // Fewer chunks than fill a page is no page at all, and the answer is in
+    // chunks, so it must land where a page boundary and a chunk boundary meet.
+    eq('and so does one that stops short of a page boundary',
+        probe('d', hashes('h', 3)), 0);
+    eq('a probe answering nothing leases nothing', r.leases.size, 1);
+
+    // The lease is what makes the window between the answer and the first
+    // chunk safe. Without it #pagesFor could hand the page to another session
+    // between the two, and the adopt would read a page holding someone else.
+    await r.release('a');
+    eq('releasing the filler leaves the lease holding the page', r.pool.refs[page0], 1);
+    ok('so it is still not in the pool', !r.pool.free.includes(page0));
+
+    // The adopt. `past` is the chunk count times tMax, which is the page count
+    // times pageTokens — the same position counted two ways.
+    await job('b', 16, 4, undefined, { adopt: 4 });
+    eq('the adopting session got the page itself', r.live.get('b').owned[0], page0);
+    eq('and the lease is consumed, leaving the frame the only holder',
+        [r.pool.refs[page0], r.leases.size], [1, 0]);
+    eq('counted as a page handed over', r.counts.adopted, 1);
+    // Seeded to the adopted length at admission, then advanced by the job
+    // itself. Without the seeding #checkFed would see a block holding nothing
+    // and refuse the job as a cache that is gone.
+    eq('with its blocks fed past the pages it adopted', r.live.get('b').fed.get(0), 20);
+    await job('b', 20, 4);
+    eq('and the session continues from there', r.live.get('b').owned.length, 2);
+}
+
+{
+    // An adopt nobody promised. The header names a chunk count, never pages:
+    // the pages come from the lease this peer's own probe left, so a count with
+    // no lease behind it, or one longer than the lease, is refused.
+    //
+    // Refused for capacity, not as a cold cache: nothing repairs or rebuilds a
+    // `busy`, where a cold refusal would have the enqueuer rebuild the whole
+    // prefix the adopt was there to skip.
+    const r = new Runner(device, D, weightsFor(0, 4),
+        { lo: 0, hi: 4, nMax: 64, tMax: 4, slots: 2, sessions: 2, pageTokens: 16,
+          idleMs: 0, peerId: 'p1' });
+    const fill = async (s) => {
+        for (let past = 0; past < 16; past += 4) {
+            await r.run({ k: 'job', s, pos: 0, past, n: 4, ids: [1, 1, 1, 1], opts: {},
+                          ...(past === 12 && { hash: 'h16' }) }, null);
+        }
+    };
+    const job = (s, past, extra = {}) => r.run(
+        { k: 'job', s, pos: 0, past, n: 4, ids: [1, 1, 1, 1], opts: {}, ...extra }, null);
+    await fill('a');
+
+    let err = null;
+    await job('b', 16, { adopt: 4 }).catch((e) => { err = e; });
+    ok('an adopt with no lease is refused', err !== null, `${err?.message}`);
+    ok('for capacity, which nothing repairs or rebuilds', err?.busy === true);
+    eq('counted as a refused adopt', r.counts.adoptRefused, 1);
+    ok('and the session took no frame', !r.live.has('b'));
+
+    eq('a probe leaves a lease for one page',
+        r.probe({ k: 'probe', s: 'b', pos: 0, hashes: ['h4', 'h8', 'h12', 'h16'] }, 4), 4);
+    err = null;
+    await job('b', 32, { adopt: 8 }).catch((e) => { err = e; });
+    ok('an adopt longer than the lease is refused too', err?.busy === true, `${err?.message}`);
+    ok('and the lease is left for the job that fits it', r.leases.has('b'));
+}
+
+{
+    // A live session beats a probe that may never turn into a prompt. One page
+    // in the pool, leased by a probe: an arriving session must still be able to
+    // run, and the enqueuer that probed falls back to sending its prefix.
+    const r = new Runner(device, D, weightsFor(0, 4),
+        { lo: 0, hi: 4, nMax: 16, tMax: 4, slots: 1, sessions: 2, idleMs: 0, peerId: 'p1' });
+    for (let past = 0; past < 16; past += 4) {
+        await r.run({ k: 'job', s: 'a', pos: 0, past, n: 4, ids: [1, 1, 1, 1], opts: {},
+                      ...(past === 12 && { hash: 'h16' }) }, null);
+    }
+    const page = r.live.get('a').owned[0];
+    await r.release('a');
+    eq('the only page is in the pool', r.pool.free, [page]);
+    eq('a probe takes it', r.probe({ k: 'probe', s: 'b', pos: 0,
+                                     hashes: ['h4', 'h8', 'h12', 'h16'] }, 4), 4);
+    eq('out of the pool', r.pool.free.length, 0);
+
+    await r.run({ k: 'job', s: 'c', pos: 0, past: 0, n: 1, ids: [1], opts: {} }, null);
+    eq('a session with nowhere else to go gets it anyway', r.live.get('c').owned[0], page);
+    eq('and the lease is gone', r.leases.size, 0);
+}
+
+{
+    // Two frames holding one page, and one of them rewinds into it.
+    // #indexPages keeps the index honest, but nothing there stops the rows
+    // being overwritten under a chat that is reading them, and #checkFed's
+    // full-attention branch permits exactly that. This is the only place
+    // `refs` is load-bearing rather than bookkeeping.
+    const r = new Runner(device, D, weightsFor(0, 4),
+        { lo: 0, hi: 4, nMax: 32, tMax: 4, slots: 3, sessions: 3, pageTokens: 16,
+          idleMs: 0, peerId: 'p1' });
+    const feed = async (s, from, to, extra = {}) => {
+        for (let past = from; past < to; past += 4) {
+            await r.run({ k: 'job', s, pos: 0, past, n: 4, ids: [1, 1, 1, 1], opts: {},
+                          ...(past + 4 === 16 && { hash: 'h16' }), ...extra }, null);
+        }
+    };
+    await feed('a', 0, 16);
+    const page = r.live.get('a').owned[0];
+    eq('a probe answers from the page the first chat still holds',
+        r.probe({ k: 'probe', s: 'b', pos: 0, hashes: ['h4', 'h8', 'h12', 'h16'] }, 4), 4);
+    await r.run({ k: 'job', s: 'b', pos: 0, past: 16, n: 4, ids: [1, 1, 1, 1], opts: {},
+                  adopt: 4 }, null);
+    eq('two live frames now hold it', r.pool.refs[page], 2);
+
+    let err = null;
+    await feed('a', 8, 12).catch((e) => { err = e; });
+    ok('a rewind into a page another chat holds is refused',
+        err !== null && /another chat holds/.test(err.message ?? ''), `${err?.message}`);
+    ok('as a cold cache, which rebuilds', !err?.busy);
+
+    // A replay re-feeds rows from the boundary log, which are the same bytes
+    // by construction, so it cannot corrupt a co-holder and is allowed.
+    err = null;
+    await feed('a', 8, 12, { replay: true }).catch((e) => { err = e; });
+    eq('where a replay of the same rows is not', err, null);
+
+    // And once the co-holder lets go, the rewind is fine again.
+    await r.release('b');
+    eq('the page is held once more', r.pool.refs[page], 1);
+    err = null;
+    await feed('a', 8, 12).catch((e) => { err = e; });
+    eq('so the rewind goes through', err, null);
+}
+
+{
+    // A speculating session must not adopt a page a plain prompt filled.
+    // #mtpCache hands the draft head the trunk's page table, so physical page
+    // `p` addresses the draft head's rows at slot `p` too, and a page filled
+    // without the draft head holds nothing there. A hit-rate filter rather
+    // than a correctness one, but it belongs in the key either way.
+    const gpu = makeGpu();
+    const { marker: mk } = await import('./stub-gpu.mjs');
+    const r = new Runner(gpu.device, { ...D, mtp: { file: 'mtp.bin', draftVocab: 20 } },
+        weightsFor(0, 4), { lo: 0, hi: 4, nMax: 32, tMax: 4, slots: 2, sessions: 2,
+                            pageTokens: 16, idleMs: 0, peerId: 'p1' });
+    r.attachMtp({ ...Object.fromEntries(['input_layernorm', 'q_proj', 'k_proj', 'v_proj',
+        'o_proj', 'post_attention_layernorm', 'gate_proj', 'up_proj', 'down_proj', 'enorm',
+        'hnorm', 'fc_e', 'fc_h', 'mtp_norm', 'embed_draft', 'head_draft']
+        .map((n) => [n, mk('M')])), kind: 'full_attention', draftVocab: 20, bytes: 5000 });
+    for (let past = 0; past < 16; past += 4) {
+        await r.run({ k: 'job', s: 'a', pos: 0, past, n: 4, ids: [1, 1, 1, 1], opts: {},
+                      ...(past === 12 && { hash: 'h16' }) }, null);
+    }
+    const hashes = ['h4', 'h8', 'h12', 'h16'];
+    eq('a plain prompt adopts it', r.probe({ k: 'probe', s: 'b', pos: 0, hashes }, 4), 4);
+    eq('and a speculating one does not',
+        r.probe({ k: 'probe', s: 'c', pos: 0, hashes, mtp: true }, 4), 0);
 }
 
 {
@@ -765,7 +955,7 @@ console.log('\ncontent-addressing the pages a prompt fills');
 {
     // Refcounts: two frames can hold one page, and it goes back to the pool
     // once, when the last of them lets go. adoptPages is the primitive the read
-    // side will use; nothing calls it yet, so this is where it is checked.
+    // side uses; this is where the primitive itself is checked.
     const r = new Runner(device, D, weightsFor(0, 4),
         { lo: 0, hi: 4, nMax: 16, tMax: 4, slots: 2, sessions: 2, idleMs: 0 });
     await r.run({ k: 'job', s: 'a', pos: 0, past: 0, n: 1, ids: [1], opts: {} }, null);
@@ -839,7 +1029,7 @@ console.log('\ncontent-addressing the pages a prompt fills');
                     new Float32Array(4 * D.hidden));
     }
     eq('a page is keyed', r.pool.index.size, 1);
-    eq('its key carries the cuts above it', [...r.pool.index.keys()], ['h16:2@up,5@p:-']);
+    eq('its key carries the cuts above it', [...r.pool.index.keys()], ['h16:2@up,5@p:-#0']);
     r.prepend(pieceFor(1), r.growLeft());
     eq('growing left clears the index', r.pool.index.size, 0);
     ok('and the reverse map with it', r.pool.byPage.every((k) => k === null));

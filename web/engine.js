@@ -198,6 +198,8 @@ export class Engine {
             // The scope chats are stored and checked under. Not the invite.
             mesh: room?.historyTag ?? 'global',
             runner: () => this.#runner,
+            // ?share=0: this tab neither keys pages nor asks for a prefix.
+            share: this.#share,
             onChange: () => this.#emit('change'),
             // `reason`: 'repair' (a peer left), 'resume' (a parked or stored
             // chat), 'rewind' (see rewind()). Only a repair has an error.
@@ -1060,6 +1062,11 @@ export class Engine {
     get ran() { return this.#router?.ran ?? 0; }
     // What the router's ack waits have had to absorb (route.js's congestion).
     get congestion() { return this.#router?.congestion ?? null; }
+    // What the prefix probes have found (route.js's shared).
+    get share() { return this.#router?.shared ?? null; }
+    // Tokens of the last prompt the peers already held, so this tab never sent
+    // them. Reported next to `lastPromptTokens`, which counts the whole prompt.
+    get lastShared() { return this.#router?.lastShared ?? 0; }
     get blocksPerSec() { return this.#sp; }
     get vramLimit() { return this.#vramLimit; }
     get lastStopReason() { return this.#lastStopReason; }

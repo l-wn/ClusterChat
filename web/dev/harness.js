@@ -399,6 +399,11 @@ export const api = {
             // (route.js's armAck). `extended > 0` with `dead === 0` is the fix
             // doing its job.
             congestion: s.congestion ?? null,
+            // What this tab's prefix probes found: how many were answered, how
+            // many found the whole offered prefix, and of the partial ones how
+            // many were the head alone holding more than the path's minimum
+            // (route.js's shared).
+            share: s.share ?? null,
         };
     },
 

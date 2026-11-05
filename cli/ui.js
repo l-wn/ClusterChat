@@ -149,7 +149,15 @@ export function request({ agent }, totals) {
             totals.out += u.output;
             const tps = rate();
             const why = ended.stop === 'tool' ? c.violet(' → tool') : ended.stop === 'length' ? c.yellow(' (cut at the token limit)') : '';
-            print(`${IN}${who} ${c.green('✓')} ${n(u.input - u.cached)} in ${c.dim(`· ${n(u.cached)} cached ·`)} `
+            // `cached` is this chat's own context; `shared` is tokens of this
+            // prompt the peers already held from another chat and so were
+            // never sent. Two agent sessions in different directories can
+            // never share a chat (the system prompt carries the cwd) and still
+            // share almost all of their prompt, so the two are worth telling
+            // apart.
+            const shared = u.shared ? c.dim(` · ${n(u.shared)} shared`) : '';
+            print(`${IN}${who} ${c.green('✓')} ${n(u.input - u.cached)} in `
+                + `${c.dim(`· ${n(u.cached)} cached`)}${shared}${c.dim(' ·')} `
                 + `${n(u.output)} out ${c.dim(`· ${secs} s${tps ? ` · ${tps.toFixed(1)} tok/s` : ''}`)}${why}`);
         },
     };

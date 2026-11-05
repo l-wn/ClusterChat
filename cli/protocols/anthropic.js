@@ -43,8 +43,13 @@ const texts = (blocks) => blocks.map((b) => b.type === 'text' ? b.text
     : b.type === 'image' || b.type === 'document' ? '[image omitted]' : null)
     .filter((t) => t != null).join('\n');
 
-const usage = (u) => ({ input_tokens: u.input - u.cached, output_tokens: u.output,
-    cache_read_input_tokens: u.cached, cache_creation_input_tokens: 0 });
+// `cache_read_input_tokens` is what the cluster did not have to compute: this
+// chat's own context plus any prefix the peers already held from another chat
+// (core.js's `shared`). The two are separate in the CLI's own line, where which
+// it was matters; to a client they are one number.
+const usage = (u) => ({ input_tokens: u.input - u.cached - (u.shared ?? 0),
+    output_tokens: u.output,
+    cache_read_input_tokens: u.cached + (u.shared ?? 0), cache_creation_input_tokens: 0 });
 
 async function messages(req, res, cluster, body) {
     const id = `msg_${crypto.randomUUID().replaceAll('-', '')}`;

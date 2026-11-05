@@ -95,6 +95,26 @@ const MAX_REPAIRS = 2;
 // a link that is still congested.
 const REBUILD_BACKOFF_MS = 500;
 
+// Longest a prompt waits for its prefix probe before starting in full. One
+// round trip of the whole path with no GPU work behind it, so this is generous;
+// a prompt that waits longer than this has lost more than the probe could save.
+const PROBE_TIMEOUT_MS = 3000;
+
+// Probes that go completely unanswered before this tab stops asking, and how
+// long it then waits before trying again.
+//
+// A peer that never answers is a peer that does not know what a probe is — an
+// older build, on a mesh this tab is newer than. Without this, every new chat
+// on such a mesh pays PROBE_TIMEOUT_MS for an answer that cannot come. Giving
+// up for a while rather than for good, because the roster changes: the peer
+// that cannot answer may be replaced by one that can.
+//
+// Silence is not the same as a `held` carrying 0. That answer means the peers
+// do support sharing and simply hold nothing of this prefix, which is the
+// ordinary case for a prompt nobody has sent before, so it resets the count.
+const PROBE_GIVEUP = 3;
+const PROBE_RETRY_MS = 60000;
+
 // Hop budget for an answer, on top of the length of the line. Bounds an answer
 // whose addressee nobody links to.
 const TTL = 8;
@@ -145,7 +165,11 @@ export function jobOpts(opts, ctx, eos) {
 //             job rebuilds.
 export function makeConversation({ mesh = 'global', history = [] } = {}) {
     return { mesh, history: Array.from(history), session: null, key: null,
-             parked: false, stale: false };
+             parked: false, stale: false,
+             // Tokens of the last prompt the peers already held, so it was
+             // never sent (sendPrompt()/send()); and whether to stop probing
+             // for them, set when a prompt that adopted failed anyway.
+             shared: 0, noProbe: false };
 }
 
 // `runner` is a getter: there is no Runner until the download starts, and
@@ -178,6 +202,10 @@ export function makeRouter({
     maxFixes = MAX_FIXES,
     maxLocalReplay = MAX_LOCAL_REPLAY,
     prefillWindow = PREFILL_WINDOW,
+    probeTimeout = PROBE_TIMEOUT_MS,
+    // Content-address pages and ask the path for a prefix it may already hold
+    // (?share=0 turns both off, here and in the Runner).
+    share = true,
     maxBackoff = MAX_BACKOFF,
     ackRecover = ACK_RECOVER,
     rebuildBackoff = REBUILD_BACKOFF_MS,
@@ -207,6 +235,17 @@ export function makeRouter({
     const senders = new Map();     // session -> Set of peers that handed me a job
     const chains = new Map();      // session -> a promise of { acc, at }: the content
                                    // hash chain this peer has verified (verifyHash)
+    const probes = new Map();      // session -> { settle, cancel, key }: a prefix probe
+                                   // out on the path, waiting for its `held`
+    // What the probes have said, for the dev harness and the GPU suite: how
+    // many were answered, how many found the whole offered prefix, how many
+    // found part of it, and of those how many were the head alone holding more
+    // than the path's minimum. The last is what says whether a partial hit is
+    // worth handling asymmetrically.
+    const shared = { probes: 0, full: 0, partial: 0, headOnly: 0, silent: 0 };
+    // Consecutive probes nothing answered, and when to try again once that
+    // ran out of patience. See PROBE_GIVEUP.
+    let probeSilence = 0, probeMuteUntil = 0;
                                     // of it. They may `free` it here.
 
     // The head's side of the closed loop, per session: the key its loop jobs
@@ -283,7 +322,9 @@ export function makeRouter({
     // this tab produced. `from` comes from the connection, not the header, so
     // the reverse path is authenticated.
     function route(h, payload, raw = null, from = null) {
-        const mine = h.k === 'job' ? iCanRun(h.pos) : h.to === net.id;
+        // A probe routes by cursor, as a job does, so it measures and pins the
+        // path the jobs will take. Everything else is addressed.
+        const mine = h.k === 'job' || h.k === 'probe' ? iCanRun(h.pos) : h.to === net.id;
         if (mine) return deliver(h, payload, from);
         if (h.to != null && !net.has(h.to)) return;   // its addressee left
 
@@ -294,6 +335,10 @@ export function makeRouter({
         }
 
         if (h.k === 'job') return forward(h, payload, raw, from);
+        // A peer that cannot run the probe's cursor relays it, exactly as it
+        // relays a job it cannot run: it computes nothing, so it adds nothing
+        // to `each` and lowers no count.
+        if (h.k === 'probe') return forwardProbe(h);
 
         // An answer can circle when its addressee is in the roster but nobody
         // has an open link to it yet. Answers are ~60 bytes, so repacking with
@@ -308,6 +353,35 @@ export function makeRouter({
         // Anything I cannot reach goes to the hub, which links to everyone.
         const to = net.linked(h.to) ? h.to : net.hub;
         if (!net.send(to, h, payload)) fail(h, to);
+    }
+
+    // Hand a probe on, and nothing more. Deliberately not forward(): that
+    // writes `outbound` and arms an ack, which would make the boundary
+    // repairable and have a probe that is simply slow look like a dead peer,
+    // and it clears `fixes`, which would let a probe reset another chat's
+    // repair budget. A probe carries no rows, so there is nothing to replay
+    // and nothing to repair — a probe that does not come back is a miss, which
+    // costs the prompt the prefix it would have skipped and nothing else.
+    //
+    // The pin it leaves is the pin a first job would have left, by the same
+    // hops() call, so there is nothing to release when it fails.
+    function forwardProbe(h) {
+        for (const to of hops(h.s, h.pos)) {
+            if (!net.send(to, h, null)) continue;
+            return pin(h.s, h.pos, to);
+        }
+        // Nowhere to ask. Answering 0 rather than leaving the enqueuer on its
+        // timeout, so the prompt starts now and in full.
+        return answerHeld(h, 0, h.each ?? []);
+    }
+
+    // The probe's answer, addressed home like a `filled`.
+    function answerHeld(h, chunks, each) {
+        const msg = { k: 'held', s: h.s, key: h.key, to: h.from, chunks, each,
+                      ttl: TTL + (net.positions || 0) };
+        if (h.from === net.id) return route(msg, null);
+        const to = net.linked(h.from) ? h.from : net.hub;
+        if (to != null) net.send(to, msg, null);
     }
 
     // Separate from route() because runJob() must not go back through iCanRun:
@@ -571,6 +645,7 @@ export function makeRouter({
         heading.delete(s);
         current.delete(s);
         chains.delete(s);
+        dropProbe(s);
     }
 
     // Tell every peer this tab handed `s` to that the session is over, so its
@@ -726,6 +801,10 @@ export function makeRouter({
             return runJob(h, payload, from);
         }
 
+        // A probe this peer can run. Never acked and never answered with an
+        // `err`: see forwardProbe().
+        if (h.k === 'probe') return runProbe(h);
+
         if (h.k === 'ack') {
             // The receiver's load, which plan() and rankAt() balance on.
             if (from != null && Number.isFinite(h.w)) {
@@ -805,6 +884,17 @@ export function makeRouter({
         if (h.k === 'filled') {
             const f = fills.get(h.s);
             if (f && h.key === f.key) f.answer(h);
+            return;
+        }
+
+        // How far the path holds this prompt's prefix. Not gated by
+        // mayAnswer(), as `err` and `fix` are not: a `held` cannot produce a
+        // wrong token, because the adopt names no pages — it consumes the lease
+        // each peer's own probe left. A count that is too large is refused
+        // `busy` by the first peer, and the prompt runs in full.
+        if (h.k === 'held') {
+            const p = probes.get(h.s);
+            if (p && h.key === p.key) p.settle(h);
             return;
         }
 
@@ -956,6 +1046,17 @@ export function makeRouter({
                 groups.set(x.cut, (groups.get(x.cut) ?? 0) + 1);
             }
         }
+        // Prefix affinity, as an input to Join rather than a rule beside it, so
+        // one place decides where a session goes and it already knows about
+        // batching. A cut this peer already holds the prompt's prefix behind is
+        // worth about as much as a session to join: adopting it skips the whole
+        // prefill, where Balance spreading two sessions with one prefix across
+        // two exits is the commonest way a symmetric hit becomes a partial one.
+        if (h.k === 'probe') {
+            for (const c of ok) {
+                if (r.hasPrefix?.(h, c.at)) groups.set(c.at, (groups.get(c.at) ?? 0) + 1);
+            }
+        }
         let join = null;
         for (const c of ok) if ((groups.get(c.at) ?? 0) > (groups.get(join?.at) ?? 0)) join = c;
         if (join) return take(join);
@@ -978,6 +1079,35 @@ export function makeRouter({
             if (x < score) { best = i; score = x; }
         });
         return take(ok[best]);
+    }
+
+    // Measure the prefix this peer holds, append it to the picture the answer
+    // carries, and hand the probe on. Synchronous throughout: plan() and the
+    // Runner's index are Map reads, and a probe behind a prefill in the GPU
+    // queue would cost what it is there to save.
+    //
+    // `chunks` is the running minimum over the path and the only field the
+    // enqueuer acts on, because a peer can skip a prefix only if nothing
+    // downstream needs the rows it would have produced for it — which is to
+    // say only if every peer after it skips too. `each` is every peer's own
+    // extent, which costs a few bytes and is the only way to see whether a
+    // partial hit is the head's or an upstream peer's.
+    function runProbe(h) {
+        const r = runner();
+        const want = plan(h);
+        let mine = 0;
+        try {
+            mine = r.probe?.(h, want) ?? 0;
+        } catch (e) {
+            console.warn(`probe for session ${h.s} failed here: ${e.message}`);
+        }
+        const chunks = Math.min(h.chunks ?? Infinity, mine);
+        const each = [...(h.each ?? []), { id: net.id, chunks: mine }];
+        if (want >= net.positions) return answerHeld(h, chunks, each);
+        // The same stamp runJob() makes, byte for byte, or the next peer keys
+        // the same page differently and holds nothing the probe can find.
+        return forwardProbe({ ...h, pos: want, chunks, each,
+                              path: [...(h.path ?? []), `${want}@${net.id}`] });
     }
 
     async function runJob(h, hidden, from = null) {
@@ -1310,6 +1440,84 @@ export function makeRouter({
         })();
     }
 
+    // --- Asking the path how much of a prefix it holds ---
+    //
+    // A KV page holds the rows a later position attends back to; it does not
+    // hold the row *at* its end, which is the only thing a peer hands
+    // downstream. So a peer can skip a prefix only if nothing below it needs
+    // the rows it would have produced there — which is to say only if every
+    // peer after it skips too. The answer the enqueuer acts on is therefore the
+    // minimum over the path, and a hit at one peer alone is worth nothing.
+    //
+    // Answers a count of T_MAX chunks, and 0 for every failure: a timeout, no
+    // path, a peer that holds nothing, prefix sharing off. 0 is today's
+    // behaviour exactly, so there is nothing to recover from.
+    //
+    // `probes` is written before the send, synchronously, so a `held` that
+    // arrives in the same turn is not dropped.
+    function probePrefix(c, hashes) {
+        if (!share || !hashes.length) return 0;
+        // Nothing on this mesh answers a probe. Start the prompt now.
+        if (probeMuteUntil && performance.now() < probeMuteUntil) return 0;
+        const s = c.session, key = c.key;
+        return new Promise((resolve) => {
+            let timer = null;
+            const finish = (chunks) => {
+                if (probes.get(s)?.key !== key) return;
+                probes.delete(s);
+                clearTimeout(timer);
+                resolve(Math.max(0, Math.min(chunks | 0, hashes.length)));
+            };
+            // Timed out, which is the only evidence this tab gets that the
+            // peers do not speak this. A session dropped from under the probe
+            // (`cancel`) is not evidence and does not count.
+            timer = setTimeout(() => {
+                if (probes.get(s)?.key === key) {
+                    shared.silent++;
+                    if (++probeSilence >= PROBE_GIVEUP) {
+                        probeMuteUntil = performance.now() + PROBE_RETRY_MS;
+                        console.warn(`no peer answered ${probeSilence} prefix probes; not asking `
+                            + `again for ${PROBE_RETRY_MS / 1000}s`);
+                    }
+                }
+                finish(0);
+            }, probeTimeout);
+            probes.set(s, {
+                key,
+                // Nothing can answer any more: resolve without counting, since
+                // no probe was answered.
+                cancel: () => finish(0),
+                settle(h) {
+                    // One answer, however many hops relayed it.
+                    if (probes.get(s)?.key !== key) return;
+                    probeSilence = 0;
+                    probeMuteUntil = 0;
+                    shared.probes++;
+                    const full = h.chunks >= hashes.length;
+                    if (full) shared.full++;
+                    else if (h.chunks > 0) shared.partial++;
+                    // Who held it when the minimum did not. The head is the one
+                    // peer whose own hit could be used without the others', so
+                    // its share of the misses says whether the asymmetric
+                    // "skip and offer" path is worth building.
+                    const each = Array.isArray(h.each) ? h.each : [];
+                    if (!full && each.length && each[each.length - 1].chunks > h.chunks) {
+                        shared.headOnly++;
+                    }
+                    finish(h.chunks);
+                },
+            });
+            route({ k: 'probe', s, key, from: net.id, pos: 0, hashes,
+                    ttl: TTL + (net.positions || 0) }, null);
+        });
+    }
+
+    // Give up on a probe for `s`, so nothing waits on an answer that can no
+    // longer come (the session was abandoned, freed or rebuilt).
+    function dropProbe(s) {
+        probes.get(s)?.cancel();
+    }
+
     // --- The enqueuer's session ---
 
     // The job header's sampler settings for `ids`, from the chat's history.
@@ -1338,7 +1546,8 @@ export function makeRouter({
     // `prompt`: the whole prompt `ids` ends, for the repetition summary when
     // its earlier chunks are not yet in the history. `from`: where that
     // prompt starts; an `err` below it is late (see deliver()).
-    function submitJob(ids, past, opts, loop = null, prompt = ids, from = past, hash = null) {
+    function submitJob(ids, past, opts, loop = null, prompt = ids, from = past, hash = null,
+                       { adopt = 0 } = {}) {
         const s = conv.session, k = conv.key;
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
@@ -1361,6 +1570,11 @@ export function makeRouter({
                 // The MTP head fills its KV from every job, prefill included.
                 ...(opts.spec && { mtp: true }),
                 ...(hash && { hash }),
+                // This prompt starts at a prefix the path already holds. The
+                // number names no pages: each peer serves it from the lease its
+                // own probe left, so one that is too large is refused rather
+                // than answered from pages nobody promised.
+                ...(adopt > 0 && { adopt }),
             });
         });
     }
@@ -1385,8 +1599,23 @@ export function makeRouter({
         if (c.session == null) newSession(c);
         let r;
         try {
-            r = await sendPrompt(c, ids, opts, { onChunk });
+            r = await sendPrompt(c, ids, opts, { onChunk, probe: !c.noProbe });
         } catch (err) {
+            // A prompt that adopted a prefix and failed anyway does not probe
+            // again: the rebuild would ask for the same pages, and a loop of
+            // adopt-and-fail is worse than one full prefill.
+            //
+            // It also rebuilds rather than reporting the refusal, capacity or
+            // not. A peer refuses an adopt it cannot serve as `busy`, because
+            // nothing may repair or rebuild into a cache that is not there —
+            // but to this enqueuer it means only that the lease lapsed, and the
+            // prompt it was skipping is a prompt it still has. If the peer is
+            // really full the rebuild is refused too, and that is what the
+            // caller is told.
+            if (c.shared) {
+                c.noProbe = true;
+                return settle(c, recover(ids, opts, err));
+            }
             // A capacity refusal is thrown to the caller. The context is still
             // cached and a rebuild would need more capacity. The caller waits
             // and retries.
@@ -1395,6 +1624,7 @@ export function makeRouter({
         }
         c.history.push(...ids);
         c.parked = false;
+        c.noProbe = false;
         return r;
     }
 
@@ -1420,7 +1650,7 @@ export function makeRouter({
     //
     // `cancellable`: a rebuild checks isCancelled() before each chunk.
     function sendFills(c, ids, past0, opts, { onChunk = null, cancellable = false,
-                                              hashes = null } = {}) {
+                                              hashes = null, adopt = 0 } = {}) {
         const s = c.session, key = c.key;
         const waiting = new Map();     // past -> { n, t0, timer }
         let wake = null, error = null, closed = false;
@@ -1486,6 +1716,9 @@ export function makeRouter({
                     ...(opts.spec && { mtp: true }),
                     // What this chunk's ids are, for the peers' page index.
                     ...(hashes?.[i / T_MAX] && { hash: hashes[i / T_MAX] }),
+                    // Only the first chunk adopts: it is the one that takes the
+                    // frame, and every chunk after it continues in it.
+                    ...(adopt > 0 && i === 0 && { adopt }),
                 });
             }
             if (closed) throw error ?? new Error('the prompt was stopped');
@@ -1497,19 +1730,43 @@ export function makeRouter({
     // Send a prompt at the end of `c`'s history: its prefill chunks, then the
     // last chunk as the job that answers. Resolves with that answer. The
     // caller adds `ids` to the history.
-    async function sendPrompt(c, ids, opts, { onChunk = null, cancellable = false } = {}) {
+    async function sendPrompt(c, ids, opts, { onChunk = null, cancellable = false,
+                                              probe = true } = {}) {
         const past = c.history.length, cut = commitAt(ids.length);
         // One hash per chunk, so each peer can content-address the pages it
         // fills (see Content addressing above). The last chunk gets one too: it
         // completes a page whenever the prompt is a whole number of chunks.
         const hashes = worthHashing(past, ids) ? await promptHashes(ids) : null;
-        if (!cut) return submitJob(ids, past, opts, null, ids, past, hashes?.[0] ?? null);
-        const pre = sendFills(c, ids.slice(0, cut), past, opts, { onChunk, cancellable, hashes });
+        // How much of the prefix the path already holds. Only the chunks before
+        // the last are offered: a turn with nothing left to send produces no
+        // token, so the prompt must always keep its last chunk. That is also
+        // what keeps the answer on a chunk boundary the peers can start from
+        // with no further clamping.
+        const adopt = probe && hashes && cut
+            ? await probePrefix(c, hashes.slice(0, cut / T_MAX)) : 0;
+        const skip = adopt * T_MAX;
+        c.shared = skip;
+        // A prompt that adopts carries no hashes. verifyHash() checks a chunk
+        // against the chain through every chunk before it, and the entry peer
+        // has none of the adopted ids, so the chain cannot be continued and
+        // every hash would be stripped with a warning. The cost is that an
+        // adopting prompt adds nothing to the index — which is only its own
+        // divergent tail, since everything it shares it has already adopted.
+        const keys = skip ? null : hashes;
+        if (!cut) return submitJob(ids, past, opts, null, ids, past, keys?.[0] ?? null);
+        // The whole offered prefix was held: there are no prefill chunks left
+        // to send, and the last chunk both adopts and commits.
+        if (skip === cut) {
+            return await submitJob(ids.slice(cut), past + cut, opts, null, ids, past,
+                                   null, { adopt });
+        }
+        const pre = sendFills(c, ids.slice(skip, cut), past + skip, opts,
+                              { onChunk, cancellable, hashes: keys, adopt });
         try {
             await pre.sent;
             if (pre.error) throw pre.error;
             return await submitJob(ids.slice(cut), past + cut, opts, null, ids, past,
-                                   hashes?.[cut / T_MAX] ?? null);
+                                   keys?.[cut / T_MAX] ?? null);
         } finally {
             pre.close();
         }
@@ -1611,12 +1868,15 @@ export function makeRouter({
             if (finish) {
                 r = await finish(ctx, onChunk);
             } else {
-                r = await sendPrompt(c, ctx, opts, { onChunk, cancellable: true });
+                r = await sendPrompt(c, ctx, opts, { onChunk, cancellable: true,
+                                                     probe: !c.noProbe });
                 c.history.push(...ctx);
             }
             onProgress(c.history.length, ctx.length);
             onChange();
+            c.noProbe = false;
         } catch (e) {
+            if (c.shared) c.noProbe = true;
             // The chat's history before this turn, for abandon() to restore.
             e.history = ctx.slice(0, ctx.length - ids.length);
             throw e;
@@ -1709,7 +1969,7 @@ export function makeRouter({
         st.from = past;
         streams.set(st.s, st);
         const opts = st.nospec ? { ...st.opts, spec: false } : st.opts;
-        const job = () => {
+        const job = (hash = null, adopt = 0) => {
             arm(st);
             // The summary and the loop's context cover the whole prompt.
             route({
@@ -1719,14 +1979,40 @@ export function makeRouter({
                 loop: loopFor(ids, opts, st.budget - st.sent, c),
                 ...(rb && { rb }),
                 ...(st.opts.spec && { mtp: true }),
+                ...(hash && { hash }),
+                ...(adopt > 0 && { adopt }),
             });
         };
+        // `hashes` content-addresses the pages each chunk fills, and `adopt`
+        // is how many chunks of them the path already holds, so they are never
+        // sent. Both as in sendPrompt(), which is the round-trip path's
+        // equivalent of this function.
+        const chunks = (hashes, adopt) => {
+            const skip = adopt * T_MAX;
+            c.shared = skip;
+            if (skip === cut) return job(null, adopt);
+            const pre = sendFills(c, ids.slice(skip, cut), past + skip, opts,
+                                  { onChunk, cancellable, hashes, adopt });
+            st.fills = pre;
+            // Either may come after the stream has failed and moved on.
+            const fail = (e) => { if (st.fills === pre && !st.done) failed(st, e); };
+            pre.sent.then(() => (pre.error ? fail(pre.error)
+                : st.fills === pre && !st.done && job(hashes?.[cut / T_MAX] ?? null)), fail);
+        };
         if (!cut) return job();
-        const pre = sendFills(c, ids.slice(0, cut), past, opts, { onChunk, cancellable });
-        st.fills = pre;
-        // Either may come after the stream has failed and moved on.
-        const fail = (e) => { if (st.fills === pre && !st.done) failed(st, e); };
-        pre.sent.then(() => (pre.error ? fail(pre.error) : st.fills === pre && !st.done && job()), fail);
+        // A continuation turn carries no hashes and cannot adopt, so it takes
+        // the same synchronous path it always did: nothing to await, and an
+        // extra turn of the loop here would reorder it against an answer.
+        if (!worthHashing(past, ids)) return chunks(null, 0);
+        // The stream is registered above, synchronously, so an answer or an
+        // `err` that arrives while the probe is out still finds it.
+        (async () => {
+            const hashes = await promptHashes(ids);
+            const adopt = c.noProbe ? 0 : await probePrefix(c, hashes.slice(0, cut / T_MAX));
+            if (st.done || st.s !== c.session) return;
+            // An adopting prompt carries no hashes: see sendPrompt().
+            chunks(adopt ? null : hashes, adopt);
+        })().catch((e) => { if (!st.done) failed(st, e); });
     }
 
     // The prompt's prefill chunks are no longer awaited.
@@ -1918,7 +2204,8 @@ export function makeRouter({
     }
 
     // Whether a reply is being generated in this conversation.
-    const busy = (c) => (c.session != null && (pending.has(c.session) || fills.has(c.session)))
+    const busy = (c) => (c.session != null && (pending.has(c.session) || fills.has(c.session)
+                                              || probes.has(c.session)))
         || [...streams.values()].some((st) => st.c === c && !st.done);
 
     // Make `c` the active conversation. Nothing is freed or forgotten. The
@@ -1998,6 +2285,16 @@ export function makeRouter({
         // relayed link. `dead`: waits that reached ackCap and were treated as
         // a failure anyway. `backoff`/`window`: the prefill window in force.
         get congestion() { return { extended, dead, backoff, window: window() }; },
+        // What the prefix probes have found. `probes` is how many were
+        // answered, `full` how many found the whole offered prefix, `partial`
+        // how many found some of it, and `headOnly` how many of those partials
+        // were the head holding more than the path's minimum — the number that
+        // says whether an asymmetric hit is worth handling. `silent` is probes
+        // nothing answered at all, which is a mesh older than this tab.
+        get shared() { return { ...shared }; },
+        // Tokens of the last prompt the peers already held, so this tab never
+        // sent them. cli/ui.js prints it next to `cached`.
+        get lastShared() { return conv.shared ?? 0; },
         get eos() { return eos; },
         set eos(v) { eos = v; },
         get hybrid() { return hybrid; },
