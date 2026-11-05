@@ -74,10 +74,10 @@ export class EngineClient {
     // The same options Engine takes, plus `wire`: 'bc' swaps the datachannel
     // for a BroadcastChannel inside the worker (tools/mesh.gpu.test.mjs's
     // --wire bc), in which case no RTC crosses the boundary at all.
-    constructor({ onEvent = () => {}, mtp = false, warm = true, batch = true,
+    constructor({ onEvent = () => {}, mtp = false, warm = true, batch = true, share = true,
                   wire = 'rtc' } = {}) {
         this.#onEvent = onEvent;
-        this.#opts = { mtp, warm, batch, wire };
+        this.#opts = { mtp, warm, batch, share, wire };
     }
 
     // Lazy, and the only place a Worker is constructed.

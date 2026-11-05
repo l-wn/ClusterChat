@@ -130,6 +130,7 @@ export async function boot() {
             if (type === 'repair') say(`repair (${detail.reason}): ${detail.message ?? ''}`);
         },
         batch: q.get('batch') !== '0',
+        share: q.get('share') !== '0',
     });
     wire = { wire: WIRE };
 

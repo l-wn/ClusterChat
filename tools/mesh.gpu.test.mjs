@@ -1403,6 +1403,14 @@ function verdict(rows, reference) {
             `${sum('released')} released, ${sum('evicted')} evicted, ` +
             `${sum('cold')} cold, ${sum('batched')} batched passes ` +
             `(${w.length} workers, ${vram} MiB each, ${pages})`);
+        // What the content index did (web/model/model.js's page index).
+        // `indexed` should be the whole pages each prompt fed, on every peer on
+        // its path: that symmetry is what a later chat with the same prefix
+        // depends on. `dropped` counts pages a rewrite or a claim change
+        // invalidated. Reported, never asserted: both follow the scenario.
+        console.log(`${''.padEnd(12)} pages:   ${sum('indexed')} keyed, ` +
+            `${sum('indexDropped')} dropped, ` +
+            `${w.map((x) => x.runner.indexSize ?? 0).join('/')} held`);
     }
 
     const pressure = rows.flatMap((row) => row.stats.filter((s) => s.runner)

@@ -17,7 +17,8 @@
 import { F32, makeStorage, makeReadback, readF32, gatherEmbedNoPos, rmsnorm, matmulNobias,
          withPass, counters, copyF32, topkRows, topkPairs, roundF16, GEMV_ROWS_MAX } from './kernels.js';
 import { blockSegs, makeSegScratch, makeCache, makeScratch, makeRecurrentState, recurrentStateBytes,
-         makePagePool, makeSessionFrame, ensurePages, freePages, makeReplayLayer,
+         makePagePool, makeSessionFrame, ensurePages, freePages, pageAt,
+         dropIndex, putIndex, makeReplayLayer,
          replayLayerBytes, mtpBlock, mtpChain, makeMtpScratch } from './model.js';
 import { makeGpuProf } from './gpuprof.js';
 import { sampleFromLogitsRow } from './generate.js';
@@ -107,7 +108,8 @@ export class Runner {
     constructor(device, d, w, { lo, hi, have = hi, nMax, tMax, slots = 5,
                                 sessions = slots, pageTokens = PAGE_TOKENS,
                                 idleMs = IDLE_MS, waitMs = WAIT_MS, specSlots = slots,
-                                keepWarmMs = 0, batchRows = GEMV_ROWS_MAX }) {
+                                keepWarmMs = 0, batchRows = GEMV_ROWS_MAX, share = true,
+                                peerId = '' }) {
         const [blockLo, blockHi] = blockRange(lo, hi, d.n_layer);
         const held = blockRange(lo, have, d.n_layer)[1] - blockLo;
         if (held !== w.layers.length) {
@@ -217,7 +219,10 @@ export class Runner {
         // The waiting session whose jobs are back on the queue to be admitted.
         this.turn = null;
         this.counts = { admitted: 0, evicted: 0, cold: 0, released: 0, refused: 0, waited: 0,
-                        nospec: 0, batched: 0, batchedJobs: 0 };
+                        nospec: 0, batched: 0, batchedJobs: 0,
+                        // Pages content-addressed, and entries dropped because
+                        // the page's bytes changed (#indexPages).
+                        indexed: 0, indexDropped: 0 };
 
         // Speculative decoding's replay slots (see #specSlot()): at most
         // `specSlots` sessions speculate through this Runner's linear_attention
@@ -228,6 +233,12 @@ export class Runner {
         this.specLive = new Map();                           // session -> slot
         this.specReadback = null;                            // the head's verify rows
         this.topk = null;                                    // GPU sampling's buffers
+
+        // Content-address the pages a prompt fills, so a later chat with the
+        // same prefix can be handed them (#indexPages). Off with ?share=0.
+        this.share = share;
+        // This peer's id, which goes in a page's key: see #pageKey().
+        this.peerId = peerId;
 
         // Keep-warm (see KEEP_WARM_MS). 0 turns it off.
         this.keepWarmMs = keepWarmMs;
@@ -505,6 +516,8 @@ export class Runner {
             // The next warmup() recreates it at the new size.
             this.#dropWarm();
             this.#specGrow(true);
+            // Every page now has a layer it holds nothing for.
+            this.#indexClear();
             this.blocks++;
             this.blockLo--;
         }
@@ -578,6 +591,8 @@ export class Runner {
             }
             this.#dropWarm();
             this.#specGrow(false);
+            // Every page now has a layer it holds nothing for.
+            this.#indexClear();
             this.blocks++;
         }
         this.hi++;
@@ -1013,6 +1028,11 @@ export class Runner {
         cache.fed = new Map();
         cache.specAt = new Map();
         cache.specLost = false;
+        // Rows this frame's pages hold, as one number for the whole frame.
+        // `fed` is per block and a session can enter an overlapping peer at two
+        // cursors, so it has no single answer; the pages do, because every
+        // block in the pool shares one page table. See #indexPages().
+        cache.hi = 0;
 
         cache.lastUse = performance.now();
         this.live.set(session, cache);
@@ -1117,6 +1137,76 @@ export class Runner {
                 `${session} (${this.pool.nPages} pages of ${this.pool.pageTokens})`);
         }
         throw this.#atCapacity('KV page', session);
+    }
+
+    // What makes two pages the same page, from the job header.
+    //
+    // `hash` fixes the token ids: it is the enqueuer's chain value for the
+    // context up to this chunk's end, checked against the ids by the peer that
+    // ran position 0 (route.js's verifyHash). The cursors fix where every cut
+    // above this peer fell, and `to` fixes this peer's own block range —
+    // together they are what the rows' f16 rounding points depend on
+    // (docs/architecture.md, Wire format: a reply is identical for the same
+    // path). Each cursor carries the peer that ran it, because bit-identity is
+    // guaranteed per kernel, not across GPU vendors, so two holders of one
+    // range need not agree byte for byte.
+    //
+    // `mtp` is in it because #mtpCache() addresses the draft head's rows by
+    // this same page table, so a page filled without it holds nothing there. It
+    // is a hit-rate filter, not a correctness one: row 0's draft reads
+    // `cache.mtpH`, which a reused frame inherits, and a wrong draft costs a
+    // rejected verify rather than a wrong token.
+    #pageKey(h, to) {
+        const mine = `${to}@${this.peerId}`;
+        const mtp = this.mtp && h.mtp ? 'm' : '-';
+        return `${h.hash}:${[...(h.path ?? []), mine].join(',')}:${mtp}`;
+    }
+
+    // Keep the pool's content index honest about what this pass did, and
+    // content-address a page it completed.
+    //
+    // `was` is the frame's high-water mark before this pass. Every page from
+    // where the pass started is dropped from the index, unconditionally: a
+    // rewind, a replay, the job after a rejected verify and a re-sent chunk all
+    // write rows that are already there, and the MTP draft chain writes rows of
+    // its own from a second submit. Dropping a superset of what any of them
+    // could have touched is a few array reads, and it stays right when a new
+    // kernel writes somewhere this method has never heard of.
+    //
+    // A page is indexed only when the pass appended exactly at the mark and
+    // ended on a page boundary, so `hash` names exactly the ids the page holds.
+    // Never from a replay, a verify or a rollback, and never from a range that
+    // crosses no block at all (a head-only or embedding-only hop writes no KV)
+    // or one that crosses a linear_attention block, whose recurrent state lives
+    // on the frame and is not shared.
+    //
+    // The rules are deliberately lopsided: a page not indexed costs a
+    // recompute, a page indexed wrongly costs wrong tokens and no error.
+    #indexPages(plan, was) {
+        const { h, T: n, cache, first, last, to } = plan;
+        const P = this.pool.pageTokens;
+        for (let j = Math.floor(h.past / P); j < cache.owned.length; j++) {
+            if (dropIndex(this.pool, pageAt(cache, j))) this.counts.indexDropped++;
+        }
+        if (!this.share || was !== h.past || first >= last) return;
+        if (h.hash === undefined || h.replay || h.rb || h.drafts != null) return;
+        const end = h.past + n;
+        if (end % P !== 0) return;
+        for (let p = first; p < last; p++) {
+            if (!this.pool.K[p - 1 - this.blockLo]) return;   // linear_attention
+        }
+        const page = pageAt(cache, end / P - 1);
+        if (page === undefined) return;
+        putIndex(this.pool, this.#pageKey(h, to), page);
+        this.counts.indexed++;
+    }
+
+    // Everything the index held. Called where a claim grows: the page gains a
+    // layer it holds nothing for, so no page is what its key says any more.
+    #indexClear() {
+        this.counts.indexDropped += this.pool.index.size;
+        this.pool.index.clear();
+        this.pool.byPage.fill(null);
     }
 
     // The rows handed downstream at `at`, kept for a replay. Rows are stored
@@ -1443,13 +1533,17 @@ export class Runner {
             this.counts.batched++;
             this.counts.batchedJobs += plans.length;
         }
-        for (const { h, T: n, cache, verify } of plans) {
+        for (const plan of plans) {
+            const { h, T: n, cache, verify, first: f, last: l } = plan;
             if (h.s === WARMUP) continue;
-            for (let p = first; p < last; p++) {
+            const was = cache.hi ?? 0;
+            cache.hi = h.past + n;
+            for (let p = f; p < l; p++) {
                 cache.fed.set(p - 1, h.past + n);
                 if (verify) cache.specAt.set(p - 1, { base: h.past, n });
                 else cache.specAt.delete(p - 1);
             }
+            this.#indexPages(plan, was);
         }
 
         // A replay that reached the end returns neither a token nor a hidden

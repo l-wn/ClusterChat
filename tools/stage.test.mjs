@@ -17,6 +17,7 @@
 //   node tools/stage.test.mjs
 
 import { Runner, MAX_QUEUE, MAX_SESSION_QUEUE } from '../web/model/stage.js';
+import { adoptPages, freePages } from '../web/model/model.js';
 import { fromF16 } from '../web/f16.js';
 import { device, D, L, N, SINGLE, BLOCK_TENSORS, marker, weightsFor, pieceFor,
          resetTrace, takeTrace, makeGpu, DH, LAYER_TYPES, hybridWeightsFor } from './stub-gpu.mjs';
@@ -671,6 +672,218 @@ console.log('\nthe page pool: pages are per peer, frames are per session');
         wide.live.get('w').owned.length, 2);
     ok('and the two pages are distinct physical pages',
         new Set(wide.live.get('w').owned).size === 2);
+}
+
+console.log('\ncontent-addressing the pages a prompt fills');
+{
+    // pageTokens 16 against tMax 4: four chunks fill a page, so the hash that
+    // keys a page is the one on the chunk that ends on its boundary. That is
+    // the arithmetic the real cluster never exercises (there a chunk is a page)
+    // and the one most likely to be got wrong.
+    const r = new Runner(device, D, weightsFor(0, 4),
+        { lo: 0, hi: 4, nMax: 32, tMax: 4, slots: 2, sessions: 2, pageTokens: 16,
+          idleMs: 0, peerId: 'p1' });
+    // `hash` is the enqueuer's chain value; route.js checks it against the ids.
+    // Here it is whatever the test says it is.
+    const job = (s, past, n = 4, hash) => r.run(
+        { k: 'job', s, pos: 0, past, n, ids: Array(n).fill(1), opts: {},
+          ...(hash && { hash }) }, null);
+    const feed = async (s, from, to, tag) => {
+        for (let past = from; past < to; past += 4) {
+            await job(s, past, 4, (past + 4) % 16 === 0 ? `${tag}${past + 4}` : undefined);
+        }
+    };
+
+    await feed('a', 0, 12, 'h');
+    eq('a page is not keyed before it is whole', r.pool.index.size, 0);
+    await feed('a', 12, 16, 'h');
+    eq('the chunk that ends on the boundary keys the page', r.pool.index.size, 1);
+    eq('and it is counted', r.counts.indexed, 1);
+    const page0 = r.live.get('a').owned[0];
+    eq('under a key naming the ids, the cut and this peer',
+        [...r.pool.index.keys()], [`h16:4@p1:-`]);
+    eq('pointing at the page the session filled', r.pool.index.get('h16:4@p1:-'), page0);
+    eq('and the reverse map agrees', r.pool.byPage[page0], 'h16:4@p1:-');
+
+    // A rewind: the next job starts inside a page that is already whole, so
+    // whatever the key said is no longer in there.
+    await job('a', 8, 4);
+    eq('a job that rewrites a whole page drops its entry', r.pool.index.size, 0);
+    eq('counted as dropped, not as never indexed', r.counts.indexDropped, 1);
+    eq('and the page is still the session\'s', r.live.get('a').owned[0], page0);
+
+    // Releasing does NOT drop the entry. This is the property the whole design
+    // turns on: an idle chat's pages keep their content, so a rebuild can be
+    // handed them back instead of re-feeding the context.
+    await feed('a', 12, 16, 'g');
+    eq('the page is keyed again', r.pool.index.size, 1);
+    await r.release('a');
+    eq('releasing a session keeps its pages addressable', r.pool.index.size, 1);
+    ok('and the page is back in the pool', r.pool.free.includes(page0));
+    eq('with nobody holding it', r.pool.refs[page0], 0);
+
+    // Taking it for another session does drop it: the bytes are about to go.
+    // One page in the pool, so the second session must have that one.
+    const tight = new Runner(device, D, weightsFor(0, 4),
+        { lo: 0, hi: 4, nMax: 16, tMax: 4, slots: 1, sessions: 2, idleMs: 0, peerId: 'p1' });
+    const tightFeed = async (sess, tag) => {
+        for (let past = 0; past < 16; past += 4) {
+            await tight.run({ k: 'job', s: sess, pos: 0, past, n: 4, ids: [1, 1, 1, 1], opts: {},
+                              ...(past === 12 && { hash: `${tag}16` }) }, null);
+        }
+    };
+    await tightFeed('a', 'g');
+    eq('one session, one page, one entry', tight.pool.index.size, 1);
+    await tight.release('a');
+    eq('still addressable after release', tight.pool.index.size, 1);
+    await tightFeed('b', 'z');
+    eq('but the page handed to another session holds only its entry',
+        [...tight.pool.index.keys()], ['z16:4@p1:-']);
+}
+
+{
+    // The free list is a queue, not a stack. A stack would hand out the page a
+    // chat just released first, which is exactly the hot shared prefix, and the
+    // index would be destroyed as fast as it was filled.
+    // Three pages and three sessions, so the pool is empty before anything is
+    // released: every page that comes back was released, and the order is the
+    // only thing under test.
+    const r = new Runner(device, D, weightsFor(0, 4),
+        { lo: 0, hi: 4, nMax: 16, tMax: 4, slots: 3, sessions: 3, idleMs: 0 });
+    const job = (s) => r.run({ k: 'job', s, pos: 0, past: 0, n: 1, ids: [1], opts: {} }, null);
+    await job('a'); await job('b'); await job('c');
+    eq('the pool is empty', r.pool.free.length, 0);
+    const [pa, pb] = [r.live.get('a').owned[0], r.live.get('b').owned[0]];
+    await r.release('a');
+    await r.release('b');                    // freed after a, so it waits longer
+    await job('d');
+    eq('the page freed longest ago comes back first', r.live.get('d').owned[0], pa);
+    await job('e');
+    eq('then the next oldest', r.live.get('e').owned[0], pb);
+}
+
+{
+    // Refcounts: two frames can hold one page, and it goes back to the pool
+    // once, when the last of them lets go. adoptPages is the primitive the read
+    // side will use; nothing calls it yet, so this is where it is checked.
+    const r = new Runner(device, D, weightsFor(0, 4),
+        { lo: 0, hi: 4, nMax: 16, tMax: 4, slots: 2, sessions: 2, idleMs: 0 });
+    await r.run({ k: 'job', s: 'a', pos: 0, past: 0, n: 1, ids: [1], opts: {} }, null);
+    const frame = r.live.get('a'), page = frame.owned[0];
+    const other = r.free[0];
+    ok('adopting a page another frame holds', adoptPages(device, r.pool, other, [page]));
+    eq('leaves both holding it', r.pool.refs[page], 2);
+    ok('and it is not in the pool', !r.pool.free.includes(page));
+    eq('with the same physical page in both tables', other.owned, [page]);
+
+    freePages(r.pool, other);
+    eq('one letting go is not enough', r.pool.refs[page], 1);
+    ok('so it stays out of the pool', !r.pool.free.includes(page));
+    freePages(r.pool, frame);
+    eq('the last one gives it back', r.pool.refs[page], 0);
+    eq('exactly once', r.pool.free.filter((x) => x === page).length, 1);
+    eq('and the pool is whole again', new Set(r.pool.free).size, r.pool.nPages);
+
+    // A page nobody holds is adopted straight off the free list.
+    const back = r.free[1] ?? r.free[0];
+    back.owned.length = 0;
+    ok('adopting a free page', adoptPages(device, r.pool, back, [page]));
+    ok('takes it out of the pool', !r.pool.free.includes(page));
+    eq('so refs > 0 and "not free" stay the same statement', r.pool.refs[page], 1);
+    ok('a page out of range is refused whole', !adoptPages(device, r.pool, r.free[0] ?? back,
+                                                          [0, r.pool.nPages + 5]));
+}
+
+{
+    // A hop that crosses no block writes no KV at all: a head-only or
+    // embedding-only claim has an empty pool. Its append test passes vacuously,
+    // so without this guard it would key a page holding nothing, and the
+    // symmetry the read side depends on would be false on any mesh whose last
+    // hop is the head.
+    const head = new Runner(device, D, weightsFor(N - 1, N),
+        { lo: N - 1, hi: N, nMax: 16, tMax: 4, slots: 1, idleMs: 0, peerId: 'h' });
+    eq('a head-only claim holds no paged layers', head.pool.K.length, 0);
+    for (let past = 0; past < 16; past += 4) {
+        await head.run({ k: 'job', s: 'a', pos: N - 1, past, n: 4, opts: {},
+                         ...(past === 12 && { hash: 'x16' }) },
+                       new Float32Array(4 * D.hidden));
+    }
+    eq('and keys nothing', [head.pool.index.size, head.counts.indexed], [0, 0]);
+}
+
+{
+    // A linear_attention block's recurrent state lives on the frame and is not
+    // shared, so a page from a range crossing one cannot be handed to another
+    // chat. Refuse to key it here rather than discover it on the read side.
+    const r = new Runner(device, DH, hybridWeightsFor(0, LAYER_TYPES.length + 1),
+        { lo: 0, hi: LAYER_TYPES.length + 1, nMax: 16, tMax: 4, slots: 1,
+          idleMs: 0, peerId: 'p' });
+    ok('this checkpoint has a linear_attention block',
+        LAYER_TYPES.includes('linear_attention'));
+    for (let past = 0; past < 16; past += 4) {
+        await r.run({ k: 'job', s: 'a', pos: 0, past, n: 4, ids: [1, 1, 1, 1], opts: {},
+                      ...(past === 12 && { hash: 'h16' }) }, null);
+    }
+    eq('so no page of it is keyed', [r.pool.index.size, r.counts.indexed], [0, 0]);
+}
+
+{
+    // Growth splices a new, zero-filled layer buffer into the pool, so every
+    // existing page now holds nothing for it. No per-page record can say
+    // "valid for 15 of 16 layers", so the index goes.
+    const r = new Runner(device, D, weightsFor(2, 5),
+        { lo: 2, hi: 5, have: 5, nMax: 16, tMax: 4, slots: 1, idleMs: 0, peerId: 'p' });
+    for (let past = 0; past < 16; past += 4) {
+        await r.run({ k: 'job', s: 'a', pos: 2, past, n: 4,
+                      ...(past === 12 && { hash: 'h16', path: ['2@up'] }) },
+                    new Float32Array(4 * D.hidden));
+    }
+    eq('a page is keyed', r.pool.index.size, 1);
+    eq('its key carries the cuts above it', [...r.pool.index.keys()], ['h16:2@up,5@p:-']);
+    r.prepend(pieceFor(1), r.growLeft());
+    eq('growing left clears the index', r.pool.index.size, 0);
+    ok('and the reverse map with it', r.pool.byPage.every((k) => k === null));
+
+    for (let past = 16; past < 32; past += 4) {
+        await r.run({ k: 'job', s: 'b', pos: 1, past: past - 16, n: 4,
+                      ...(past === 28 && { hash: 'g16' }) },
+                    new Float32Array(4 * D.hidden));
+    }
+    const was = r.pool.index.size;
+    r.growRight();
+    eq('and so does growing right', [was > 0, r.pool.index.size], [true, 0]);
+}
+
+{
+    // The index is bounded by the pool: a page holds one content, so only one
+    // key can name it. No cap to tune, and no GPU memory at stake.
+    const r = new Runner(device, D, weightsFor(0, 4),
+        { lo: 0, hi: 4, nMax: 16, tMax: 4, slots: 2, sessions: 2, idleMs: 0, peerId: 'p' });
+    const vram = r.vramBytes;
+    for (let i = 0; i < 12; i++) {
+        const s = `s${i}`;
+        for (let past = 0; past < 16; past += 4) {
+            await r.run({ k: 'job', s, pos: 0, past, n: 4, ids: [1, 1, 1, 1], opts: {},
+                          ...(past === 12 && { hash: `h${i}` }) }, null);
+        }
+    }
+    ok('many prompts never take the index past the pool',
+        r.pool.index.size <= r.pool.nPages, `${r.pool.index.size} of ${r.pool.nPages}`);
+    eq('every entry agrees with the reverse map', r.pool.index.size,
+        r.pool.byPage.filter((k) => k !== null).length);
+    eq('and the index costs no GPU memory', r.vramBytes, vram);
+}
+
+{
+    // ?share=0 turns it off: nothing is keyed, so no chat can ever be handed
+    // another's KV on this peer.
+    const r = new Runner(device, D, weightsFor(0, 4),
+        { lo: 0, hi: 4, nMax: 16, tMax: 4, slots: 1, idleMs: 0, share: false, peerId: 'p' });
+    for (let past = 0; past < 16; past += 4) {
+        await r.run({ k: 'job', s: 'a', pos: 0, past, n: 4, ids: [1, 1, 1, 1], opts: {},
+                      ...(past === 12 && { hash: 'h16' }) }, null);
+    }
+    eq('share: false keys nothing', [r.pool.index.size, r.counts.indexed], [0, 0]);
 }
 
 console.log('\na peer at capacity refuses instead of robbing a live chat');

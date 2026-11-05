@@ -119,6 +119,42 @@ different split all write the same bytes.
 contiguous cache (`makeCache()`, used by the single-tab page and the dev tools)
 is the one-page case: `page = N_max`, `pages = [0]`.
 
+### Shared prefixes
+
+Because a row's bits depend only on that row's input, a page's bytes are a pure
+function of the tokens that produced it. So the pool keeps a content index,
+`key -> page`, and a page a chat filled can be handed to a later chat with the
+same prefix instead of being computed again. Four opencode sessions in
+different directories share 95.7% of their first prompt, 112 whole pages of it.
+
+A page's key names three things, all of which its bytes depend on
+(`Runner.#pageKey`): the enqueuer's hash chain over the token ids up to that
+page's end; where every cut above this peer fell and which peer ran it, since a
+reply is only identical for the same path and bit-identity is guaranteed per
+kernel rather than across GPU vendors; and whether the MTP draft head filled
+its rows, because `#mtpCache` addresses them by this same page table.
+
+The enqueuer sends one hash per prefill chunk, each over the context up to that
+chunk's end — not one per page, because a peer's page size is its own and the
+enqueuer knows none of them. A peer keys a page whose boundary is a chunk end,
+which is every page when `PAGE_TOKENS` and `T_MAX` are both 64. Only a prompt
+that starts a context carries hashes: a turn continuing a chat begins at an
+arbitrary position, so its chunks straddle page boundaries. The peer running
+position 0 is the only one with the ids, and it checks the hash against them
+before anything is keyed — the enqueuer is not trusted, and a hash naming other
+ids would have a later chat read KV for text it never sent.
+
+Two counters hold the pool's own bookkeeping together. `refs` is how many
+frames hold a page, and `free` lists the pages at zero, so a page a session
+released keeps its content until something else needs it — which is how a chat
+evicted for being idle gets its own pages back on a rebuild. `free` is a queue
+rather than a stack for the same reason: a stack would hand out the page a chat
+just let go of first, which is exactly the hot shared prefix. `byPage` is the
+index the other way round, so every site that changes a page's bytes drops its
+entry and the index holds only entries that are true. It holds no reference to
+a page, so it costs host RAM only and can never compete with a live chat for
+one. `?share=0` turns the whole thing off.
+
 ## Gated DeltaNet block (Qwen3.8-27B linear attention)
 
 No KV cache: each session carries a fixed-size recurrent state per layer,

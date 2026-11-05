@@ -98,15 +98,21 @@ export class Engine {
     #good = null;            // [lo, hi): the holding the last whole pass ran on
     #ceiling = Infinity;     // the most positions this GPU ran in one pass before a loss
     #losses = 0;             // GPU losses so far
+    #share = true;           // content-address pages (see the constructor)
 
     // `mtp`: a runner holding the head also loads the MTP draft head, when
     // the checkpoint has one (on unless the page has ?mtp=0).
     // `batch`: the runner batches jobs (stage.js #batchWith; off with ?batch=0).
-    constructor({ onEvent = () => {}, mtp = false, warm = true, batch = true } = {}) {
+    // `share`: the runner content-addresses the pages a prompt fills, so a
+    // later chat with the same prefix can be handed them (stage.js
+    // #indexPages; off with ?share=0).
+    constructor({ onEvent = () => {}, mtp = false, warm = true, batch = true,
+                  share = true } = {}) {
         this.#onEvent = onEvent;
         this.#mtpWanted = mtp;
         this.#keepWarm = warm;
         this.#batch = batch;
+        this.#share = share;
     }
 
     // Test-only: build an Engine around an existing net/router/runner,
@@ -399,6 +405,7 @@ export class Engine {
         const runner = new Runner(device, d, { layers: [] },
             { lo, hi, have: lo, nMax: ctx, tMax: T_MAX, slots, sessions,
               keepWarmMs: this.#keepWarm ? KEEP_WARM_MS : 0,
+              share: this.#share, peerId: net.id,
               ...(this.#batch ? {} : { batchRows: 1 }),
               ...(pageTokens ? { pageTokens } : {}),
               ...(waitMs !== undefined ? { waitMs } : {}) });
@@ -1039,6 +1046,12 @@ export class Engine {
     get ctxLen() { return this.#router?.ctxLen ?? 0; }
     // The context window of this mesh's chats, in tokens.
     get ctxMax() { return this.#ctx ?? this.#runner?.nMax ?? runnerCtx(null, this.#net?.ctx, this.#manifest?.n_pos); }
+    // The checkpoint has linear_attention blocks, whose recurrent state a
+    // rewind cannot trim (route.js's rewind(), which marks the chat stale
+    // instead). A caller that would rewind to reuse a context must check this
+    // first: on a hybrid checkpoint the next turn rebuilds the whole chat, so
+    // a rewind costs more than the miss it avoids.
+    get hybrid() { return !!this.#router?.hybrid; }
     get conversation() { return this.#router?.conversation ?? null; }
     get meshTag() { return this.#router?.mesh ?? null; }
     // A copy of the active chat's token ids: what the peers were fed, and what

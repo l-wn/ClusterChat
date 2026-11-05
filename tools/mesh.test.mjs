@@ -107,7 +107,9 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null
         // `waitMs: 0`: no job waits for a frame. With `idleMs` 0 a frame can
         // always be taken, and the fuzz expects refusals to be immediate.
         // Waiting is tested in tools/stage.test.mjs.
-        { lo, hi, have, nMax: 4 * T_MAX, tMax: T_MAX, slots, idleMs, waitMs: 0,
+        // `peerId`: a page's content key names the peer that ran the cut, so
+        // two holders of one range never collide (stage.js's #pageKey).
+        { lo, hi, have, nMax: 4 * T_MAX, tMax: T_MAX, slots, idleMs, waitMs: 0, peerId: id,
           ...(specSlots != null && { specSlots }), ...(sessions != null && { sessions }) });
 
     // `${session}|${tag}` -> the prefix fold, one entry per token position.
@@ -461,7 +463,8 @@ class World {
                          opts: sent.opts, loop: !!sent.loop, fed: sent.fed, auto: !!sent.auto,
                          drafts: sent.drafts, rowOpts: sent.rowOpts, tokens: sent.tokens,
                          nospec: !!sent.nospec,
-                         rb: !!sent.rb, fill: !!sent.fill });
+                         rb: !!sent.rb, fill: !!sent.fill,
+                         hash: sent.hash, path: sent.path });
         const slow = this.slowLinks.get(`${from}>${to}`);
         const later = (fn) => {
             if (!slow) return queueMicrotask(fn);
@@ -646,6 +649,112 @@ function chain(cuts, opts = {}, world = {}) {
 }
 
 // ---
+
+console.log('\ncontent-addressing: every peer on a path keys the pages it filled');
+{
+    // Here a page is T_MAX tokens, as on a real cluster, so a prompt of two
+    // whole chunks is two whole pages.
+    const PAGES = 2;
+    const long = Array.from({ length: PAGES * T_MAX }, (_, i) => (i * 7) % 90 + 1);
+    const { w, asker } = chain([0, Math.floor(N / 2), N]);
+
+    await generate(asker, long, 1, { whole: true });
+    const runners = [0, 1].map((id) => w.tabs.get(id).runner.real);
+    eq('both peers on the path keyed the same number of pages',
+        runners.map((r) => r.counts.indexed), [PAGES, PAGES]);
+    eq('which is the pages the prompt filled whole',
+        runners.map((r) => r.pool.index.size), [PAGES, PAGES]);
+    eq('with nothing silently continued', w.violations, []);
+
+    // The keys name the cuts the job went through and who ran them, so the two
+    // peers never key a page the same way.
+    const keys = runners.map((r) => [...r.pool.index.keys()].sort());
+    ok('the entry peer keys from its own cut alone',
+        keys[0].every((k) => k.split(':')[1].split(',').length === 1), keys[0].join(' '));
+    ok('and the second peer from both cuts',
+        keys[1].every((k) => k.split(':')[1].split(',').length === 2), keys[1].join(' '));
+    eq('so no key is shared between peers',
+        keys[0].filter((k) => keys[1].includes(k)).length, 0);
+
+    // A second chat with the same prefix on the same path is the point: the
+    // same text through the same cuts must produce the same keys.
+    asker.router.newChat();
+    await generate(asker, long, 1, { whole: true });
+    eq('the same prompt on the same path keys the same pages',
+        runners.map((r) => [...r.pool.index.keys()].sort()), keys);
+    eq('so the index did not grow', runners.map((r) => r.pool.index.size), [PAGES, PAGES]);
+    eq('though every page was filled again', runners.map((r) => r.counts.indexed),
+        [PAGES * 2, PAGES * 2]);
+
+    // Different text, same path: different keys.
+    const other = long.map((x, i) => (i === 0 ? x + 1 : x));
+    asker.router.newChat();
+    await generate(asker, other, 1, { whole: true });
+    ok('a different prompt keys different pages',
+        runners.every((r) => r.pool.index.size > PAGES),
+        runners.map((r) => r.pool.index.size).join(' '));
+}
+
+{
+    // What a job carries, and what it does not. A decode job pays no bytes for
+    // a path it will never be keyed by.
+    const { w, asker } = chain([0, N]);
+    const long = Array.from({ length: 2 * T_MAX }, (_, i) => (i % 80) + 1);
+    await generate(asker, long, 2, { whole: true });
+
+    const jobs = w.wire.filter((m) => m.k === 'job' && m.s === asker.router.session);
+    const prompt = jobs.filter((m) => m.past < long.length);
+    ok('every chunk of the prompt carries a content hash',
+        prompt.length > 0 && prompt.every((m) => typeof m.hash === 'string'),
+        prompt.map((m) => m.hash).join(' '));
+    eq('each one different, since each covers more of the context',
+        new Set(prompt.map((m) => m.hash)).size, prompt.length);
+    const decode = jobs.filter((m) => m.past >= long.length);
+    ok('a decode job carries neither hash nor path',
+        decode.length > 0 && decode.every((m) => m.hash === undefined && m.path === undefined),
+        `${decode.length} decode jobs`);
+}
+
+{
+    // A turn that continues a chat starts at an arbitrary position, so its
+    // chunks straddle page boundaries and its pages could never match another
+    // chat's. It carries no hash at all.
+    const { w, asker } = chain([0, N]);
+    const r = w.tabs.get(0).runner.real;
+    await generate(asker, PROMPT, 1);
+    const indexed = r.counts.indexed;
+    w.wire.length = 0;
+    await generate(asker, PROMPT, 1);          // a second turn of the same chat
+    const jobs = w.wire.filter((m) => m.k === 'job');
+    ok('no job of a continuing turn carries a hash',
+        jobs.length > 0 && jobs.every((m) => m.hash === undefined),
+        jobs.filter((m) => m.hash).length + ' did');
+    eq('so nothing more is keyed', r.counts.indexed, indexed);
+}
+
+{
+    // The enqueuer is not trusted: anyone can run a client. A hash that named
+    // other ids would have a later chat read KV for text it never sent, which
+    // is wrong tokens and no error, so the peer at position 0 — the only one
+    // with the ids — checks it and strips it when it does not match.
+    const { w, asker } = chain([0, N]);
+    const r = w.tabs.get(0).runner.real;
+    const long = Array.from({ length: T_MAX }, (_, i) => (i % 70) + 1);
+
+    await generate(asker, long, 1, { whole: true });
+    eq('an honest prompt is keyed', r.counts.indexed, 1);
+
+    // The same ids under a hash that describes nothing. Handed straight to the
+    // holder of position 0, as a client's job arrives.
+    const before = r.counts.indexed;
+    w.tabs.get(0).router.route(
+        { k: 'job', s: 'liar', key: 'k', from: 100, pos: 0, past: 0,
+          n: long.length, ids: long, opts: { temp: 0, topK: 0 },
+          hash: 'deadbeefdeadbeefdeadbeefdeadbeef' }, null, null, 100);
+    await w.sync();
+    eq('a hash that does not match the ids keys nothing', r.counts.indexed, before);
+    eq('and nothing was silently continued', w.violations, []);
+}
 
 console.log('\none peer holding everything: the reference');
 

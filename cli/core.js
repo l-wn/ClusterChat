@@ -19,7 +19,11 @@
 //
 // Agents send the whole conversation every time. The cluster keeps the last
 // few chats it ran, and a request that continues one feeds only its new
-// messages, so the mesh does not prefill the conversation again.
+// messages, so the mesh does not prefill the conversation again. A request
+// that is a *prefix* of a kept chat continues it too, by rewinding the chat to
+// where that reply began: an agent that gave up on a slow reply and started a
+// new session re-sends its first turn verbatim, and that turn is already
+// cached on the GPUs.
 
 import { runTurn } from '../web/turn.js';
 import { stopRe } from '../web/prompt.js';
@@ -36,13 +40,31 @@ export class ApiError extends Error {
 const SEAT_RETRY_MS = 2000;
 const SEAT_WAIT_MS = 60000;
 
+// Tokens a rewind must save, over the best position that needs no rewind,
+// before it is worth taking. A rewind gives back the end of the chat it
+// rewinds: the messages past that point stop being continuable, so an agent
+// that comes back with them pays a full prefill. Worth it for the thousands of
+// tokens a restarted session re-sends, not for a few hundred.
+const REWIND_MIN = 512;
+
 // `engine` has joined (join.js). `template` is the model's chat format
 // (templates/). `info` is printed and served as is. `count` is the tokenizer's
-// encode(), replaced in tests.
-export function makeCluster({ engine, template, info, sampling = {}, count: tokens = encode }) {
+// encode(), replaced in tests. `onPrepare` sees what each request decided to
+// feed, before it is fed: bin.js uses it to dump prompts for
+// tools/prefix-overlap.mjs, which measures how much two agents' prompts
+// actually share. Nothing in here depends on it.
+export function makeCluster({ engine, template, info, sampling = {}, count: tokens = encode,
+                              onPrepare = null }) {
     const net = engine.net;
-    const recent = [];          // { conv, key, msgs }, most recent first
+    // { conv, key, msgs, len, marks }, most recent first. `len` is the chat's
+    // context length now; `marks` is where it can be continued from (below).
+    const recent = [];
     let queue = Promise.resolve();
+    // The assistant-turn opener's length in tokens, measured once. A template
+    // that does not export one records no 'prompt' marks, so such a cluster
+    // keeps exactly the reuse it had before.
+    let openLen = null;
+    const openTokens = async () => (openLen ??= (await tokens(template.open)).length);
 
     const check = (req) => {
         if (!Array.isArray(req.messages) || !req.messages.some((m) => m.role === 'user')) {
@@ -70,7 +92,7 @@ export function makeCluster({ engine, template, info, sampling = {}, count: toke
             }
             const plan = await prepare(req);
             await seat(req.signal);
-            try { yield { type: 'start', tokens: plan.fresh, cached: plan.hit?.len ?? 0 }; yield* turn(req, plan); } finally { net.unseat(); }
+            try { yield { type: 'start', tokens: plan.fresh, cached: plan.cached }; yield* turn(req, plan); } finally { net.unseat(); }
         } finally {
             release();
         }
@@ -87,6 +109,58 @@ export function makeCluster({ engine, template, info, sampling = {}, count: toke
         }
     }
 
+    // --- Where a chat's context can be continued from ---
+    //
+    // Every render() ends on the assistant-turn opener (`template.open`), and
+    // render(..., { first: false }) begins by closing that turn. So only two
+    // positions per turn have the shape a continuation expects, and a mark
+    // records which of the two it is:
+    //
+    //   'prompt'  the prompt was fed up to but not including the opener, so
+    //             the context ends on message `i`'s own end-of-turn. Only a
+    //             request that stops at `i` can continue here, by feeding the
+    //             opener alone and generating the reply again: anything after
+    //             it would leave an empty assistant turn in the context. This
+    //             is where a restarted agent's re-sent first turn lands.
+    //   'reply'   the reply at index `i` is in the context with its turn left
+    //             unclosed, which is what render({ first: false }) assumes.
+    //             Any request repeating messages 0..i continues here. The last
+    //             one of these is the chat's current end, and reaching it needs
+    //             no rewind: that is the reuse this file has always done.
+    //
+    // `i` indexes the whole conversation, not the request, because an agent
+    // resends every message every time and `entry.msgs` is built from that.
+
+    // The chat and position a request continues from, or undefined. The
+    // deepest position over every kept chat wins, since that is the most
+    // tokens reused.
+    //
+    // A position that needs a rewind must save REWIND_MIN tokens over the best
+    // that does not. On a hybrid checkpoint one is never taken at all: a rewind
+    // there marks the chat stale (route.js's rewind()) because a linear
+    // attention layer cannot give back the tokens it folded in, so the next
+    // turn rebuilds the whole conversation — more than the miss it avoids.
+    function bestHit(key, msgs) {
+        const cands = [];
+        for (const entry of recent) {
+            if (entry.key !== key) continue;
+            // How many of this chat's messages the request repeats.
+            let k = 0;
+            while (k < entry.msgs.length && k < msgs.length && entry.msgs[k] === msgs[k]) k++;
+            for (const mark of entry.marks) {
+                if (mark.i >= k) continue;
+                if (mark.kind === 'prompt' && mark.i !== msgs.length - 1) continue;
+                const back = entry.len - mark.len;
+                if (back > 0 && engine.hybrid) continue;
+                cands.push({ entry, mark, back });
+            }
+        }
+        const free = cands.filter((c) => !c.back).sort((a, b) => b.mark.len - a.mark.len)[0];
+        const deep = cands.sort((a, b) => b.mark.len - a.mark.len)[0];
+        if (!deep || !deep.back) return deep;
+        return deep.mark.len - (free?.mark.len ?? 0) >= REWIND_MIN ? deep : free;
+    }
+
     // Which chat a request runs in and what it feeds, checked against the
     // context before anything changes.
     async function prepare(req) {
@@ -94,31 +168,55 @@ export function makeCluster({ engine, template, info, sampling = {}, count: toke
         const key = JSON.stringify([req.system ?? null, tools]);
         const msgs = req.messages.map(norm);
 
-        // The longest chat this request continues: same system and tools, and
-        // its messages are where this request's start.
-        const hit = recent.filter((e) => e.key === key && e.msgs.length < msgs.length
-                && e.msgs.every((m, i) => m === msgs[i]))
-            .sort((a, b) => b.msgs.length - a.msgs.length)[0];
-        const prompt = hit
-            ? template.render(req.messages.slice(hit.msgs.length), { first: false })
-            : template.render(req.messages, { tools, system: req.system, first: true });
+        const hit = bestHit(key, msgs);
+        const prompt = !hit
+            ? template.render(req.messages, { tools, system: req.system, first: true })
+            : hit.mark.kind === 'prompt' ? template.open
+            : template.render(req.messages.slice(hit.mark.i + 1), { first: false });
         const fresh = (await tokens(prompt)).length;
-        const total = (hit?.len ?? 0) + fresh;
+        const cached = hit?.mark.len ?? 0;
+        const total = cached + fresh;
         if (total >= engine.ctxMax) {
             throw Object.assign(new ApiError('context', `the conversation needs ${total} tokens and `
                 + `this cluster's context holds ${engine.ctxMax}. Shorten it, or use a cluster `
                 + 'created with a longer context.'), { tokens: total, max: engine.ctxMax });
         }
-        return { tools, key, msgs, hit, prompt, fresh };
+        onPrepare?.({ prompt, fresh, cached, reused: hit?.mark.kind ?? null });
+        return { tools, key, msgs, hit, prompt, fresh, cached };
     }
 
     async function* turn(req, { tools, key, msgs, hit, prompt }) {
         let entry;
         if (hit) {
-            entry = hit;
-            engine.switchTo(hit.conv);
+            entry = hit.entry;
+            engine.switchTo(entry.conv);
+            // Rewinding to a mark drops the context past it, so everything the
+            // entry recorded past it stops being true and is truncated here,
+            // before anything can throw: otherwise a later request would
+            // continue from tokens that have been overwritten. The peers need
+            // no telling. A full-attention layer's KV is addressed by position,
+            // so the next job's shorter `past` overwrites the rows above it.
+            //
+            // The rewind lands by subtracting from `entry.len`, this chat's
+            // context length as of its last turn. If the router disagrees, it
+            // would land somewhere else and the prompt prepare() rendered would
+            // be fed at the wrong position, which produces wrong tokens and no
+            // error. Refuse and drop the chat instead: the agent's retry gets a
+            // fresh one and pays a prefill, which is the cost of being sure.
+            if (hit.back > 0) {
+                if (engine.ctxLen !== entry.len) {
+                    forget(entry);
+                    engine.discard(entry.conv);
+                    throw new ApiError('unready', 'this chat changed underneath the request; '
+                        + 'try again and it will be sent in full');
+                }
+                engine.rewind(hit.back);
+                entry.msgs = entry.msgs.slice(0, hit.mark.i + 1);
+                entry.marks = entry.marks.filter((m) => m.len <= hit.mark.len);
+                entry.len = hit.mark.len;
+            }
         } else {
-            entry = { conv: engine.newChat(), key, msgs: [], len: 0 };
+            entry = { conv: engine.newChat(), key, msgs: [], len: 0, marks: [] };
         }
         forget(entry);
         recent.unshift(entry);
@@ -170,6 +268,18 @@ export function makeCluster({ engine, template, info, sampling = {}, count: toke
 
         const reply = { role: 'assistant', text: shown, calls: ids };
         entry.msgs = [...msgs, norm(reply)];
+        // Where the next request may continue this chat (see the marks above).
+        // The 'prompt' mark is `cached` plus the prompt's own tokens, less the
+        // opener's, rather than engine.ctxLen - engine.lastFed: runTurn()
+        // rewinds a stop sequence *after* the engine has counted what it fed,
+        // so the subtraction would be short by the cut. It is exact because
+        // the opener starts on a special token, which the tokenizer never
+        // merges across — the same property render({ first: false }) relies on.
+        if (template.open) {
+            mark(entry, 'prompt', msgs.length - 1,
+                 cached + result.promptTokens - (await openTokens()));
+        }
+        mark(entry, 'reply', msgs.length, engine.ctxLen);
         entry.len = engine.ctxLen;
 
         const stopped = engine.lastStopReason;
@@ -182,6 +292,16 @@ export function makeCluster({ engine, template, info, sampling = {}, count: toke
     const forget = (entry) => {
         const i = recent.indexOf(entry);
         if (i >= 0) recent.splice(i, 1);
+    };
+
+    // Record where this chat can be continued from. Marks are added in
+    // ascending `len` order, and a turn regenerated after a rewind to its own
+    // 'prompt' mark re-records that same (kind, i) rather than adding a
+    // duplicate, so the list stays ascending and one entry long per position.
+    const mark = (entry, kind, i, len) => {
+        const at = entry.marks.findIndex((m) => m.kind === kind && m.i === i);
+        if (at >= 0) entry.marks[at].len = len;
+        else entry.marks.push({ kind, i, len });
     };
 
     // The prompt tokens a request would take on a new chat.

@@ -18,7 +18,10 @@ export const tools = true;
 
 const TOOL_INTRO = '# Tools\n\nYou have access to the following functions:\n\n<tools>';
 const TOOL_RULES = '\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>';
-const REPLY = '<|im_start|>assistant\n<think>\n\n</think>\n\n';
+// The assistant-turn opener every render() ends on. A context that stops here
+// is ready to generate, so cli/core.js feeds just this to regenerate a reply
+// it already has the prompt for.
+export const open = '<|im_start|>assistant\n<think>\n\n</think>\n\n';
 
 // The prompt text for `msgs`, ending on an open assistant turn.
 //
@@ -39,7 +42,7 @@ export function render(msgs, { tools = [], system = null, first = true } = {}) {
             if (msgs[i + 1]?.role !== 'tool') out += '<|im_end|>\n';
         } else throw new Error(`unexpected message role "${m.role}"`);
     });
-    return out + REPLY;
+    return out + open;
 }
 
 function systemTurn(system, tools) {

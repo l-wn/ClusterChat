@@ -1,6 +1,7 @@
 // Tests the clusterchat client in cli/ without a mesh: the Qwen template
 // against the checkpoint's own Jinja output, the reply parser, history reuse
-// against a fake engine, and every protocol over HTTP against a fake cluster.
+// against a fake engine (including the rewinds that reuse a chat a request is
+// only a prefix of), and every protocol over HTTP against a fake cluster.
 //
 //   node tools/cli.test.mjs
 //
@@ -73,15 +74,15 @@ console.log('\nreading a reply as it grows');
 }
 
 // A fake engine: one token per character, replies from a script.
-function fakeEngine(replies, { ctxMax = 100000, sessions = 2 } = {}) {
+function fakeEngine(replies, { ctxMax = 100000, sessions = 2, hybrid = false } = {}) {
     let active = null;
-    const fed = [], discarded = [];
+    const fed = [], discarded = [], chats = [];
     const engine = {
         net: { connected: true, peers: [{ lo: 0, hi: 4, ready: true }], sessions,
                seats: 0, seat: async () => { engine.net.seats++; return { ok: true }; }, unseat() { engine.net.seats--; } },
-        ctxMax, lastStopReason: 'eos', lastPromptTokens: 0, lastFed: 0,
+        ctxMax, hybrid, lastStopReason: 'eos', lastPromptTokens: 0, lastFed: 0,
         get ctxLen() { return active?.len ?? 0; },
-        newChat() { active = { len: 0 }; return active; },
+        newChat() { active = { len: 0 }; chats.push(active); return active; },
         switchTo(c) { active = c; },
         discard(c) { discarded.push(c); },
         stop() { engine.lastStopReason = 'stopped'; },
@@ -100,7 +101,7 @@ function fakeEngine(replies, { ctxMax = 100000, sessions = 2 } = {}) {
             }
         },
     };
-    return { engine, fed, discarded };
+    return { engine, fed, discarded, chats };
 }
 
 const run = async (cluster, req) => {
@@ -151,6 +152,125 @@ console.log('\nhistory reuse');
     await run(cluster, { system: 'Third.', tools: [], messages: [u1] });
     eq('a third chat evicts the oldest', discarded.length, 1);
     eq('every seat was given back', engine.net.seats, 0);
+}
+
+console.log('\nreusing a chat a request is only a prefix of');
+{
+    // An agent that gave up on a slow reply and opened a new session sends its
+    // first turn again, verbatim. The GPUs still hold it.
+    const { engine, fed } = fakeEngine(['First.', 'Second.', 'Third.', 'Fourth.']);
+    const cluster = makeCluster({ engine, template: qwen, info: { model: 'm' }, count });
+    const sys = 'You code.';
+    const u1 = { role: 'user', text: 'fix the bug in math.js' };
+    const req = { system: sys, tools: [READ], messages: [u1] };
+
+    const a = await run(cluster, req);
+    const whole = fed[0].length;
+    ok('the first request feeds the whole render', whole > 1000, `${whole} tokens`);
+    eq('nothing cached yet', a.at(-1).usage.cached, 0);
+
+    const b = await run(cluster, req);
+    eq('the same request again feeds only the assistant-turn opener', fed[1], qwen.open);
+    eq('and reports everything before it as cached', b.at(-1).usage.cached,
+       whole - qwen.open.length);
+    eq('the reply is generated again', textOf(b), 'Second.');
+
+    const c = await run(cluster, req);
+    eq('and again, from the same position', fed[2], qwen.open);
+    eq('with the same amount cached', c.at(-1).usage.cached, whole - qwen.open.length);
+}
+
+{
+    // Diverging mid-conversation: rewind to the end of the last reply the
+    // request still agrees with, and feed only what follows it.
+    const { engine, fed } = fakeEngine(['First.', 'Second.', 'Third.']);
+    const cluster = makeCluster({ engine, template: qwen, info: { model: 'm' }, count });
+    const sys = 'You code.';
+    const u1 = { role: 'user', text: 'one' };
+    const a1 = { role: 'assistant', text: 'First.' };
+
+    await run(cluster, { system: sys, tools: [READ], messages: [u1] });
+    const afterFirst = engine.ctxLen;
+    await run(cluster, { system: sys, tools: [READ],
+                         messages: [u1, a1, { role: 'user', text: 'two' }] });
+    const c = await run(cluster, { system: sys, tools: [READ],
+                                   messages: [u1, a1, { role: 'user', text: 'two again' }] });
+    eq('a request diverging mid-chat feeds only the messages after the divergence', fed[2],
+       '<|im_end|>\n<|im_start|>user\ntwo again<|im_end|>\n' + qwen.open);
+    eq('and keeps the turns before it cached', c.at(-1).usage.cached, afterFirst);
+}
+
+{
+    // A rewind gives back the end of the chat, so a request carrying what it
+    // discarded must not be answered from tokens that were overwritten.
+    const { engine, fed } = fakeEngine(['First.', 'Second.', 'Third.']);
+    const cluster = makeCluster({ engine, template: qwen, info: { model: 'm' }, count });
+    const sys = 'You code.';
+    const u1 = { role: 'user', text: 'one' };
+    const req = { system: sys, tools: [READ], messages: [u1] };
+
+    await run(cluster, req);
+    await run(cluster, req);              // rewinds and regenerates: 'First.' is gone
+    await run(cluster, { system: sys, tools: [READ],
+                         messages: [u1, { role: 'assistant', text: 'First.' },
+                                    { role: 'user', text: 'two' }] });
+    ok('a request carrying the discarded reply is a miss, not a hit on overwritten tokens',
+       fed[2].startsWith('<|im_start|>system\n# Tools'), fed[2].slice(0, 40));
+}
+
+{
+    // A rewind costs the chat's tail, so a small saving is not worth one.
+    const { engine, fed } = fakeEngine(['ok', 'ok again']);
+    const cluster = makeCluster({ engine, template: chatml, info: { model: 'm' }, count });
+    const req = { system: 'Be brief.', messages: [{ role: 'user', text: 'hi' }] };
+
+    const a = await run(cluster, req);
+    ok('this chat is shorter than the rewind threshold', engine.ctxLen < 512, `${engine.ctxLen}`);
+    const b = await run(cluster, req);
+    ok('a saving under REWIND_MIN feeds the whole render instead',
+       fed[1].startsWith('<|im_start|>system\nBe brief.'), fed[1].slice(0, 40));
+    eq('and reports nothing cached', b.at(-1).usage.cached, 0);
+    ok('the first request was not affected', a.at(-1).usage.cached === 0);
+}
+
+{
+    // A rewind lands by subtracting from the length the entry recorded. If the
+    // chat moved underneath the request, feeding there would be silently wrong,
+    // so the request is refused and the chat dropped.
+    const { engine, discarded, chats } = fakeEngine(['First.', 'Second.']);
+    const cluster = makeCluster({ engine, template: qwen, info: { model: 'm' }, count });
+    const req = { system: 'You code.', tools: [READ], messages: [{ role: 'user', text: 'one' }] };
+
+    await run(cluster, req);
+    chats[0].len -= 7;                  // something else moved this chat's context
+    await rejects('a chat that moved underneath a rewind is refused, not fed at the wrong position',
+                  run(cluster, req), (err) => err.kind === 'unready');
+    eq('and the chat is dropped so the retry starts clean', discarded.length, 1);
+}
+
+{
+    // On a hybrid checkpoint a rewind marks the chat stale (route.js), so the
+    // next turn would rebuild all of it. Never rewind there; the reuse that
+    // needs no rewind is unaffected.
+    const { engine, fed } = fakeEngine(['First.', 'Second.', 'Third.'], { hybrid: true });
+    const cluster = makeCluster({ engine, template: qwen, info: { model: 'm' }, count });
+    const sys = 'You code.';
+    const u1 = { role: 'user', text: 'one' };
+    const a1 = { role: 'assistant', text: 'First.' };
+    const req = { system: sys, tools: [READ], messages: [u1] };
+
+    await run(cluster, req);
+    const b = await run(cluster, req);
+    ok('on a hybrid checkpoint the same request feeds the whole render again',
+       fed[1].startsWith('<|im_start|>system\n# Tools'), fed[1].slice(0, 40));
+    eq('and nothing is reported cached', b.at(-1).usage.cached, 0);
+
+    const c = await run(cluster, { system: sys, tools: [READ],
+                                   messages: [u1, a1, { role: 'user', text: 'two' }] });
+    eq('but a continuation, which needs no rewind, still feeds only its new turn', fed[2],
+       '<|im_end|>\n<|im_start|>user\ntwo<|im_end|>\n' + qwen.open);
+    ok('and reports the rest as cached', c.at(-1).usage.cached > 1000,
+       `${c.at(-1).usage.cached}`);
 }
 {
     const { engine } = fakeEngine(['x'], { ctxMax: 50 });

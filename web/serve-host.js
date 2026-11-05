@@ -42,7 +42,7 @@ function runnerSnapshot(engine) {
         live: r.live.size, slots: r.live.size + r.free.length,
         cuts: r.cuts.size, logs: r.logs.size,
         pagesFree: r.pool.free.length, pagesTotal: r.pool.nPages,
-        pageTokens: r.pool.pageTokens,
+        pageTokens: r.pool.pageTokens, indexSize: r.pool.index.size,
         vramMiB: Math.round(engine.vramBytes / 2 ** 20),
         ...r.counts,
     };
@@ -233,7 +233,7 @@ export function install(post) {
     }
 
     const commands = {
-        async init({ wire, mtp, warm, batch, buffered }) {
+        async init({ wire, mtp, warm, batch, share, buffered }) {
             if (engine) throw new Error('already initialised');
             watchLag();
             // `--wire bc` (tools/mesh.gpu.test.mjs) swaps the datachannel for a
@@ -247,7 +247,7 @@ export function install(post) {
                 rtc = installRtcProxy({ post, buffered });
             }
             engine = new Engine({
-                mtp, warm, batch,
+                mtp, warm, batch, share,
                 onEvent: (type, detail) => sendSnapshot(type, detail),
             });
             return { wire: wire === 'bc' ? 'bc' : 'rtc' };

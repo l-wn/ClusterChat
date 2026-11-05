@@ -126,9 +126,33 @@ export function makeCache(device, d, N_max, n_layer = d.n_layer, layerLo = 0) {
 // Only full_attention layers are paged. A linear_attention layer's recurrent
 // state has no token axis, so it is a fixed cost per session and is stored on
 // the session frame.
+//
+// A page's bytes are a pure function of the tokens that produced it (store_kv
+// in kernels.js: a row's bits depend only on that row's input). So the pool
+// also keeps a content index, `key -> page`, letting a later session be handed
+// a page instead of computing it again (docs/model.md, Shared prefixes).
+//
+// A page holds one content, so at most one key can name it. `byPage` is that
+// map the other way round, and the two move together through putIndex() and
+// dropIndex(): every site that changes a page's bytes drops its entry, so the
+// index holds only entries that are true. There is no generation number and
+// no staleness check, because nothing stale is ever in there.
+//
+// The index holds no reference to a page: it costs host RAM only and can never
+// compete with a live chat for one. `refs` counts the frames holding a page,
+// and `free` lists the pages at zero — so a page a session released keeps its
+// content, and stays reusable, until something else actually needs it. That is
+// what lets a chat evicted for being idle get its own pages back on a rebuild
+// instead of re-feeding its whole context.
+//
+// `free` is a queue, not a stack. A stack would hand out the most recently
+// freed page first, which is exactly the hot shared prefix a chat just let go
+// of, and the index would be destroyed as fast as it was filled. Taking the
+// oldest instead gives the content index an approximate LRU for nothing.
 
 // `nPages` pages of `pageTokens` each, per full_attention layer in [layerLo,
-// layerLo + n_layer). `free` is a stack of free physical page indices.
+// layerLo + n_layer). `free` is a queue of free physical page indices (see the
+// note above on why a queue).
 export function makePagePool(device, d, { pageTokens, nPages, n_layer = d.n_layer,
                                           layerLo = 0 } = {}) {
     const perPage = kvRowBytes(d) * pageTokens;
@@ -142,8 +166,37 @@ export function makePagePool(device, d, { pageTokens, nPages, n_layer = d.n_laye
         bytes += perPage * nPages * 2;
     }
     const free = [];
-    for (let i = nPages - 1; i >= 0; i--) free.push(i);   // pops lowest index first
-    return { pageTokens, nPages, K, V, free, bytes };
+    for (let i = 0; i < nPages; i++) free.push(i);        // takes lowest index first
+    return {
+        pageTokens, nPages, K, V, free, bytes,
+        // Frames holding each page. A page is on `free` exactly while this is
+        // 0, which is the whole invariant: nothing else records where a page is.
+        refs: new Uint16Array(nPages),
+        // The content index, both ways round (see the note above). Bounded by
+        // nPages, since only one key can name a page.
+        index: new Map(),
+        byPage: new Array(nPages).fill(null),
+    };
+}
+
+// Forget what a page held. Called wherever its bytes change: when a frame takes
+// it, when a job rewrites rows already in it, and when a claim grows and the
+// page gains a layer it holds nothing for.
+export function dropIndex(pool, phys) {
+    const key = pool.byPage[phys];
+    if (key === null) return false;
+    pool.index.delete(key);
+    pool.byPage[phys] = null;
+    return true;
+}
+
+// Record what a page holds, replacing whatever it held before.
+export function putIndex(pool, key, phys) {
+    dropIndex(pool, phys);
+    const old = pool.index.get(key);
+    if (old !== undefined) pool.byPage[old] = null;      // the same content moved
+    pool.index.set(key, phys);
+    pool.byPage[phys] = key;
 }
 
 // One session's view of the pool. It has the fields of a makeCache() result
@@ -188,25 +241,72 @@ export function makeSessionFrame(device, d, pool, maxPages, n_layer = d.n_layer,
 //
 // Table entries are written with queue.writeBuffer as pages are taken, so they
 // are applied before any later dispatch reads them.
+//
+// Taking a page forgets what it held: this session is about to overwrite it.
+// Returning false can leave pages already taken, as it always could — that
+// costs index entries and a job, never a wrong answer.
 export function ensurePages(device, pool, frame, tokens) {
     const need = Math.ceil(tokens / pool.pageTokens);
     if (need > frame.maxPages) return false;
     while (frame.owned.length < need) {
-        const phys = pool.free.pop();
+        const phys = pool.free.shift();
         if (phys === undefined) return false;
         const logical = frame.owned.length;
         frame.owned.push(phys);
+        pool.refs[phys]++;
+        dropIndex(pool, phys);
         device.queue.writeBuffer(frame.pages, logical * 4, new Uint32Array([phys]));
     }
     return true;
 }
 
-// Return every page to the pool. The table is not cleared: entries are only
-// read for positions the session has written, and the next session to use the
-// frame overwrites each entry before reading it.
+// The physical page behind this frame's logical page `j`, or undefined, so a
+// caller can name a page without knowing how the table is laid out.
+export function pageAt(frame, j) {
+    return frame.owned[j];
+}
+
+// Point a fresh frame's first `pages.length` logical pages at pages another
+// session already filled, so this session reads rows it did not compute.
+// ensurePages() then appends from there as usual.
+//
+// Nothing is copied and no index entry moves: the bytes are what they were, and
+// both frames now hold the page. A page nobody held comes off `free`, which is
+// what keeps `refs > 0` and "not on `free`" the same statement.
+//
+// All or nothing, unlike ensurePages: a frame left holding half a prefix would
+// be admitted with a cache that does not match the `past` it was admitted at.
+export function adoptPages(device, pool, frame, pages) {
+    if (frame.owned.length || pages.length > frame.maxPages) return false;
+    for (const phys of pages) {
+        if (!Number.isInteger(phys) || phys < 0 || phys >= pool.nPages) {
+            for (const p of frame.owned) if (--pool.refs[p] === 0) pool.free.push(p);
+            frame.owned.length = 0;
+            return false;
+        }
+        if (pool.refs[phys]++ === 0) {
+            const at = pool.free.indexOf(phys);
+            if (at >= 0) pool.free.splice(at, 1);
+        }
+        frame.owned.push(phys);
+    }
+    device.queue.writeBuffer(frame.pages, 0, new Uint32Array(pages));
+    return true;
+}
+
+// Let go of every page this frame holds. The table is not cleared: entries are
+// only read for positions the session has written, and the next session to use
+// the frame overwrites each entry before reading it.
+//
+// A page another frame still holds stays held. A page nobody holds goes to the
+// back of `free` with its bytes and its index entry untouched, so the next
+// session with that prefix can have it back rather than recompute it.
 export function freePages(pool, frame) {
     const n = frame.owned.length;
-    while (frame.owned.length) pool.free.push(frame.owned.pop());
+    while (frame.owned.length) {
+        const phys = frame.owned.pop();
+        if (pool.refs[phys] > 0 && --pool.refs[phys] === 0) pool.free.push(phys);
+    }
     return n;
 }
 

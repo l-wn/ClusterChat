@@ -58,7 +58,12 @@ Anything else that speaks the OpenAI Chat Completions API can use
 - **The first request is slow, the rest aren't.** Agents resend the whole
   conversation every time. The client remembers the last few chats it ran,
   and a request that continues one feeds only its new messages, so only the
-  first request prefills the system prompt.
+  first request prefills the system prompt. A request that is a *prefix* of a
+  kept chat reuses it too: an agent that gives up on a slow reply and opens a
+  new session re-sends its first turn verbatim, and that turn is rewound to
+  and continued rather than prefilled again. The cluster's model decides
+  whether this is possible — a checkpoint with linear-attention layers cannot
+  rewind, so there it still costs a full prefill.
 - **One request at a time.** Concurrent requests queue.
 - **Text and tool calls.** Images are replaced by "[image omitted]", and
   thinking is off.

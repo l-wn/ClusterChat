@@ -413,6 +413,15 @@ of the session leave there too, whatever the peer holds by then.
 unpinned one ranks ready holders by open link first, then by reported load,
 then by how far they reach. With no load reported, that is reach alone.
 
+**The path a job has been through** (`path`): each hop that *runs* blocks
+appends `cursor@peer` as the job leaves it, so a job carries where every cut
+above it fell and which peer ran each. A job merely relayed goes on as the
+bytes it arrived in and adds nothing, which is right: a relay computes no rows.
+Only a job carrying a content hash carries it, since the one reader is the KV
+page index (model.md, *Shared prefixes*), where it is what makes two peers'
+pages for the same text distinguishable — a reply is identical for the same
+path, and no more than that.
+
 ## Wire format
 
 Messages are a JSON header plus an optional f16 payload (`net.js`):

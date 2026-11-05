@@ -205,6 +205,8 @@ export function makeRouter({
     const planned = new Map();     // session -> { n, at }: positions I chose to run for
                                     // it, until its cut exists here
     const senders = new Map();     // session -> Set of peers that handed me a job
+    const chains = new Map();      // session -> a promise of { acc, at }: the content
+                                   // hash chain this peer has verified (verifyHash)
                                     // of it. They may `free` it here.
 
     // The head's side of the closed loop, per session: the key its loop jobs
@@ -568,6 +570,7 @@ export function makeRouter({
         senders.delete(s);
         heading.delete(s);
         current.delete(s);
+        chains.delete(s);
     }
 
     // Tell every peer this tab handed `s` to that the session is over, so its
@@ -993,6 +996,9 @@ export function makeRouter({
         }
         try {
             const t0 = performance.now();
+            // At position 0 this peer has the ids, so it is the only one that
+            // can tell whether the enqueuer's content hash describes them.
+            if (h.pos === 0 && h.hash !== undefined) h = await verifyHash(h);
             const want = plan(h);
             const t1 = performance.now();
             const r = await runner().run(h, hidden, want);
@@ -1039,7 +1045,16 @@ export function makeRouter({
                 // spread, so a replay rebuilds caches to the end of the line.
                 // The peer that ran position 0 stamps `entry` for the head.
                 forward({ ...h, pos: r.at, ...(!h.mtp && { ids: undefined }), trace,
-                          ...(h.pos === 0 && { entry: net.id }) },
+                          ...(h.pos === 0 && { entry: net.id }),
+                          // Where every cut so far fell and who ran it, for the
+                          // page index's key (model/stage.js's #pageKey). Only
+                          // on a job carrying a hash: a decode job would pay
+                          // the bytes for nothing. A job this peer only relayed
+                          // goes on as the bytes it arrived in, so it gains
+                          // nothing here, which is right — a relay computes no
+                          // rows.
+                          ...(h.hash !== undefined
+                              && { path: [...(h.path ?? []), `${r.at}@${net.id}`] }) },
                         r.hidden, null, from);
                 // Packing and sending time on this tab, stored with the RTT.
                 if (!h.replay) put(links, out, { ...links.get(out), send: round(performance.now() - t3) });
@@ -1189,6 +1204,112 @@ export function makeRouter({
         return true;
     }
 
+    // --- Content addressing a prompt's pages ---
+    //
+    // A peer's KV for a run of positions is a pure function of the ids that
+    // produced it, so a chat with the same prefix can be handed another's pages
+    // instead of computing them again (model/model.js's page index). The ids
+    // are what identifies them, and only the enqueuer and the peer at position
+    // 0 ever see ids — route() strips them on the hand-off — so the enqueuer
+    // sends a hash and the peer at position 0 checks it.
+    //
+    // One hash per chunk, each over the whole context up to that chunk's end.
+    // Not one per page: a peer's page size is its own (stage.js clamps it to
+    // the context), peers need not agree on it, and the enqueuer knows none of
+    // them. A peer keys a page whose boundary is a chunk end, which is every
+    // page when PAGE_TOKENS and T_MAX are both 64.
+    //
+    // The salt ties a hash to this mesh and this checkpoint, so one cannot be
+    // replayed into another cluster or against other weights. Every peer in a
+    // mesh derives the same salt from the same two mesh-wide values, or two
+    // enqueuers would never agree on a hash; either may be absent, and the
+    // empty string is as good a salt as any when nobody has anything else.
+    const sha256 = async (...parts) => {
+        let n = 0;
+        for (const part of parts) n += part.byteLength;
+        const buf = new Uint8Array(n);
+        let at = 0;
+        for (const part of parts) { buf.set(new Uint8Array(part.buffer ?? part, part.byteOffset ?? 0,
+                                                           part.byteLength), at); at += part.byteLength; }
+        return new Uint8Array(await crypto.subtle.digest('SHA-256', buf));
+    };
+    const hex = (bytes, n = bytes.length) => Array.from(bytes.subarray(0, n),
+        (b) => b.toString(16).padStart(2, '0')).join('');
+    const idBytes = (ids) => new Uint8Array(Uint32Array.from(ids).buffer);
+
+    let salted = null;
+    const salt = () => (salted ??= sha256(
+        new TextEncoder().encode(`${mesh}\0${net.weightsUrl ?? ''}`)));
+
+    // Whether a prompt's pages could ever match another chat's, which decides
+    // whether to hash it at all. Synchronous, and checked before anything is
+    // awaited: every decode token goes through here, and a job that gains
+    // nothing from sharing must not even pay a microtask for it — route.js
+    // registers a job as pending in the same turn its caller submits it.
+    //
+    // A turn continuing a chat starts at an arbitrary position, so its chunks
+    // straddle page boundaries and could never line up with another chat's. A
+    // prompt shorter than one chunk fills no whole page anywhere.
+    const worthHashing = (past, ids) => past === 0 && ids.length >= T_MAX;
+
+    // The hash for every chunk of `ids`, one per chunk sendFills() will send,
+    // each over the context from position 0 to that chunk's end. 128 bits of
+    // SHA-256 per chunk: a collision would have to be found, not stumbled on.
+    async function promptHashes(ids) {
+        const out = [];
+        let acc = await salt();
+        for (let i = 0; i < ids.length; i += T_MAX) {
+            acc = await sha256(acc, idBytes(ids.slice(i, i + T_MAX)));
+            out.push(hex(acc, 16));
+        }
+        return out;
+    }
+
+    // At position 0 only, where the ids are: check the enqueuer's hash against
+    // them before any peer indexes a page under it. The enqueuer is not trusted
+    // — anyone can run a client — and a hash that named other ids would have a
+    // later chat read KV for text it never sent, which is wrong tokens and no
+    // error.
+    //
+    // The chain is a cursor, so the checks must happen in the order the chunks
+    // arrived. Links are ordered and route() hands jobs on in order, but
+    // digesting is asynchronous, so two chunks' checks would otherwise
+    // interleave and the second would find the cursor still at the first.
+    // Each check therefore waits for the one before it on the same session.
+    //
+    // Returns the header to run: the same one, or one with the hash stripped,
+    // which costs the sharing and nothing else.
+    function verifyHash(h) {
+        const prior = chains.get(h.s);
+        let settle;
+        put(chains, h.s, new Promise((res) => { settle = res; }));
+        return (async () => {
+            let state = null;
+            try {
+                state = await prior ?? null;
+            } catch { /* a broken chain is a null one */ }
+            try {
+                // Only a job at position 0 of a prompt that started the context
+                // carries a hash, so there is a cursor to continue and ids to
+                // check it against.
+                const acc = h.past === 0 ? await salt()
+                    : state?.at === h.past ? state.acc : null;
+                const next = acc && h.path === undefined && Array.isArray(h.ids)
+                    ? await sha256(acc, idBytes(h.ids)) : null;
+                if (!next || hex(next, 16) !== h.hash) {
+                    console.warn(`dropped the content hash of ${h.s}'s job at ${h.past}: `
+                        + 'it does not match its ids');
+                    state = null;          // the chain is broken; later chunks fail too
+                    return { ...h, hash: undefined };
+                }
+                state = { acc: next, at: h.past + h.ids.length };
+                return h;
+            } finally {
+                settle(state);
+            }
+        })();
+    }
+
     // --- The enqueuer's session ---
 
     // The job header's sampler settings for `ids`, from the chat's history.
@@ -1217,7 +1338,7 @@ export function makeRouter({
     // `prompt`: the whole prompt `ids` ends, for the repetition summary when
     // its earlier chunks are not yet in the history. `from`: where that
     // prompt starts; an `err` below it is late (see deliver()).
-    function submitJob(ids, past, opts, loop = null, prompt = ids, from = past) {
+    function submitJob(ids, past, opts, loop = null, prompt = ids, from = past, hash = null) {
         const s = conv.session, k = conv.key;
         return new Promise((resolve, reject) => {
             const timer = setTimeout(() => {
@@ -1239,6 +1360,7 @@ export function makeRouter({
                 ...(loop && { loop }),
                 // The MTP head fills its KV from every job, prefill included.
                 ...(opts.spec && { mtp: true }),
+                ...(hash && { hash }),
             });
         });
     }
@@ -1297,7 +1419,8 @@ export function makeRouter({
     // `error`. Call `close()` once the last chunk is answered or has failed.
     //
     // `cancellable`: a rebuild checks isCancelled() before each chunk.
-    function sendFills(c, ids, past0, opts, { onChunk = null, cancellable = false } = {}) {
+    function sendFills(c, ids, past0, opts, { onChunk = null, cancellable = false,
+                                              hashes = null } = {}) {
         const s = c.session, key = c.key;
         const waiting = new Map();     // past -> { n, t0, timer }
         let wake = null, error = null, closed = false;
@@ -1361,6 +1484,8 @@ export function makeRouter({
                     fill: true,
                     prof: opts.prof || undefined,
                     ...(opts.spec && { mtp: true }),
+                    // What this chunk's ids are, for the peers' page index.
+                    ...(hashes?.[i / T_MAX] && { hash: hashes[i / T_MAX] }),
                 });
             }
             if (closed) throw error ?? new Error('the prompt was stopped');
@@ -1374,12 +1499,17 @@ export function makeRouter({
     // caller adds `ids` to the history.
     async function sendPrompt(c, ids, opts, { onChunk = null, cancellable = false } = {}) {
         const past = c.history.length, cut = commitAt(ids.length);
-        if (!cut) return submitJob(ids, past, opts);
-        const pre = sendFills(c, ids.slice(0, cut), past, opts, { onChunk, cancellable });
+        // One hash per chunk, so each peer can content-address the pages it
+        // fills (see Content addressing above). The last chunk gets one too: it
+        // completes a page whenever the prompt is a whole number of chunks.
+        const hashes = worthHashing(past, ids) ? await promptHashes(ids) : null;
+        if (!cut) return submitJob(ids, past, opts, null, ids, past, hashes?.[0] ?? null);
+        const pre = sendFills(c, ids.slice(0, cut), past, opts, { onChunk, cancellable, hashes });
         try {
             await pre.sent;
             if (pre.error) throw pre.error;
-            return await submitJob(ids.slice(cut), past + cut, opts, null, ids, past);
+            return await submitJob(ids.slice(cut), past + cut, opts, null, ids, past,
+                                   hashes?.[cut / T_MAX] ?? null);
         } finally {
             pre.close();
         }

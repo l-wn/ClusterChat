@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // clusterchat: use a ClusterChat cluster from coding agents.
 
-import { readFileSync } from 'node:fs';
-import { relative } from 'node:path';
+import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
+import { join as joinPath, relative } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import * as ui from './ui.js';
 import { parseTarget, join } from './join.js';
@@ -30,6 +30,29 @@ options
   --host <addr>    local address (${HOST})
   --server <url>   for demo: whose demo (default $CLUSTERCHAT_SERVER, else https://clusterchat.io)
 `;
+
+// With CLUSTERCHAT_DUMP_PROMPTS set to a directory, write what every request
+// decided to feed into it, one file per request. Two agents' dumps are what
+// tools/prefix-overlap.mjs measures the shared prefix of, which is the number
+// that says whether sharing KV pages between chats is worth building
+// (PLAN-prefix-sharing.md). Off unless the variable is set, and a write that
+// fails is reported once and then ignored: this must never cost a request.
+function promptDump() {
+    const dir = process.env.CLUSTERCHAT_DUMP_PROMPTS;
+    if (!dir) return null;
+    mkdirSync(dir, { recursive: true });
+    let n = 0, warned = false;
+    return ({ prompt, fresh, cached, reused }) => {
+        const name = `${process.pid}-${String(++n).padStart(4, '0')}.txt`;
+        try {
+            writeFileSync(joinPath(dir, name), prompt);
+            writeFileSync(joinPath(dir, `${name}.json`),
+                JSON.stringify({ fresh, cached, reused }) + '\n');
+        } catch (err) {
+            if (!warned) { warned = true; ui.line('!', 'dump', `${dir}: ${err.message}`); }
+        }
+    };
+}
 
 function parseArgs(argv) {
     const args = { _: [] };
@@ -75,7 +98,8 @@ async function connect(args) {
         else if (what === 'unlinked') s.warn('linked', 'no link to the GPUs yet. Requests are refused until there is one.');
     } }).catch((err) => { s.fail('joined', err.message); throw Object.assign(err, { shown: true }); });
 
-    const cluster = makeCluster({ engine, template, info, sampling: SAMPLING });
+    const cluster = makeCluster({ engine, template, info, sampling: SAMPLING,
+                                 onPrepare: promptDump() });
     const totals = { replies: 0, out: 0 };
     const server = await listen(cluster, { port, host, onChat: (r) => ui.request(r, totals) }).catch((err) => {
         engine.drop();
