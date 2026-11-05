@@ -1212,6 +1212,17 @@ function check(row, reference) {
     stalls('main thread', (row.stats ?? []).map((st) => st.longtasks).filter(Boolean));
     stalls('serving worker', (row.stats ?? []).map((st) => st.lag).filter(Boolean));
 
+    // What the ack wait had to absorb (route.js's congestion, via the worker
+    // snapshot). Reported, never asserted here, like the stalls above: it is
+    // a property of whichever machine and network the row ran on. `extended`
+    // re-arming with `dead` at 0 is the fix doing its job.
+    const congestions = (row.stats ?? []).map((st) => st.congestion).filter(Boolean);
+    if (congestions.length) {
+        const sum = (f) => congestions.reduce((n, c) => n + (c[f] ?? 0), 0);
+        console.log(`    congestion: ${sum('extended')} waits re-armed, ${sum('dead')} ` +
+            `declared dead anyway, ${sum('backoff')} backoffs in force`);
+    }
+
     const ladder = all.flatMap((r) => r.events ?? []);
     const repairs = ladder.filter((e) => e === 'repair').length;
     const fixes = ladder.filter((e) => e === 'fix').length;
@@ -1242,6 +1253,10 @@ function check(row, reference) {
         ok(`${row.name}: nothing needed repairing`, repairs === 0 && fixes === 0,
             repairs || fixes ? `${fixes} local repairs, ${repairs} rebuilds with ` +
                 `no peer having left` : '');
+        // Nothing in this row is dead, so no ack wait should have reached the
+        // cap either.
+        const dead = congestions.reduce((n, c) => n + (c.dead ?? 0), 0);
+        ok(`${row.name}: and no ack wait was declared dead`, dead === 0, `${dead} dead`);
     }
 
     if (row.replayed) {

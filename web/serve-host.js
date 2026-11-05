@@ -145,6 +145,7 @@ function snapshot(engine, convIds, cache) {
         conversation: convIds.get(engine.conversation) ?? null,
         history: engine.history,
         runner: runnerSnapshot(engine),
+        congestion: engine.congestion,
         capacity: capacityTable(engine, cache),
     };
 }

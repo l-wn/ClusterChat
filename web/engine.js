@@ -1045,6 +1045,8 @@ export class Engine {
     // a stored chat is rebuilt from.
     get history() { return Uint32Array.from(this.#router?.history ?? []); }
     get ran() { return this.#router?.ran ?? 0; }
+    // What the router's ack waits have had to absorb (route.js's congestion).
+    get congestion() { return this.#router?.congestion ?? null; }
     get blocksPerSec() { return this.#sp; }
     get vramLimit() { return this.#vramLimit; }
     get lastStopReason() { return this.#lastStopReason; }

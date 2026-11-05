@@ -554,11 +554,13 @@ therefore costs the peers' own hops instead of a UK↔Thailand round trip.
   Decoding setting (closed loop / round trip) switches the loop off.
 
 **Prefill** (`route.js` `sendFills()`). Every chunk of a prompt but the last is
-a prefill chunk (`fill: true`). Up to `PREFILL_WINDOW` (4) of them are in
-flight at once, so the peers on a path work on different chunks at the same
-time instead of waiting for each chunk's round trip. The last chunk follows as
-soon as the last prefill chunk is sent; it is the ordinary job that samples
-the first token and opens the loop.
+a prefill chunk (`fill: true`). Up to `PREFILL_WINDOW` (4 before backoff) of
+them are in flight at once, so the peers on a path work on different chunks at
+the same time instead of waiting for each chunk's round trip. Loss on a hop
+halves the window (down to 1), so the mesh sends less into a link that is
+already dropping packets, and a run of clean acks wins a halving back. The
+last chunk follows as soon as the last prefill chunk is sent; it is the
+ordinary job that samples the first token and opens the loop.
 
 - **The last chunk commits the prompt.** Links are ordered and a runner runs a
   session's jobs in order, so its answer means every chunk before it ran. A
@@ -782,7 +784,13 @@ there is no UI for it yet.
 A peer can leave at any time. Recovery works in steps, cheapest first:
 
 1. **Acks.** The receiver of a job acks it before touching the GPU. No ack
-   within 1.5 s counts as a failed send.
+   within ~1.5 s (the peer's measured round trip, floored there, plus an
+   allowance for the message's size) makes the hop *suspect*, not dead. While
+   the link's send queue is still shrinking, or while the data channel is still
+   open, the wait is re-armed — a lost packet stalls a link for a second or two
+   and an open channel is not a departure. Only a closed or failed channel, a
+   send that fails outright, or 30 s of silence on an open one counts as a
+   failed send.
 2. **Local repair.** Each peer keeps a **boundary log**: the residual stream it
    handed over at each boundary, per session (`Runner.logs`), as the f16 bits
    it sent. When a hand-off
@@ -814,6 +822,10 @@ Known gaps:
 - A peer that stays connected but stops answering (a zombie) at the enqueuer's
   first hop: every rebuild can be routed straight back into it until the roster
   drops it, so a turn can spend its whole repair budget there.
+- A peer whose tab is frozen but whose channel stays open (a closed lid, a
+  throttled tab) is detected after 30 s rather than at the first late ack. That
+  is deliberate: inferring death from one late ack re-fed the whole context over
+  a link that was merely losing packets, which collapsed the mesh under load.
 - Peers are trusted: nothing checks that a peer computed its range honestly.
 - Routing balances GPU work, not chats: every chat still needs a frame on the
   embedding's holder and on the head's, so with one of each the runners'

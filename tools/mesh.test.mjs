@@ -331,7 +331,8 @@ class World {
     // every departure the mesh can absorb is absorbed, and a budget would make
     // it fail for reasons unrelated to routing.
     constructor({ maxRepairs, maxFixes, maxLocalReplay, hybrid = false, hybridRouter = hybrid,
-                  idleMs = 0, ackRate = Infinity, toyVocab = null, prefillWindow } = {}) {
+                  idleMs = 0, ackRate = Infinity, toyVocab = null, prefillWindow,
+                  ackCap = 45, rebuildBackoff = 0 } = {}) {
         // How many distinct tokens the toy model samples. A small one makes
         // replies repeat, so prompt lookup finds drafts and some are accepted.
         this.toyVocab = toyVocab;
@@ -356,6 +357,13 @@ class World {
         this.maxLocalReplay = maxLocalReplay;
         // Prefill chunks of one prompt in flight (route.js PREFILL_WINDOW).
         this.prefillWindow = prefillWindow;
+        // Longest an ack is waited for in total (route.js's ACK_CAP). Small
+        // here so a zombie is still declared dead quickly; a test about the
+        // re-arm itself raises it.
+        this.ackCap = ackCap;
+        // Pause before a second rebuild (route.js's REBUILD_BACKOFF_MS). 0 in
+        // most of this suite, whose timings are tuned to a 500ms jobTimeout.
+        this.rebuildBackoff = rebuildBackoff;
         this.peers = [];          // the roster, shared by reference with every Mesh
         this.tabs = new Map();    // id -> { net, router, runner }
         this.zombies = new Set(); // peers whose links look open and drop everything
@@ -422,6 +430,8 @@ class World {
             isCancelled: () => tab.cancelled,
             ackTimeout: 15,       // short, so zombie and slow-link tests run quickly
             ackRate: this.ackRate,
+            ackCap: this.ackCap,
+            rebuildBackoff: this.rebuildBackoff,
             jobTimeout: 500,      // the enqueuer's last-resort timeout, rarely reached
             ...(this.maxRepairs === undefined ? {} : { maxRepairs: this.maxRepairs }),
             ...(this.maxFixes === undefined ? {} : { maxFixes: this.maxFixes }),
@@ -1043,9 +1053,9 @@ console.log('\na kill with nobody to replace it: fail loudly, do not guess');
 console.log('\na zombie peer: nothing can repair a peer that swallows');
 {
     // There is no other holder of the second half, so repair finds no
-    // candidate. The zombie never acks the hand-off, so the failure is
-    // detected after about ackTimeout, not jobTimeout, and the error names the
-    // peer.
+    // candidate. The zombie's link still looks open (zombie() never touches
+    // net.links), so the wait is re-armed until ackCap, not ackTimeout, before
+    // the failure is detected, and the error names the peer.
     const w = new World();
     w.join(0, 0, 4);
     w.join(1, 4, N);               // the only holder of the second half
@@ -1065,6 +1075,7 @@ console.log('\na zombie peer: nothing can repair a peer that swallows');
     // A failed rebuild is retried, so the turn's whole repair budget is spent
     // before the failure is reported, and no more than the budget.
     eq('the whole repair budget went on the same peer, and no more', asker.repairs, 2);
+    ok('and the wait was re-armed before giving up', w.tabs.get(0).router.congestion.dead > 0);
 }
 
 console.log('\na slow but alive peer: legitimately long compute is not a departure');
@@ -1856,7 +1867,10 @@ console.log('\na turn that failed must not leave answers behind for the next one
     const ctl = chain([0, 4, N]);
     const want = await generate(ctl.asker, [9, 8, 7], 6);
 
-    const w = new World({ maxFixes: 0 });
+    // ackCap at the old flat ackTimeout: this test is about what happens
+    // after a hop has genuinely given up, not about Phase 1's re-arm (which
+    // would absorb a 40ms lateness and let the turn succeed instead).
+    const w = new World({ maxFixes: 0, ackCap: 15 });
     w.join(0, 0, 4);
     w.join(1, 4, N);
     const asker = w.join(100);
@@ -1915,6 +1929,123 @@ console.log('\na big job crossing a link that shows no queue is given time to la
     eq('the answer matches', await generate(asker, PROMPT, 4), want);
     eq('with no repair and no rebuild', [w.tabs.get(0).router.repaired, asker.repairs], [0, 0]);
     ok('and the hand-off was never reported as broken', !w.wire.some((m) => m.k === 'err'));
+}
+
+console.log('\na lost packet on an open link is not a dead peer');
+{
+    // A client's prefill chunk is header-only (no size allowance: ackRate is
+    // Infinity by default), so the old flat ackTimeout was the whole budget.
+    // A link that reports no draining queue (as the TURN relay case does) and
+    // delivers one job 60ms late must not be treated as a departure: the
+    // channel is open the whole time.
+    const ctl = chain([0, 4, N]);
+    const want = await generate(ctl.asker, PROMPT, 4);
+
+    const w = new World({ ackCap: 300 });
+    w.join(0, 0, 4);
+    w.join(1, 4, N);
+    const asker = w.join(100);
+    w.slowLink(0, 1, (h) => (h.k === 'job' ? 60 : 0), { drain: false });   // ackTimeout is 15
+
+    eq('the answer matches', await generate(asker, PROMPT, 4), want);
+    eq('with no repair and no rebuild', [w.tabs.get(0).router.repaired, asker.repairs], [0, 0]);
+    ok('and the hand-off was never reported as broken', !w.wire.some((m) => m.k === 'err'));
+    const c = w.tabs.get(0).router.congestion;
+    ok('the wait really was re-armed, not just allowed to be', c.extended > 0, `extended ${c.extended}`);
+    eq('and never gave up on an open link', c.dead, 0);
+}
+
+console.log('\nan open link that never delivers is still declared dead, at the cap');
+{
+    // The other side of the same change: nobody can "fix" the test above by
+    // making armAck never fail. Two holders of the second half, one zombied,
+    // so a repair candidate exists.
+    const w = new World({ ackCap: 45 });
+    w.join(0, 0, 4);
+    w.join(1, 4, N);
+    w.join(2, 4, N);
+    const asker = w.join(100);
+
+    const got = await generate(asker, PROMPT, BUDGET, {
+        between: async (n) => {
+            if (n !== 4) return;
+            const carrying = [1, 2].find((id) => w.tabs.get(id).runner.real.live.size > 0);
+            w.zombie(carrying);
+        },
+    });
+
+    eq('the answer matches the reference', got, CONTROL);
+    eq('with no rebuild', asker.repairs, 0);
+    eq('and one local repair, found at the cap', w.tabs.get(0).router.repaired, 1);
+    const c = w.tabs.get(0).router.congestion;
+    ok('the cap really was reached', c.dead > 0, `dead ${c.dead}`);
+}
+
+console.log('\nthe ack wait is sized from the measured round trip');
+{
+    // A link delayed 20ms each way, so rtts settles near 40. Once the
+    // estimate is built, this peer is no longer suspected for being far: the
+    // extended count stops growing.
+    const w = new World({ ackCap: 300 });
+    w.join(0, 0, 4);
+    w.join(1, 4, N);
+    const asker = w.join(100);
+    w.slowLink(0, 1, () => 20);
+    w.slowLink(1, 0, () => 20);
+
+    await generate(asker, PROMPT, 4);
+    const router = w.tabs.get(0).router;
+    const rtt = router.rtts.get(1);
+    ok('the round trip settled near 40ms', rtt > 20 && rtt < 80, `rtt ${rtt}`);
+    ok('and a deviation estimate exists', router.rttvars.get(1) !== undefined);
+
+    const before = router.congestion.extended;
+    await generate(asker, PROMPT, 8);
+    eq('once the estimate is built, no more waits are extended',
+        router.congestion.extended, before);
+}
+
+console.log('\nloss shrinks the prefill window, and clean acks win it back');
+{
+    const w = new World({ ackCap: 300, prefillWindow: 4 });
+    w.join(0, 0, 4);
+    w.join(1, 4, N);
+    const asker = w.join(100);
+    w.slowLink(0, 1, (h) => (h.k === 'job' ? 60 : 0), { drain: false });
+
+    // A few chunks of prefill, well under nMax (4*T_MAX), so backoff has
+    // several boundaries to re-arm across before the turn ends.
+    const LONG = Array.from({ length: 3 * T_MAX }, (_, i) => (i * 7) % 29);
+    await generate(asker, LONG, 1);
+    const router = w.tabs.get(0).router;
+    ok('the window backed off', router.congestion.backoff > 0, `backoff ${router.congestion.backoff}`);
+    ok('and shrank', router.congestion.window < 4, `window ${router.congestion.window}`);
+
+    // Recovery needs `ackRecover` clean acks per halving, not more context: a
+    // fresh, short chat with a long decode budget gives plenty of clean acks
+    // without approaching nMax.
+    w.slowLinks.delete('0>1');
+    asker.router.newChat();
+    await generate(asker, PROMPT, 40);   // well past 2 * route.js's ACK_RECOVER (16)
+    eq('clean acks win the window back', router.congestion.backoff, 0);
+}
+
+console.log('\na second rebuild waits before re-feeding');
+{
+    const w = new World({ ackCap: 45, rebuildBackoff: 60 });
+    w.join(0, 0, 4);
+    w.join(1, 4, N);               // the only holder of the second half
+    const asker = w.join(100);
+
+    const start = performance.now();
+    const got = await generate(asker, PROMPT, BUDGET, {
+        between: async (n) => { if (n === 4) w.zombie(1); },
+    }).catch((e) => null);
+    const took = performance.now() - start;
+
+    ok('the generation gives up rather than answering', got === null);
+    eq('the whole repair budget went on the same peer', asker.repairs, 2);
+    ok('a second rebuild waited before re-feeding', took >= 60, `took ${took}ms`);
 }
 
 console.log('\na boundary log begun again is never replayed past its end');
@@ -2503,7 +2634,9 @@ console.log('\nclosed loop: nothing runs on once nobody wants it');
     // the old loop, whose job still arrives, must not run alongside the new
     // one.
     {
-        const w = new World({ maxFixes: 0 });
+        // ackCap at the old flat ackTimeout: a 40ms lateness is well inside
+        // Phase 1's re-arm budget and would be absorbed instead of rebuilt.
+        const w = new World({ maxFixes: 0, ackCap: 15 });
         w.join(0, 0, 4);
         w.join(1, 4, N);
         const asker = w.join(100);

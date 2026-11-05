@@ -409,6 +409,13 @@ console.log('\nMesh.linked: an open channel, not merely a pending connection');
     ok('open link', m.linked(1));
     ok('a gathering link is not linked', m.linked(2) === false);
     ok('unknown peer', m.linked(99) === false);
+
+    ok('an open link is alive', m.alive(1));
+    ok('a gathering link is not alive', m.alive(2) === false);
+    ok('an unknown peer is not alive', m.alive(99) === false);
+
+    m.links.set(3, { pc: {}, ch: { readyState: 'open' }, dead: true });
+    eq('a link already marked dead is open but not alive', [m.linked(3), m.alive(3)], [true, false]);
 }
 
 console.log('\nMesh.transports: what ICE settled on, per link');

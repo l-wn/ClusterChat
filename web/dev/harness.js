@@ -393,6 +393,11 @@ export const api = {
             // `longtask` entries are per-realm, so the observer above cannot
             // see them; this is the drift of a timer in there.
             lag: s.lag ?? null,
+            // How often an ack wait had to be re-armed because the link was
+            // open but silent, and how often that still ended in a failure
+            // (route.js's armAck). `extended > 0` with `dead === 0` is the fix
+            // doing its job.
+            congestion: s.congestion ?? null,
         };
     },
 

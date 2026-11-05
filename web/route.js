@@ -24,6 +24,14 @@ export const T_MAX = 64;
 // can sit in a runner's queue ahead of other chats' jobs, so this stays small.
 export const PREFILL_WINDOW = 4;
 
+// Halvings of `prefillWindow` that observed loss may force: 4 -> 2 -> 1 chunks
+// in flight. The response to loss has to be to send less; nothing else in the
+// mesh does that (PLAN-mesh-resilience.md §2c).
+const MAX_BACKOFF = 2;
+
+// Consecutive acks with no re-arm that win a halving back.
+const ACK_RECOVER = 16;
+
 // A peer's load, as reported in its acks, is used for this long.
 const LOAD_TTL_MS = 10_000;
 
@@ -43,9 +51,10 @@ const ROUTES = 128;        // (session, boundary) pairs a peer pins a hop for
 // loaded mesh).
 const JOB_TIMEOUT = 300_000;
 
-// How long a peer waits for the next hop to ack a job before treating the hop
-// as a failed send. The receiver acks before any GPU work, so this covers
-// network RTT plus the time the job takes to cross.
+// How long a peer waits for the next hop to ack a job before suspecting the
+// hop. The receiver acks before any GPU work, so this covers network RTT plus
+// the time the job takes to cross. It is a *suspicion*, not a verdict: while
+// the channel is open the wait is re-armed (see armAck).
 const ACK_TIMEOUT = 1500;
 
 // Slowest transfer rate, in bytes per second, that a hop's wait allows for on
@@ -55,6 +64,18 @@ const ACK_TIMEOUT = 1500;
 // wait is sized from the payload. A decode job is a few KB and adds almost
 // nothing.
 const ACK_RATE = 256 * 1024;
+
+// Longest an ack may be waited for in total, across every re-arm, before an
+// open-but-silent hop is treated as dead after all. A client on Wi-Fi stalls
+// a link 1-2s on a lost packet and an SCTP retransmit timeout can eat a whole
+// ACK_TIMEOUT, so the old flat 1500ms declared live peers dead and re-fed the
+// whole context over the link that was already losing packets. JOB_TIMEOUT
+// still bounds a job that genuinely never lands.
+const ACK_CAP = 30_000;
+
+// Longest single step between re-arms. The step doubles from ACK_TIMEOUT, so
+// a long wait costs a handful of timers rather than one every 1.5s.
+const ACK_STEP_MAX = 5000;
 
 // Consecutive local repairs one boundary may make before passing the error
 // back. Reset when a job crosses the boundary. Bounds replays into a peer that
@@ -68,6 +89,11 @@ const MAX_LOCAL_REPLAY = 256;
 
 // Context rebuilds one turn may make before the failure reaches the user.
 const MAX_REPAIRS = 2;
+
+// Pause before a rebuild that follows a failed one, multiplied by how many the
+// turn has spent. The first rebuild is immediate; the second does not stack on
+// a link that is still congested.
+const REBUILD_BACKOFF_MS = 500;
 
 // Hop budget for an answer, on top of the length of the line. Bounds an answer
 // whose addressee nobody links to.
@@ -147,10 +173,14 @@ export function makeRouter({
     jobTimeout = JOB_TIMEOUT,
     ackTimeout = ACK_TIMEOUT,
     ackRate = ACK_RATE,
+    ackCap = ACK_CAP,
     maxRepairs = MAX_REPAIRS,
     maxFixes = MAX_FIXES,
     maxLocalReplay = MAX_LOCAL_REPLAY,
     prefillWindow = PREFILL_WINDOW,
+    maxBackoff = MAX_BACKOFF,
+    ackRecover = ACK_RECOVER,
+    rebuildBackoff = REBUILD_BACKOFF_MS,
     // Whether this peer, as the head, runs the closed loop. When off, it
     // answers loop jobs without feeding. Tests use this.
     closedLoop = true,
@@ -171,6 +201,7 @@ export function makeRouter({
     const assigned = new Map();    // peer -> { n, at }: positions routed to it since
                                     // its last ack
     const rtts = new Map();        // peer -> averaged ack round trip, ms
+    const rttvars = new Map();     // peer -> mean deviation of its ack round trip, ms
     const planned = new Map();     // session -> { n, at }: positions I chose to run for
                                     // it, until its cut exists here
     const senders = new Map();     // session -> Set of peers that handed me a job
@@ -197,6 +228,34 @@ export function makeRouter({
     let repaired = 0;              // hand-offs this peer fixed for somebody else
     let ran = 0;                   // token positions this peer has run, all sessions
     let eos = 0;                   // end-of-text id, from the manifest
+
+    let extended = 0;              // ack waits re-armed on an open channel
+    let dead = 0;                  // ack waits that reached ackCap anyway
+
+    let backoff = 0;               // halvings of prefillWindow in force
+    let clean = 0;                 // consecutive acks with no re-arm
+
+    // Chunks of one prompt in flight, after any backoff. Read per chunk, so a
+    // window that shrinks mid-prompt takes effect on the next one.
+    const window = () => Math.max(1, prefillWindow >> backoff);
+
+    // An ack wait was re-armed on an open link: the link is losing packets.
+    function stalling() {
+        clean = 0;
+        if (backoff >= maxBackoff) return;
+        backoff++;
+        console.warn(`backing off to ${window()} prefill chunks in flight, from ${prefillWindow}`);
+        onChange();
+    }
+
+    // An ack arrived. One that needed no re-arm counts towards recovery.
+    function acked(wasExtended) {
+        if (wasExtended || backoff === 0) return;
+        if (++clean < ackRecover) return;
+        clean = 0;
+        backoff--;
+        onChange();
+    }
 
     // Mint a session and key for `c`. The id says who asked and roughly when,
     // so it is guessable. The key is the secret.
@@ -384,28 +443,73 @@ export function makeRouter({
         put(upstream, key, id);
     }
 
-    // Wait for the next hop to ack the job just sent. Expiry is handled like a
-    // failed send. Not armed for a replay, which is never acked.
+    // The wait for one hop's ack, before the message's size is allowed for.
+    // `ackTimeout` is the floor, so a near peer is unaffected. Above it the
+    // estimate is the peer's smoothed round trip plus four mean deviations,
+    // as TCP sizes its retransmit timeout, so a far or relayed peer is not
+    // suspected for being far. Bounded by ackCap, which bounds the wait anyway.
+    function ackRto(to) {
+        const srtt = rtts.get(to);
+        if (srtt == null) return ackTimeout;
+        const v = rttvars.get(to) ?? srtt / 2;
+        return Math.min(Math.max(ackTimeout, srtt + 4 * v), ackCap);
+    }
+
+    // Wait for the next hop to ack the job just sent. Not armed for a replay,
+    // which is never acked.
     //
     // The far end acks once the whole message has arrived, but send() returns
     // when it is queued. A prefill's residual stream is half a megabyte or
     // more and can take seconds to cross a relayed link. So if the link's send
-    // queue is still shrinking at expiry, the wait is extended. A queue that
-    // stops shrinking, or a delivered message that is never acked, fails.
+    // queue is still shrinking at expiry, the wait is extended: that is
+    // positive evidence the bytes are still leaving, and it is not capped.
     //
-    // The first wait also allows for the message's size at ACK_RATE, since the
-    // queue empties into SCTP before the bytes arrive.
+    // An expiry on a channel that is still open is NOT a death. A lost packet
+    // on a visitor's Wi-Fi stalls the link for a second or two, and an SCTP
+    // retransmit timeout alone can consume a whole ackTimeout. Declaring the
+    // hop dead there drops the session and re-feeds the entire context over
+    // the same degraded link, which causes more loss: that is the meltdown in
+    // PLAN-mesh-resilience.md §2. So while net.alive() holds, the wait is
+    // re-armed with a doubling step until `ackCap` has passed since the send.
+    // Repair and failure are for a channel that is closed or marked dead
+    // (#linkFailed), for a send that failed outright (forward() never arms a
+    // wait then), or for the cap.
+    //
+    // The first wait is this peer's retransmit estimate (ackRto) plus the
+    // message's size at ACK_RATE, since the queue empties into SCTP before the
+    // bytes arrive.
     function armAck(key, h, payload, raw, to) {
         clearAck(key);   // a new send at this boundary replaces any earlier wait
-        const wait = { to, past: h.past, sentAt: performance.now(), queued: net.buffered?.(to) ?? 0 };
+        const wait = { to, past: h.past, sentAt: performance.now(),
+                       queued: net.buffered?.(to) ?? 0, step: 0, waits: 0 };
         const bytes = raw?.byteLength ?? payload?.byteLength ?? 0;
-        const first = ackTimeout + bytes / ackRate * 1000;
+        const first = ackRto(to) + bytes / ackRate * 1000;
         const expire = () => {
             const queued = net.buffered?.(to) ?? 0;
             if (wait.queued > 0 && queued < wait.queued) {
                 wait.queued = queued;
                 wait.timer = setTimeout(expire, ackTimeout);
                 return;
+            }
+            const waited = performance.now() - wait.sentAt;
+            const left = ackCap - waited;
+            if (left > 0 && (net.alive?.(to) ?? net.linked?.(to) ?? false)) {
+                if (wait.waits === 0) {
+                    console.warn(`peer ${to} has not acked ${h.s} at ${h.pos} after `
+                        + `${Math.round(waited)}ms, but the link is open. Waiting up to `
+                        + `${(ackCap / 1000).toFixed(1)}s before repairing.`);
+                }
+                wait.waits++;
+                wait.step = Math.min(wait.step ? wait.step * 2 : ackTimeout, ACK_STEP_MAX);
+                wait.timer = setTimeout(expire, Math.min(wait.step, left));
+                extended++;
+                stalling();
+                return;
+            }
+            if (wait.waits > 0) {
+                dead++;
+                console.warn(`peer ${to} did not ack ${h.s} at ${h.pos} within `
+                    + `${(ackCap / 1000).toFixed(1)}s on an open link. Treating it as dead.`);
             }
             acks.delete(key);
             // Backed up and not draining: a busy refusal.
@@ -638,7 +742,18 @@ export function makeRouter({
                 const rtt = Math.round((performance.now() - w.sentAt) * 100) / 100;
                 put(links, key, { ...links.get(key), rtt });
                 const prev = rtts.get(from);
-                rtts.set(from, prev == null ? rtt : 0.8 * prev + 0.2 * rtt);
+                if (prev == null) {
+                    rtts.set(from, rtt);
+                    rttvars.set(from, rtt / 2);
+                } else {
+                    // Deviation first, against the old mean, as Jacobson/Karels
+                    // specifies. `rtts` keeps its 0.8/0.2 weighting: plan() and
+                    // rankAt() read it as a cost, and this must not move
+                    // routing decisions.
+                    rttvars.set(from, 0.75 * (rttvars.get(from) ?? rtt / 2) + 0.25 * Math.abs(rtt - prev));
+                    rtts.set(from, 0.8 * prev + 0.2 * rtt);
+                }
+                acked(w.waits > 0);
                 clearAck(key);
             }
             return;
@@ -1229,7 +1344,7 @@ export function makeRouter({
 
         const sent = (async () => {
             for (let i = 0; i < ids.length; i += T_MAX) {
-                while (!closed && waiting.size >= prefillWindow) await new Promise((res) => { wake = res; });
+                while (!closed && waiting.size >= window()) await new Promise((res) => { wake = res; });
                 if (!closed && cancellable && isCancelled()) {
                     f.fail(Object.assign(new Error('rebuild cancelled'), { cancelled: true }));
                 }
@@ -1334,6 +1449,16 @@ export function makeRouter({
     // job that reopens the loop. It resolves once the stream has taken that
     // answer and added the context to the history.
     async function rebuild(ids, opts, reason, err = null, finish = null) {
+        // Only for a rebuild after a failure, and only from the second one on:
+        // `reason` 'resume' and 'rewind' are not failures, and the first
+        // attempt must stay prompt. `repairs` was incremented by the caller.
+        if (err && repairs > 1 && rebuildBackoff > 0) {
+            await new Promise((res) => setTimeout(res, rebuildBackoff * (repairs - 1)));
+            if (isCancelled()) {
+                throw Object.assign(new Error('rebuild cancelled'), { cancelled: true });
+            }
+        }
+
         const c = conv;
         const ctx = [...c.history, ...ids];
         const done = onRepair(err, ctx.length, reason);
@@ -1726,6 +1851,7 @@ export function makeRouter({
 
         // Live maps, for tests and diagnostics.
         plan, hops, routes, upstream, outbound, fixes, acks, pending, fills, links, heading, streams,
+        rtts, rttvars,
 
         get session() { return conv.session; },
         get conversation() { return conv; },
@@ -1737,6 +1863,11 @@ export function makeRouter({
         get loads() { return new Map(loads); },
         get repairs() { return repairs; },
         get repaired() { return repaired; },   // hand-offs fixed for other peers
+        // How much the ack wait has had to absorb. `extended`: waits re-armed
+        // because the channel was open but silent — packet loss, or a far
+        // relayed link. `dead`: waits that reached ackCap and were treated as
+        // a failure anyway. `backoff`/`window`: the prefill window in force.
+        get congestion() { return { extended, dead, backoff, window: window() }; },
         get eos() { return eos; },
         set eos(v) { eos = v; },
         get hybrid() { return hybrid; },

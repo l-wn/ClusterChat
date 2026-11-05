@@ -847,6 +847,19 @@ export class Mesh {
 
     #live(id) { return this.links.get(id)?.ch?.readyState === 'open'; }
 
+    // Whether a message already sent on this link can still be expected to
+    // arrive: the channel is open and #linkFailed has not marked the link
+    // dead (ICE failed, or the channel closed). route.js's ack wait uses this
+    // to tell a link that is merely slow or lossy from one that is gone.
+    //
+    // Separate from linked()/#live(), which decide whether to *send*: a send
+    // on a link about to be replaced is harmless, whereas waiting out a dead
+    // one costs a whole session.
+    alive(id) {
+        const link = this.links.get(id);
+        return link?.ch?.readyState === 'open' && !link.dead;
+    }
+
     // Ask the signaling server for a seat before a reply generates. Resolves
     // { ok, max }: ok false means the mesh already has `max` replies
     // generating. With no answer within SEAT_WAIT_MS, or no open socket, it
