@@ -416,6 +416,8 @@ console.log(`  people chatting: ${Number.isFinite(MAX_PEOPLE) ? MAX_PEOPLE : 'no
         ? `${Math.round(PEOPLE_IDLE_MS / 60000)} min` : `${PEOPLE_IDLE_MS / 1000} s`} idle`);
 console.log(`  chats in memory per peer: ${MESH_SESSIONS} in the global mesh, `
     + `at most ${MAX_PRIVATE_SESSIONS} in a private one`);
+console.log(`  shared prefixes per peer: ${MESH_SNAPS} in the global mesh, `
+    + `at most ${MAX_PRIVATE_SNAPS} in a private one`);
 console.log(`  context: ${MESH_CTX} tokens in the global mesh, at most ${MAX_PRIVATE_CTX} in a private one`);
 if (OWN_TURN) console.log(`  TURN: ${TURN_URLS.join(', ')} (a credential per peer)`);
 else if (TURN_SECRET || TURN_URLS.length) console.warn('TURN_SECRET and TURN_URLS go together. '
