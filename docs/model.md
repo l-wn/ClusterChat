@@ -176,6 +176,28 @@ blocks that job crosses alone. See architecture.md, *Sharing a prefix*, for the
 probe, the lease that holds a page between the answer and the first chunk, and
 why a rewind into a page two chats hold is refused.
 
+**A hybrid checkpoint shares a snapshot, not pages.** A linear_attention block
+has no position axis — its state folds in everything fed so far — so a prefix
+cannot be paged out of it. What is shareable is the whole state at one
+position: `S` and the three conv rings, per linear block, which is what
+`makeRecurrentState` allocates and what `#snapSlot` keeps a few of
+(`SNAP_SLOTS`, 50 MiB for the whole of Qwen3.5-4B against the
+`recurrentStateBytes * SESSIONS` every peer already reserves for frames). A
+page from a range crossing a linear block is still keyed, since its
+full_attention rows are a pure function of the ids and the path either way;
+what the snapshot adds is the other half, and `probe()` offers the prefix only
+when it has both at the same position.
+
+The position has to be where two prompts diverge, and the prompt that fills the
+cache first cannot know it — only a probe carrying both prefixes' hashes does.
+So a peer learns it from a miss: a probe that finds pages and no snapshot
+records the key it wanted, and the next pass to end exactly there takes one.
+The prompt that asked pays in full and the one after it adopts, which is also
+the retry an agent makes when it abandons a slow request. Snapshots are ranked
+by how often they are adopted, held while a probe has promised one, and dropped
+with the page index when a claim grows, since both are indexed by a block
+layout that just changed.
+
 ## Gated DeltaNet block (Qwen3.8-27B linear attention)
 
 No KV cache: each session carries a fixed-size recurrent state per layer,

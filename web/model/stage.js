@@ -25,7 +25,7 @@ import { sampleFromLogitsRow } from './generate.js';
 import { sampleFromCandidates, candidatesFor, TOPK_MAX } from './sampling.js';
 import { toF16, fromF16 } from '../f16.js';
 import { positions, blockRange, kvRowBytes, PAGE_TOKENS, IDLE_MS, WAIT_MS, LEASE_MS,
-         SPEC_COLS } from '../split.js';
+         SNAP_SLOTS, SPEC_COLS } from '../split.js';
 
 // The session id a warm-up pass runs under. Peer-minted ids are
 // `${peerId}-${base36}`, so it cannot collide with a chat.
@@ -97,6 +97,15 @@ function makeWarmKernel(device) {
 // A replay layer's buffers (model.js makeReplayLayer).
 const SLOT_BUFS = ['S', 'histQ', 'histK', 'histV', 'linQ', 'linK', 'linV', 'linA', 'linB'];
 
+// One linear_attention block's recurrent state (model.js makeRecurrentState),
+// which is what a shared prefix snapshot holds and what it is copied into.
+const RECUR_BUFS = ['S', 'histQ', 'histK', 'histV'];
+
+// Keys a probe may have asked a snapshot for, as a multiple of the slots: a
+// little history, so a prefix probed for twice is still remembered when the
+// pass that could snapshot it finally arrives, and no more.
+const WANTED_SLACK = 4;
+
 // Thrown by #cacheFor for a job that must wait for a frame. The queue catches
 // it and parks the job. Never leaves this file.
 const WAIT = new Error('waiting for a session frame');
@@ -109,7 +118,7 @@ export class Runner {
     constructor(device, d, w, { lo, hi, have = hi, nMax, tMax, slots = 5,
                                 sessions = slots, pageTokens = PAGE_TOKENS,
                                 idleMs = IDLE_MS, waitMs = WAIT_MS, leaseMs = LEASE_MS,
-                                specSlots = slots,
+                                specSlots = slots, snapSlots = SNAP_SLOTS,
                                 keepWarmMs = 0, batchRows = GEMV_ROWS_MAX, share = true,
                                 peerId = '' }) {
         const [blockLo, blockHi] = blockRange(lo, hi, d.n_layer);
@@ -229,7 +238,10 @@ export class Runner {
                         // chat that did not compute them, and adopts refused
                         // because the lease was gone by the time the job came
                         // (#probe, #cacheFor).
-                        probed: 0, adopted: 0, adoptRefused: 0 };
+                        probed: 0, adopted: 0, adoptRefused: 0,
+                        // Recurrent snapshots taken for a prefix a probe asked
+                        // for, and sessions started from one (#snapIfWanted).
+                        snapped: 0, snapAdopted: 0 };
 
         // Speculative decoding's replay slots (see #specSlot()): at most
         // `specSlots` sessions speculate through this Runner's linear_attention
@@ -247,10 +259,25 @@ export class Runner {
         // This peer's id, which goes in a page's key: see #pageKey().
         this.peerId = peerId;
         // Pages a probe has promised a session but no frame holds yet:
-        // session -> { pages, at }, one per session. See probe() and
+        // session -> { pages, snap, at }, one per session. See probe() and
         // split.js's LEASE_MS.
         this.leases = new Map();
         this.leaseMs = leaseMs;
+
+        // Shared prefix snapshots of the linear_attention blocks' recurrent
+        // state: key -> { layers, at, bytes, hits, leased }. A Gated DeltaNet
+        // layer has no position axis, so a prefix cannot be paged out of it
+        // the way KV can — what is shareable is the whole state at one
+        // position, and this is that. See #snapSlot() and split.js's
+        // SNAP_SLOTS.
+        this.snapSlots = snapSlots;
+        this.snaps = new Map();
+        // Keys a probe asked for and found no snapshot behind, with the
+        // position each wants: key -> at. Where two prompts diverge is known
+        // only to the probe that carries both prefixes' hashes, and a first
+        // prompt cannot guess it, so the peer learns where to snapshot from
+        // the miss and takes one the next time a pass ends there.
+        this.wanted = new Map();
 
         // Keep-warm (see KEEP_WARM_MS). 0 turns it off.
         this.keepWarmMs = keepWarmMs;
@@ -275,6 +302,7 @@ export class Runner {
         for (const frame of this.live.values()) bytes += frame.bytes;
         if (this.warm) bytes += this.warm.bytes;
         for (const slot of [...this.specFree, ...this.specLive.values()]) bytes += slot.bytes;
+        for (const snap of this.snaps.values()) bytes += snap.bytes;
         if (this.specReadback) bytes += this.specReadback.size;
         if (this.topk) bytes += this.topk.bytes;
         if (this.warmKernel) bytes += this.warmKernel.bytes;
@@ -530,6 +558,7 @@ export class Runner {
             this.#specGrow(true);
             // Every page now has a layer it holds nothing for.
             this.#indexClear();
+            this.#snapClear();
             this.blocks++;
             this.blockLo--;
         }
@@ -605,6 +634,7 @@ export class Runner {
             this.#specGrow(false);
             // Every page now has a layer it holds nothing for.
             this.#indexClear();
+            this.#snapClear();
             this.blocks++;
         }
         this.hi++;
@@ -1033,14 +1063,28 @@ export class Runner {
         // A reused frame holds the previous session's state. For KV that is
         // harmless: scatter_kv overwrites every row before attention reads it.
         // Recurrent state is accumulated, not overwritten, so it is cleared
-        // before a new session uses the frame.
+        // before a new session uses the frame — or, for a session adopting a
+        // prefix, replaced by the snapshot of that prefix's state, which is
+        // the recurrent half of what a page gives the full_attention blocks.
         const stale = cache.recurrent.some(Boolean) && cache.used;
-        if (stale) {
+        if (adopt?.snap) {
+            this.#copyRecurrent(adopt.snap.layers, cache.recurrent, 'adopt recurrent state');
+            this.counts.snapAdopted++;
+        } else if (stale) {
             const enc = this.device.createCommandEncoder({ label: 'clear recurrent state' });
             for (const rc of cache.recurrent) {
                 if (!rc) continue;
-                for (const buf of [rc.S, rc.histQ, rc.histK, rc.histV]) enc.clearBuffer(buf);
+                for (const buf of RECUR_BUFS) enc.clearBuffer(rc[buf]);
             }
+            this.device.queue.submit([enc.finish()]);
+        }
+        // The trunk row the MTP draft head pairs with this session's first
+        // position. A reused frame inherits the previous tenant's, which is
+        // meaningless either way, but an adopting session's first fill reads
+        // it, so start it from zero rather than from another chat.
+        if (adopt && cache.mtpH) {
+            const enc = this.device.createCommandEncoder({ label: 'clear mtp row' });
+            enc.clearBuffer(cache.mtpH);
             this.device.queue.submit([enc.finish()]);
         }
         cache.used = true;
@@ -1230,8 +1274,13 @@ export class Runner {
     // ended on a page boundary, so `hash` names exactly the ids the context
     // holds up to that point. Never from a replay, a verify or a rollback, and
     // never from a range that crosses no block at all (a head-only or
-    // embedding-only hop writes no KV) or one that crosses a linear_attention
-    // block, whose recurrent state lives on the frame and is not shared.
+    // embedding-only hop writes no KV).
+    //
+    // A range crossing a linear_attention block *is* keyed. The page holds
+    // the full_attention rows, which are a pure function of the ids and the
+    // path either way; what a linear block cannot give back is handled on the
+    // read side, where an adopt needs a recurrent snapshot at the same
+    // position before probe() will offer the prefix at all.
     //
     // Every whole page the pass completed is keyed, not only its last, with the
     // logical page index in the key. `hash` names the context up to the pass's
@@ -1248,13 +1297,10 @@ export class Runner {
         for (let j = Math.floor(h.past / P); j < cache.owned.length; j++) {
             if (dropIndex(this.pool, pageAt(cache, j))) this.counts.indexDropped++;
         }
-        if (!this.share || was !== h.past || first >= last) return;
-        if (h.hash === undefined || h.replay || h.rb || h.drafts != null) return;
+        if (!this.share || was !== h.past || first >= last) return undefined;
+        if (h.hash === undefined || h.replay || h.rb || h.drafts != null) return undefined;
         const end = h.past + n;
-        if (end % P !== 0) return;
-        for (let p = first; p < last; p++) {
-            if (!this.pool.K[p - 1 - this.blockLo]) return;   // linear_attention
-        }
+        if (end % P !== 0) return undefined;
         const key = this.#pageKey(h, to);
         // From where the pass started to the last page it completed. Pages
         // below that were completed by an earlier pass and keyed by it; the
@@ -1263,10 +1309,13 @@ export class Runner {
         // it ends on, which is why this starts where the drop loop does.
         for (let j = Math.floor(h.past / P); j < end / P; j++) {
             const page = pageAt(cache, j);
-            if (page === undefined) return;
+            if (page === undefined) return undefined;
             putIndex(this.pool, `${key}#${j}`, page);
             this.counts.indexed++;
         }
+        // The key this pass keyed its pages under, so a recurrent snapshot of
+        // the same prefix is taken under the same one.
+        return key;
     }
 
     // The chunk whose pass keys logical page `j`, and so which of a prompt's
@@ -1307,12 +1356,18 @@ export class Runner {
         // one, and this session already has rows of its own.
         if (this.live.has(h.s)) return 0;
         const first = Math.max(h.pos, 1), last = Math.min(to, this.d.n_layer + 1);
-        // A hop that crosses no block writes no KV, and a linear_attention
-        // block's recurrent state lives on the frame and is not shared. Both
-        // mirror #indexPages, so the index is self-consistently adoptable.
+        // A hop that crosses no block writes no KV, so there is nothing to
+        // hand over. Mirrors #indexPages, so the index stays self-consistently
+        // adoptable.
         if (first >= last) return 0;
-        for (let p = first; p < last; p++) {
-            if (!this.pool.K[p - 1 - this.blockLo]) return 0;
+        // Whether this hop crosses a linear_attention block, whose recurrent
+        // state has no position axis and so cannot be paged. Those blocks need
+        // a snapshot of the whole state at the answer's position, or the
+        // adopting session would run with its full_attention layers warm and
+        // its recurrent ones empty — wrong tokens and no error.
+        let recur = false;
+        for (let p = first; p < last && !recur; p++) {
+            if (!this.pool.K[p - 1 - this.blockLo]) recur = true;
         }
         const P = this.pool.pageTokens, T = this.tMax;
         if (P % T && T % P) return 0;         // no page boundary is a chunk boundary
@@ -1335,10 +1390,41 @@ export class Runner {
         // Answer only where a page boundary and a chunk boundary coincide, so
         // the number means the same on this peer and on the enqueuer.
         const span = Math.max(P, T);
-        const n = Math.floor(pages.length * P / span) * span / P;
+        let n = Math.floor(pages.length * P / span) * span / P;
+
+        // With a linear block in range the answer is capped at the deepest
+        // position a snapshot exists for, searched down from the pages' own
+        // reach: a shallower snapshot is still usable, a deeper one is not.
+        // A snapshot is keyed exactly as this prefix's pages are, without the
+        // page index: #chunkFor(m - 1)'s hash names the context up to m pages,
+        // so the key fixes the position and the two sides cannot drift.
+        const snapKey = (m) => this.#pageKey({ ...h, hash: h.hashes[this.#chunkFor(m - 1)] }, to);
+        // Every position a snapshot exists for, not only the deepest: the
+        // answer is the minimum over the whole path, so another peer may cut
+        // this prefix shorter, and then the state has to come from a snapshot
+        // at *that* position. There are at most `snapSlots` of them, and the
+        // adopting job carries no hashes to look one up with later.
+        const snaps = new Map();
+        if (recur) {
+            const step = span / P;
+            let deepest = 0;
+            for (let m = n; m >= step; m -= step) {
+                const snap = this.#snapFor(snapKey(m));
+                if (!snap) continue;
+                snaps.set(m, snap);
+                deepest ||= m;
+            }
+            // Nothing to restore the state from. Remember where this prompt
+            // wanted one, so the next pass that ends there takes it.
+            if (!deepest) {
+                if (n) this.#wantSnap(snapKey(n), n);
+                return 0;
+            }
+            n = deepest;
+        }
         if (!n) return 0;
 
-        this.#lease(h.s, pages.slice(0, n));
+        this.#lease(h.s, pages.slice(0, n), snaps, recur);
         this.counts.probed++;
         return n * P / T;
     }
@@ -1351,6 +1437,104 @@ export class Runner {
         const i = this.#chunkFor(0);
         if (i >= h.hashes.length) return false;
         return this.pool.index.has(`${this.#pageKey({ ...h, hash: h.hashes[i] }, to)}#0`);
+    }
+
+    // --- Shared prefix snapshots of the recurrent state ---
+
+    // The snapshot a prefix key names, counting the hit, or undefined.
+    #snapFor(key) {
+        const snap = this.snaps.get(key);
+        if (snap) { snap.hits++; snap.at = performance.now(); }
+        return snap;
+    }
+
+    // Remember that a probe wanted a snapshot at `key` and did not find one.
+    // Bounded by the slot count times a little slack: a client cannot make
+    // this peer remember an unbounded number of prefixes by probing.
+    #wantSnap(key, pages) {
+        if (this.wanted.has(key)) return;
+        if (this.wanted.size >= this.snapSlots * WANTED_SLACK) {
+            this.wanted.delete(this.wanted.keys().next().value);
+        }
+        this.wanted.set(key, pages);
+    }
+
+    // A set of per-linear-block recurrent buffers to snapshot into: a free
+    // one, or the lowest-ranked snapshot nothing holds, or a new allocation.
+    // Null when there is no room, which is not an error — the prefix simply
+    // stays unshared and the next prompt feeds it in full.
+    //
+    // Ranked by hits, like a cache: a prefix adopted often outranks one
+    // adopted once. `leased` holds the snapshot a probe has already promised.
+    async #snapSlot() {
+        if (this.snaps.size >= this.snapSlots) {
+            let worst = null, low = null;
+            for (const [k, snap] of this.snaps) {
+                if (snap.leased) continue;          // promised to a probe already
+                if (!low || snap.hits < low.hits
+                    || (snap.hits === low.hits && snap.at < low.at)) { worst = k; low = snap; }
+            }
+            if (!low) return null;
+            this.snaps.delete(worst);
+            low.hits = 0;
+            return low;
+        }
+        const { device } = this;
+        device.pushErrorScope?.('out-of-memory');
+        const layers = [];
+        let bytes = 0;
+        for (let i = 0; i < this.blocks; i++) {
+            const kind = this.d.layer_types?.[this.blockLo + i] ?? 'full_attention';
+            if (kind !== 'linear_attention') { layers.push(null); continue; }
+            layers.push(makeRecurrentState(device, this.d));
+            bytes += recurrentStateBytes(this.d);
+        }
+        const oom = await device.popErrorScope?.();
+        if (oom) {
+            for (const rc of layers) if (rc) for (const b of RECUR_BUFS) rc[b].destroy();
+            return null;
+        }
+        return { layers, bytes, hits: 0, at: 0, leased: 0 };
+    }
+
+    // Copy a session's recurrent state into a snapshot, or a snapshot back
+    // into a session's. Whole buffers, whose sizes are read off the buffers
+    // themselves, so there is no geometry to get wrong — the same shape as
+    // model.js's snapSpec/restoreSpec, outside a pass because nothing else of
+    // this session runs until its next job.
+    #copyRecurrent(from, to, label) {
+        const enc = this.device.createCommandEncoder({ label });
+        for (let i = 0; i < to.length; i++) {
+            const src = from[i], dst = to[i];
+            if (!src || !dst) continue;
+            for (const b of RECUR_BUFS) enc.copyBufferToBuffer(src[b], 0, dst[b], 0, dst[b].size);
+        }
+        this.device.queue.submit([enc.finish()]);
+    }
+
+    // Take a snapshot of this session's recurrent state, if a probe asked for
+    // one at exactly this key. Called where a page is keyed, so every rule
+    // #indexPages applies to a page applies here too.
+    async #snapIfWanted(cache, key) {
+        if (!this.wanted.has(key) || this.snaps.has(key)) return;
+        if (!cache.recurrent.some(Boolean)) return;      // nothing recurrent to snapshot
+        const slot = await this.#snapSlot();
+        if (!slot) return;
+        this.wanted.delete(key);
+        this.#copyRecurrent(cache.recurrent, slot.layers, `snapshot prefix ${key}`);
+        this.snaps.set(key, slot);
+        this.counts.snapped++;
+    }
+
+    // Everything the snapshots held. Called where the block layout changes: a
+    // snapshot's layers are indexed by local block, so none of them lines up
+    // any more.
+    #snapClear() {
+        for (const snap of this.snaps.values()) {
+            for (const rc of snap.layers) if (rc) for (const b of RECUR_BUFS) rc[b].destroy();
+        }
+        this.snaps.clear();
+        this.wanted.clear();
     }
 
     // The pages this job may adopt, or null if it may not.
@@ -1366,13 +1550,23 @@ export class Runner {
         const want = h.adopt * this.tMax / this.pool.pageTokens;
         if (!Number.isInteger(want) || want < 1 || want > lease.pages.length) return null;
         if (h.past !== h.adopt * this.tMax) return null;
-        return { pages: lease.pages.slice(0, want) };
+        // With a linear block in range the pages are only half the state: the
+        // recurrent side has to come from a snapshot at exactly this position,
+        // or the session would run with its full_attention layers warm and its
+        // recurrent ones empty.
+        const snap = lease.snaps?.get(want);
+        if (lease.recur && !snap) return null;
+        return { pages: lease.pages.slice(0, want), snap };
     }
 
-    #lease(session, pages) {
+    #lease(session, pages, snaps = new Map(), recur = false) {
         this.#unlease(session);
         refPages(this.pool, pages);
-        this.leases.set(session, { pages, at: performance.now() });
+        // A snapshot under lease is not reclaimed by #snapSlot, for the same
+        // reason a leased page is not reclaimed by #pagesFor: the probe has
+        // already promised it.
+        for (const snap of snaps.values()) snap.leased++;
+        this.leases.set(session, { pages, snaps, recur, at: performance.now() });
     }
 
     // Drop one session's lease, if it has one. Returns whether it did.
@@ -1381,6 +1575,7 @@ export class Runner {
         if (!lease) return false;
         this.leases.delete(session);
         unrefPages(this.pool, lease.pages);
+        for (const snap of lease.snaps?.values() ?? []) snap.leased--;
         return true;
     }
 
@@ -1768,6 +1963,9 @@ export class Runner {
             this.counts.batched++;
             this.counts.batchedJobs += plans.length;
         }
+        // Prefixes a probe asked for a recurrent snapshot of, taken once the
+        // readback below has confirmed the pass. See #snapIfWanted().
+        const toSnap = [];
         for (const plan of plans) {
             const { h, T: n, cache, verify, first: f, last: l } = plan;
             if (h.s === WARMUP) continue;
@@ -1778,7 +1976,8 @@ export class Runner {
                 if (verify) cache.specAt.set(p - 1, { base: h.past, n });
                 else cache.specAt.delete(p - 1);
             }
-            this.#indexPages(plan, was);
+            const key = this.#indexPages(plan, was);
+            if (key !== undefined) toSnap.push([plan.cache, key]);
         }
 
         // A replay that reached the end returns neither a token nor a hidden
@@ -1797,6 +1996,14 @@ export class Runner {
             out = new Float32Array(readback.getMappedRange(0, bytes).slice(0));
             readback.unmap();
         }
+        // A linear_attention block cannot give a prefix back the way a page
+        // can, so what a later chat needs is the whole state at this position.
+        // Taken after the readback, not before it: the pass is settled, the
+        // copy is off the path of this job's own answer, and a model of the
+        // buffers' contents (tools/mesh.test.mjs) sees the pass's rows in them
+        // by now. Only for a prefix a probe asked for — the copy is cheap but
+        // the slots are few, and only a probe knows where two prompts diverge.
+        for (const [cache, key] of toSnap) await this.#snapIfWanted(cache, key);
         const t4 = performance.now();
         const gpu = prof?.collect();
         const c1 = counters();

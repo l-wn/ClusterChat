@@ -58,6 +58,8 @@ export const marker = (tag) => ({ __tag: tag, ...mappable(1 << 16) });
 export function makeGpu({ timestamps = false, fallback = null } = {}) {
     let trace = [];
     const passes = { opened: 0, timed: 0, resolved: 0, cleared: 0 };
+    const moves = [];
+    let done = null;
     // The contents of the next readback. The stub does no arithmetic, so a
     // caller that wants specific values from a run sets them here, and #run
     // reads them as the GPU's output. Cleared after one readback; with nothing
@@ -114,12 +116,23 @@ export function makeGpu({ timestamps = false, fallback = null } = {}) {
             },
             resolveQuerySet() { passes.resolved++; },
             // Clearing a reused session's recurrent state (stage.js's
-            // #cacheFor, or a restart from past 0 in #run). The stub does not
-            // read buffer contents, so it only counts the call.
-            clearBuffer() { passes.cleared++; },
-            copyBufferToBuffer() {}, finish: () => ({}),
+            // #cacheFor, or a restart from past 0 in #run), and copying one
+            // (a shared prefix snapshot, #copyRecurrent). The stub holds no
+            // buffer contents, so it records which buffers moved and leaves it
+            // to the caller's model of their contents to follow — the way
+            // mesh.test.mjs's recurrent ledger does.
+            clearBuffer(buf) { passes.cleared++; moves.push({ clear: buf }); },
+            copyBufferToBuffer(src, _so, dst) { moves.push({ src, dst }); },
+            finish: () => ({}),
         }),
-        queue: { writeBuffer() {}, submit() {}, onSubmittedWorkDone: async () => {} },
+        queue: {
+            writeBuffer() {}, submit() {},
+            // A job that reads nothing back waits on this instead
+            // (stage.js #pass's `filling` branch). A caller modelling the
+            // pass's output hooks it here, so its model lands at the same
+            // point in the pass that a readback would.
+            onSubmittedWorkDone: async () => { done?.(); },
+        },
     };
     return {
         device,
@@ -129,6 +142,11 @@ export function makeGpu({ timestamps = false, fallback = null } = {}) {
         allocated: () => allocated,
         // Everything the run used, collapsed. The usual way to read a trace.
         takeTrace: () => collapse(trace),
+        // Buffers cleared or copied since the last call, in order. A caller
+        // modelling buffer contents applies these to keep up.
+        takeMoves: () => moves.splice(0),
+        // Called where a job that reads nothing back waits for the GPU.
+        setDone: (fn) => { done = fn; },
         passes,
     };
 }

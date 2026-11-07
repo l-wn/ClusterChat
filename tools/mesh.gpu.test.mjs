@@ -1434,7 +1434,8 @@ function verdict(rows, reference) {
             `${sum('indexDropped')} dropped, ` +
             `${w.map((x) => x.runner.indexSize ?? 0).join('/')} held, ` +
             `${sum('probed')} probed, ${sum('adopted')} adopted, ` +
-            `${sum('adoptRefused')} refused`);
+            `${sum('adoptRefused')} refused, ${sum('snapped')} snapshots, ` +
+            `${sum('snapAdopted')} restored`);
     }
 
     // The read side must actually have fired somewhere, or the `share` row

@@ -664,6 +664,12 @@ never sent**: no job, no payload, no GPU pass, anywhere on the line.
   The peer at position 0 checks a hash against the ids of every chunk before it,
   and it has none of the adopted ones. What such a prompt does not key is its
   own divergent tail, since everything it shares it has already adopted.
+- **A hybrid checkpoint needs a recurrent snapshot as well**, because a
+  linear_attention block's state has no position axis to page. Both halves are
+  keyed the same way and `probe()` offers a prefix only when it holds both at
+  one position, so a peer on older code — which keys no hybrid page at all —
+  simply answers 0 and the minimum protects the path. See model.md, *Shared
+  prefixes*, for how a peer learns which position to snapshot.
 - **Adoption is across enqueuers.** A chat may adopt pages another tab produced,
   which is what makes several agent sessions in different directories share
   their prompt — they can never share a chat, because the system prompt carries

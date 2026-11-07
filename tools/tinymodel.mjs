@@ -29,6 +29,7 @@ const flag = (name, fallback) => {
     return i < 0 ? fallback : argv[i + 1];
 };
 const num = (name, fallback) => Number(flag(name, fallback));
+const has = (name) => argv.includes(`--${name}`);
 
 // The defaults give a whole model in ~1.3 MB, with a shape that uses every
 // path in model.js: GQA (n_head > n_kv_head), an even head_dim for RoPE's
@@ -51,6 +52,18 @@ const N_POS    = num('n-pos', 4096);
 // kept strong. SwiGLU's output has a nonzero mean direction that accumulates
 // over blocks into a constant, and a constant in the residual stream makes one
 // LM-head row win for every input.
+// A hybrid checkpoint: Gated DeltaNet on most layers, full attention on every
+// fourth, as Qwen3.5-4B and Qwen3.8-27B are published. Without this the repo
+// has no real-GPU coverage of the linear_attention kernels at all, and none of
+// the recurrent-state buffer copies a shared prefix snapshot makes.
+const HYBRID = has('hybrid');
+// Gated DeltaNet's widths. `valueDim` is `hidden` so out_proj is square, and
+// nV/nK is the value-head repeat factor the kernels expect.
+const LIN_DV = num('linear-head-dim', 16);
+const LIN_NV = num('linear-value-heads', HIDDEN / LIN_DV);
+const LIN_NK = num('linear-key-heads', Math.max(1, LIN_NV / 2));
+const LIN_K4 = num('linear-conv', 4);
+
 const ATTN_SCALE = num('attn-scale', 0.6);
 const MLP_SCALE  = num('mlp-scale', 0.25);
 // How peaked attention is. Random q/k projections give scores of order 1, so
@@ -291,8 +304,68 @@ bytes += write('lm_head.bin', [
     { name: 'lm_head', shape: [VOCAB, H], data: shifted(wte, VOCAB, H) },
 ]);
 
+// Which kind each block is. A hybrid checkpoint runs Gated DeltaNet on most
+// layers and full attention on every fourth, which is how Qwen3.5-4B and
+// Qwen3.8-27B are published (`...F...F...`). Most ranges a peer can claim are
+// therefore mixed, which is the case worth testing.
+const LAYER_TYPES = HYBRID
+    ? Array.from({ length: N_LAYER }, (_, i) => (i % 4 === 3 ? 'full_attention' : 'linear_attention'))
+    : null;
+
+// A depthwise causal conv that mostly passes the current row through: the last
+// tap is the current token (output[t] reads x[t-K+1..t]), so weight it 1 and
+// leave the history taps small. An all-random conv of width 4 attenuates the
+// signal the recurrence is supposed to carry.
+const convW = (dim, k) => {
+    const a = new Float32Array(dim * k);
+    for (let r = 0; r < dim; r++) {
+        for (let j = 0; j < k; j++) a[r * k + j] = j === k - 1 ? 1 : normal(0.1);
+    }
+    return a;
+};
+
+// A_log and dt_bias, concatenated as the converter packs them
+// (tools/convert_hf.py's linear_attn_layer_tensors). The decay per token is
+// `g = exp(-exp(A_log) * softplus(a + dt_bias))`, and with `a` near zero that
+// is exp(-exp(A_log) * 0.693). A_log -3 gives g ~= 0.966: the state remembers
+// a few dozen tokens, so the reply depends on the prefix, which is what the
+// GPU suite's oracle checks and what a shared snapshot has to reproduce.
+const gateParams = (nV) => {
+    const a = new Float32Array(2 * nV);
+    for (let i = 0; i < nV; i++) { a[i] = -3; a[nV + i] = 0; }
+    return a;
+};
+
+const linKeyDim = LIN_NK * LIN_DV, linValueDim = LIN_NV * LIN_DV;
+
 for (let i = 0; i < N_LAYER; i++) {
     const fn = `block_${String(i).padStart(2, '0')}.bin`;
+    if (LAYER_TYPES?.[i] === 'linear_attention') {
+        // Names and shapes from web/model/loader.js's linearAttnBlockShapes().
+        // q and k are l2-normalised per head by the kernel, so their scale
+        // does not matter; b and a are kept small so beta ~= 0.5 and the decay
+        // stays near the gate_params value above.
+        bytes += write(fn, [
+            { name: 'input_layernorm',          shape: [H],                   data: ones(H) },
+            { name: 'post_attention_layernorm', shape: [H],                   data: ones(H) },
+            { name: 'in_proj_q',   shape: [linKeyDim, H],   data: proj(linKeyDim, H, QK_SCALE) },
+            { name: 'in_proj_k',   shape: [linKeyDim, H],   data: proj(linKeyDim, H, QK_SCALE) },
+            { name: 'in_proj_v',   shape: [linValueDim, H], data: proj(linValueDim, H) },
+            { name: 'in_proj_z',   shape: [linValueDim, H], data: proj(linValueDim, H) },
+            { name: 'in_proj_b',   shape: [LIN_NV, H],      data: proj(LIN_NV, H, 0.5) },
+            { name: 'in_proj_a',   shape: [LIN_NV, H],      data: proj(LIN_NV, H, 0.5) },
+            { name: 'conv1d_q',    shape: [linKeyDim, LIN_K4],   data: convW(linKeyDim, LIN_K4) },
+            { name: 'conv1d_k',    shape: [linKeyDim, LIN_K4],   data: convW(linKeyDim, LIN_K4) },
+            { name: 'conv1d_v',    shape: [linValueDim, LIN_K4], data: convW(linValueDim, LIN_K4) },
+            { name: 'gate_params', shape: [2 * LIN_NV],     data: gateParams(LIN_NV) },
+            { name: 'gated_norm',  shape: [LIN_DV],         data: ones(LIN_DV) },
+            { name: 'out_proj',    shape: [H, linValueDim], data: attnOut(H, linValueDim) },
+            { name: 'gate_proj',                shape: [FFN, H],   data: proj(FFN, H) },
+            { name: 'up_proj',                  shape: [FFN, H],   data: proj(FFN, H) },
+            { name: 'down_proj',                shape: [H, FFN],   data: mlpOut(H, FFN) },
+        ]);
+        continue;
+    }
     bytes += write(fn, [
         { name: 'input_layernorm',          shape: [H],         data: ones(H) },
         { name: 'q_proj',                   shape: [qDim, H],   data: proj(qDim, H, QK_SCALE) },
@@ -303,11 +376,20 @@ for (let i = 0; i < N_LAYER; i++) {
         { name: 'gate_proj',                shape: [FFN, H],    data: proj(FFN, H) },
         { name: 'up_proj',                  shape: [FFN, H],    data: proj(FFN, H) },
         { name: 'down_proj',                shape: [H, FFN],    data: mlpOut(H, FFN) },
+        // A hybrid checkpoint's full_attention blocks are gated and
+        // QK-normalised (loader.js's fullAttnBlockShapes). `attn_gate` goes
+        // through sigmoid and multiplies the attention output, so a zero-mean
+        // gate leaves about half of it: scaled like any other projection.
+        ...(HYBRID ? [
+            { name: 'attn_gate', shape: [qDim, H],     data: proj(qDim, H) },
+            { name: 'q_norm',    shape: [HEAD_DIM],    data: ones(HEAD_DIM) },
+            { name: 'k_norm',    shape: [HEAD_DIM],    data: ones(HEAD_DIM) },
+        ] : []),
     ]);
 }
 
 const manifest = {
-    model: `tiny-test-${N_LAYER}L-${H}h`,
+    model: `tiny-test-${N_LAYER}L-${H}h${HYBRID ? '-hybrid' : ''}`,
     arch: 'llama',
     hidden: H,
     n_layer: N_LAYER,
@@ -329,13 +411,26 @@ const manifest = {
     chat_format: 'chatml',
     bos_token_id: tk.bos,
     eos_token_id: tk.eos,
+    // A hybrid checkpoint. loader.js reads `layer_types` to decide each
+    // block's kind, and the `linear_*` widths to size the recurrent state.
+    ...(HYBRID && {
+        layer_types: LAYER_TYPES,
+        linear_num_key_heads: LIN_NK,
+        linear_num_value_heads: LIN_NV,
+        linear_key_head_dim: LIN_DV,
+        linear_value_head_dim: LIN_DV,
+        linear_conv_kernel_dim: LIN_K4,
+    }),
     // Not read by any code. Records how this checkpoint was generated.
-    generated_by: `tools/tinymodel.mjs --seed ${SEED}`,
+    generated_by: `tools/tinymodel.mjs --seed ${SEED}${HYBRID ? ' --hybrid' : ''}`,
     files,
 };
 
 writeFileSync(`${OUT}/manifest.json`, `${JSON.stringify(manifest, null, 1)}\n`);
 writeFileSync(`${OUT}/tokenizer/tokenizer.json`, `${JSON.stringify(tk.json)}\n`);
 
-console.log(`${OUT}: ${manifest.model}, ${N_LAYER} blocks over ${N_LAYER + 2} positions, ` +
+const kinds = LAYER_TYPES
+    ? ` (${LAYER_TYPES.filter((k) => k === 'linear_attention').length} linear, `
+        + `${LAYER_TYPES.filter((k) => k === 'full_attention').length} full)` : '';
+console.log(`${OUT}: ${manifest.model}, ${N_LAYER} blocks${kinds} over ${N_LAYER + 2} positions, ` +
     `vocab ${VOCAB}, ${(bytes / 1024).toFixed(0)} KiB of weights (seed ${SEED})`);

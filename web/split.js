@@ -110,6 +110,18 @@ export function runnerSessions(asked, mesh) {
 // reclaimed after this long.
 export const IDLE_MS = 2000;
 
+// Shared prefix snapshots a runner keeps of its linear_attention blocks'
+// recurrent state (stage.js's #snapSlot). A Gated DeltaNet layer has no
+// position axis, so a prefix cannot be paged out of it the way KV can — what
+// is shareable is the whole state at one position, and a snapshot is that.
+//
+// One costs `recurrentStateBytes` per linear block the peer holds: 50 MiB for
+// the whole of Qwen3.5-4B, 150 MiB for Qwen3.8-27B, against the
+// `recurrentStateBytes * SESSIONS` every peer already reserves for frames. So
+// a handful is affordable where general dedup is not, and they are ranked by
+// how often they are adopted.
+export const SNAP_SLOTS = 2;
+
 // How long a probe's page lease is held. A probe answers from the content
 // index and takes a lease on the pages it named, so they still hold those
 // bytes when the prompt's first job arrives; the adopt consumes it. Long
@@ -298,13 +310,14 @@ export function replayLayerBytes(d, cols = SPEC_COLS) {
 //
 // A linear_attention block also reserves `spec` speculative replay slots
 // (stage.js, one per session speculating through it at once), `slots` by
-// default, as the Runner does.
+// default, as the Runner does, and `snaps` shared prefix snapshots (one
+// recurrent state per block per snapshot, SNAP_SLOTS by default).
 export function blockBytes(d, { nMax = DEFAULT_CTX, slots = SLOTS, sessions = SESSIONS, spec = slots,
-                                kind, index } = {}) {
+                                snaps = SNAP_SLOTS, kind, index } = {}) {
     if (index != null) kind = d.layer_types?.[index] ?? 'full_attention';
     const share = kind ? (kind === 'linear_attention' ? 0 : 1) : kvShare(d);
     return blockWeightBytes(d, { index, kind }) + kvRowBytes(d) * nMax * 2 * slots * share
-        + (recurrentStateBytes(d) * sessions + replayLayerBytes(d) * spec) * (1 - share);
+        + (recurrentStateBytes(d) * (sessions + snaps) + replayLayerBytes(d) * spec) * (1 - share);
 }
 
 // What holding the MTP draft head costs, apart from its scratch: its file,

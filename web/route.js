@@ -1455,7 +1455,7 @@ export function makeRouter({
     //
     // `probes` is written before the send, synchronously, so a `held` that
     // arrives in the same turn is not dropped.
-    function probePrefix(c, hashes) {
+    function probePrefix(c, hashes, mtp) {
         if (!share || !hashes.length) return 0;
         // Nothing on this mesh answers a probe. Start the prompt now.
         if (probeMuteUntil && performance.now() < probeMuteUntil) return 0;
@@ -1507,7 +1507,13 @@ export function makeRouter({
                     finish(h.chunks);
                 },
             });
+            // `mtp` because the draft head's rows live at the same page
+            // slots, so a page filled with it holds something a page without
+            // it does not: Runner.#pageKey keys the two apart. The probe has
+            // to carry whatever its prompt's jobs will, or it looks up a key
+            // nothing ever wrote.
             route({ k: 'probe', s, key, from: net.id, pos: 0, hashes,
+                    ...(mtp && { mtp: true }),
                     ttl: TTL + (net.positions || 0) }, null);
         });
     }
@@ -1743,7 +1749,7 @@ export function makeRouter({
         // what keeps the answer on a chunk boundary the peers can start from
         // with no further clamping.
         const adopt = probe && hashes && cut
-            ? await probePrefix(c, hashes.slice(0, cut / T_MAX)) : 0;
+            ? await probePrefix(c, hashes.slice(0, cut / T_MAX), !!opts.spec) : 0;
         const skip = adopt * T_MAX;
         c.shared = skip;
         // A prompt that adopts carries no hashes. verifyHash() checks a chunk
@@ -2008,7 +2014,10 @@ export function makeRouter({
         // `err` that arrives while the probe is out still finds it.
         (async () => {
             const hashes = await promptHashes(ids);
-            const adopt = c.noProbe ? 0 : await probePrefix(c, hashes.slice(0, cut / T_MAX));
+            // st.opts.spec, not opts.spec: that is what the job below will
+            // carry, even when this send has speculation off (`nospec`).
+            const adopt = c.noProbe ? 0
+                : await probePrefix(c, hashes.slice(0, cut / T_MAX), !!st.opts.spec);
             if (st.done || st.s !== c.session) return;
             // An adopting prompt carries no hashes: see sendPrompt().
             chunks(adopt ? null : hashes, adopt);

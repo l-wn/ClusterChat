@@ -6,7 +6,7 @@ import {
     holds, holders, depths, minDepth, covers, gaps, size, place, assign,
     blockBytes, blockWeightBytes, kvRowBytes, modelBytes, endBytes, kvShare, recurrentStateBytes, replayLayerBytes, floorBlocks, budgetBlocks, costDims, MIN_BYTES,
     positions, headPos, blockRange, served, filling, coverage, EMBED,
-    SESSIONS, SLOTS, MAX_SESSIONS, poolSlots, runnerSessions,
+    SESSIONS, SLOTS, MAX_SESSIONS, SNAP_SLOTS, poolSlots, runnerSessions,
 } from '../web/split.js';
 
 // The floor depends on the model, so every call passes one. Ten is
@@ -173,9 +173,13 @@ console.log('\nrecurrent state: charged once per session on linear layers');
         recurrentStateBytes(costDims(SMOLLM2_135M)), 0);
     eq('averaged: three blocks in four carry one state per session',
         blockBytes(qwen, { sessions: 8 }) - blockBytes(qwen, { sessions: 0 }), per * 8 * 0.75);
-    eq('a named linear block: weights plus a state per session and two replay slots, no KV',
+    eq('a named linear block: weights, a state per session and per snapshot, two replay slots, no KV',
         blockBytes(qwen, { sessions: 8, kind: 'linear_attention' }),
-        blockWeightBytes(qwen, { kind: 'linear_attention' }) + per * 8 + replayLayerBytes(qwen) * 2);
+        blockWeightBytes(qwen, { kind: 'linear_attention' }) + per * (8 + SNAP_SLOTS)
+            + replayLayerBytes(qwen) * 2);
+    eq('a shared prefix snapshot is one more state per linear block',
+        blockBytes(qwen, { snaps: 3, kind: 'linear_attention' })
+            - blockBytes(qwen, { snaps: 2, kind: 'linear_attention' }), per);
     eq('a replay slot: the state and conv rings again, plus 8 tokens of inputs',
         replayLayerBytes(qwen), per + 8 * (2048 * 2 + 6144 + 48 * 2) * 4);
     eq('the replay slots follow `spec`',
@@ -230,8 +234,8 @@ console.log('\nstored bytes: a block costs what its file weighs');
     eq('a full block is its file', blockWeightBytes(d, { index: 3 }), FULL);
     eq('by kind, the mean of that kind', blockWeightBytes(d, { kind: 'full_attention' }), FULL);
     eq('unnamed, the mean of the model', blockWeightBytes(d), (LIN * 48 + FULL * 16) / 64);
-    eq('a linear block: 388.5 MiB + 8 recurrent states + 2 replay slots = 420 MiB',
-        Math.round(blockBytes(d, { index: 0 }) / MiB), 420);
+    eq('a linear block: 388.5 MiB + (8 + 2) recurrent states + 2 replay slots = 427 MiB',
+        Math.round(blockBytes(d, { index: 0 }) / MiB), 427);
     eq('a full block: 377.2 MiB + 72 MiB of KV pool = 449 MiB',
         Math.round(blockBytes(d, { index: 3 }) / MiB), 449);
     eq('the KV pool is 2 16K contexts of int8 K and V, one scale per 32',
@@ -264,7 +268,9 @@ console.log('\nstored bytes: a block costs what its file weighs');
     // The cost of the whole model, for a peer holding all of it.
     const whole = kinds.reduce((n, _, i) => n + blockBytes(d, { index: i }), 0)
         + endBytes(d, 'embed') + endBytes(d, 'head');
-    eq('the whole of Qwen3.8-27B at 16K is 29.2 GiB before scratch', (whole / 2 ** 30).toFixed(1), '29.2');
+    // 29.2 GiB before the two shared prefix snapshots the linear blocks now
+    // reserve (split.js's SNAP_SLOTS), which are 0.3 GiB of it.
+    eq('the whole of Qwen3.8-27B at 16K is 29.5 GiB before scratch', (whole / 2 ** 30).toFixed(1), '29.5');
     eq('modelBytes() sums the same', modelBytes(d), whole);
     eq('and at 32K the KV pool doubles: 1.1 GiB more',
         ((modelBytes(d, { nMax: 32768 }) - whole) / 2 ** 30).toFixed(2),

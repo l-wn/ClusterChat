@@ -96,7 +96,7 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null
                     opts = {}) {
     // Each peer has its own GPU and trace. With a shared trace, a replay into
     // one peer while another is working would be recorded as one run.
-    const { device, setFill, resetTrace, takeTrace, passes } = makeGpu();
+    const { device, setFill, setDone, resetTrace, takeTrace, takeMoves } = makeGpu();
     // nMax is well above T_MAX, so a context can be longer than one replay
     // chunk and the chunk loop in replay() is tested.
     // `idleMs: 0`: this suite's eviction tests need a second session to take
@@ -125,6 +125,13 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null
     // handed a session the wrong page would fold cleanly and the ledger would
     // report no violation.
     const kv = new Map();
+    // The recurrent fold, keyed by the state's own `S` buffer rather than by
+    // session (see RECURRENT). A linear_attention block's state is shareable
+    // only as a whole-state snapshot, which stage.js copies between buffers,
+    // so the model of its contents has to follow the buffers and not the
+    // chats: keyed by session, a session handed a snapshot would start from
+    // SEED and answer something else, and the ledger would call that correct.
+    //
     // `${session}|${tag}` -> { st, win }: the recurrent fold (see RECURRENT),
     // and while the session's last job was a verify, `win`: where it started,
     // its rows, and the fold before and after each row. The next job may start
@@ -209,9 +216,22 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null
         resetTrace();
         let last = 0, filled = false;
         const digs = [];                 // each row's digest, for a verify's tokens
-        const cleared = passes.cleared;
+
+        // Buffers stage.js cleared or copied while preparing this job: a reused
+        // frame's recurrent state zeroed, or a shared prefix snapshot copied
+        // into one. Applied before the fold reads them, which is the order the
+        // GPU sees.
+        function applyMoves() {
+            for (const m of takeMoves()) {
+                if (m.clear) { rec.delete(m.clear); continue; }
+                const from = rec.get(m.src);
+                if (from) rec.set(m.dst, { st: from.st, win: null });
+                else rec.delete(m.dst);
+            }
+        }
 
         function fold(tags, bytes) {
+            applyMoves();
             // The ledger. Every job for a session arriving at this peer at
             // this cursor must continue where the last one stopped, and a
             // rewrite (a replay, or a repair's re-sent job) must store the
@@ -276,8 +296,11 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null
                 for (const t of tags) {
                     d = mix(d, tagId(t));
                     if (RECURRENT.test(t)) {
-                        const k = `${h.s}|${t}`;
-                        if (j === 0 && passes.cleared > cleared) rec.delete(k);
+                        // The buffer this block's state lives in, so a copy of
+                        // it carries the fold with it. The warm-up cache is
+                        // not in `live`, and nothing asserts on its tokens.
+                        const rc = real.live.get(h.s)?.recurrent[Number(t.slice(1)) - real.blockLo];
+                        const k = rc?.S ?? `${h.s}|${t}`;
                         let e = rec.get(k);
                         if (!e) rec.set(k, e = { st: SEED, win: null });
                         if (j === 0) {
@@ -338,6 +361,16 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null
             filled = true;
             return fold(takeTrace(), bytes) ?? new Float32Array(D.vocab);
         });
+        // A prefill chunk at the end of the line, and a replay that got there,
+        // read nothing back. Folding where they wait for the GPU puts the toy's
+        // model of the pass at the same point in #pass() as a readback, which
+        // matters for anything stage.js does *after* the pass — a shared prefix
+        // snapshot has to see this chunk's rows in the state it copies.
+        setDone(() => {
+            if (filled) return;
+            filled = true;
+            fold(takeTrace(), null);
+        });
 
         let r;
         try {
@@ -347,22 +380,24 @@ function peerRunner(world, id, lo, hi, have, slots, idleMs = 0, specSlots = null
         }
         // A replay that reached the end of the line reads nothing back, so the
         // fold has not run. It hands on no rows and keeps no log, so folding
-        // it here is safe, and it must still be counted.
+        // it here is safe, and it must still be counted. A prefill chunk at
+        // the end of the line is the same: the head reads nothing back.
         if (!filled) fold(takeTrace(), null);
+        // Buffers stage.js copied *after* the pass — a shared prefix snapshot
+        // of this job's own result (#snapIfWanted). Applied here, once the
+        // fold above has this job's rows in it, because that is the state the
+        // snapshot holds on the GPU. At the end of the line the fold runs
+        // after real.run returns, so draining inside fold() alone would snap
+        // the chunk before this one.
+        applyMoves();
 
-        // The toy follows the real Runner. A session the real Runner evicted
-        // loses its recurrent fold too. Otherwise the next job would be
-        // answered from a state whose buffers were evicted, and the eviction
-        // would go unnoticed.
-        //
-        // `kv` is not swept: it is keyed by page, bounded by the pool, and
-        // write-through. A page handed to another session has the same offsets
-        // overwritten as that session writes its rows, which is exactly what
-        // the real KV does — and a page that outlives its session staying
-        // addressable is the whole point of the content index.
-        for (const k of [...rec.keys()]) {
-            if (!real.live.has(k.slice(0, k.indexOf('|')))) rec.delete(k);
-        }
+        // Neither ledger is swept by session, because neither models a
+        // session: `kv` is keyed by physical page and `rec` by the buffer the
+        // state lives in. Both are bounded by what the Runner allocated, and
+        // both are write-through — a page handed on has its offsets rewritten
+        // as the new session writes rows, and a reused frame's recurrent state
+        // is cleared or copied into, which applyMoves() follows. A state or a
+        // page outliving its session is the whole point of sharing a prefix.
 
         // Three result shapes: a token, a hidden state to hand on, or neither
         // (a replay that reached the end of the line). The other fields (phase
@@ -543,7 +578,7 @@ class World {
                          drafts: sent.drafts, rowOpts: sent.rowOpts, tokens: sent.tokens,
                          nospec: !!sent.nospec,
                          rb: !!sent.rb, fill: !!sent.fill,
-                         hash: sent.hash, path: sent.path,
+                         hash: sent.hash, path: sent.path, mtp: !!sent.mtp,
                          chunks: sent.chunks, each: sent.each, adopt: sent.adopt,
                          bytes: body?.byteLength ?? 0 });
         const slow = this.slowLinks.get(`${from}>${to}`);
@@ -797,6 +832,38 @@ console.log('\ncontent-addressing: every peer on a path keys the pages it filled
     ok('a decode job carries neither hash nor path',
         decode.length > 0 && decode.every((m) => m.hash === undefined && m.path === undefined),
         `${decode.length} decode jobs`);
+}
+
+{
+    // A probe must carry everything its prompt's jobs will that the page key
+    // is built from. `mtp` is one: Runner.#pageKey keys a page the draft head
+    // filled apart from one it did not, so a probe that left the flag off
+    // would look up a key nothing ever wrote.
+    //
+    // This shipped. Every clusterchat CLI client speculates (cli/bin.js's
+    // sampling sets `spec: true`, with no flag and no API field to turn it
+    // off), so every job keyed `:m` while every probe asked for `:-`, and a
+    // live cluster shared nothing at all while every counter looked healthy.
+    const long = Array.from({ length: 3 * T_MAX }, (_, i) => (i * 41) % 90 + 1);
+    const { w, asker } = chain([0, N]);
+
+    await generate(asker, long, 1, { whole: true, opts: { spec: true } });
+    const s1 = asker.sessions.at(-1);
+    const probes = w.wire.filter((m) => m.k === 'probe' && m.s === s1);
+    const jobs = w.wire.filter((m) => m.k === 'job' && m.s === s1 && m.past < long.length);
+    ok('a speculating prompt sends speculating jobs', jobs.length > 0 && jobs.every((m) => m.mtp),
+        `${jobs.filter((m) => !m.mtp).length} of ${jobs.length} did not`);
+    ok('and its probe says so too', probes.length > 0 && probes.every((m) => m.mtp),
+        `${probes.filter((m) => !m.mtp).length} of ${probes.length} did not`);
+
+    asker.router.newChat();
+    w.wire.length = 0;
+    await generate(asker, long, 1, { whole: true });
+    const s2 = asker.sessions.at(-1);
+    ok('a plain prompt sends neither',
+        w.wire.filter((m) => (m.k === 'job' || m.k === 'probe') && m.s === s2)
+            .every((m) => !m.mtp));
+    eq('with nothing silently continued', w.violations, []);
 }
 
 {
@@ -2153,6 +2220,47 @@ console.log('\nonly the tail evicted it: the boundary log repairs that without a
     eq('with no rebuild', asker.repairs, 0);
     ok('because peer 0 replayed its boundary into the tail', w.tabs.get(0).router.repaired >= 1);
     eq('and no ledger violations', w.violations, []);
+}
+
+console.log('\nsharing a prefix on a hybrid checkpoint: the recurrent snapshot');
+{
+    // The whole point of the snapshot, end to end and checked on tokens. A
+    // Gated DeltaNet layer folds in everything fed so far, so an adopting
+    // session whose recurrent state were left empty would attend over pages it
+    // did not earn and answer something else entirely. The assertion that
+    // matters is that it answers exactly what a chat that fed the prefix
+    // itself answers.
+    //
+    // Three prompts of the same text: the first keys pages, the second's probe
+    // asks for a snapshot and its own pass supplies one, the third adopts.
+    const long = Array.from({ length: 3 * T_MAX }, (_, i) => (i * 43) % 90 + 1);
+    const { w, asker } = chain([0, 3, N], {}, { hybrid: true });
+    const runners = [0, 1].map((id) => w.tabs.get(id).runner.real);
+    ok('this world is hybrid', runners.every((r) => r.d.layer_types?.includes('linear_attention')));
+
+    const first = await generate(asker, long, 2, { whole: true });
+    eq('the first prompt keys pages on both peers',
+        runners.every((r) => r.pool.index.size > 0), true);
+    eq('and neither takes a snapshot yet', runners.map((r) => r.counts.snapped), [0, 0]);
+
+    asker.router.newChat();
+    const second = await generate(asker, long, 2, { whole: true });
+    eq('the second asks for one, and its own pass supplies it',
+        runners.map((r) => r.counts.snapped), [1, 1]);
+    eq('having adopted nothing itself', runners.map((r) => r.counts.adopted), [0, 0]);
+    eq('and answering the same tokens', second, first);
+
+    asker.router.newChat();
+    w.wire.length = 0;
+    const third = await generate(asker, long, 2, { whole: true });
+    ok('the third adopts the prefix, pages and recurrent state together',
+        runners.every((r) => r.counts.adopted > 0 && r.counts.snapAdopted > 0),
+        runners.map((r) => `${r.counts.adopted}/${r.counts.snapAdopted}`).join(' '));
+    eq('and answers exactly what a chat that fed the prefix itself answers',
+        third, first);
+    const jobs = w.wire.filter((m) => m.k === 'job' && m.s === asker.sessions.at(-1));
+    eq('with no job sent for the adopted chunks', jobs.filter((m) => m.past < T_MAX), []);
+    eq('and nothing silently continued', w.violations, []);
 }
 
 console.log('\nrewind on a hybrid checkpoint: the cut tokens must leave the recurrent state too');

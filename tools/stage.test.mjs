@@ -741,6 +741,89 @@ console.log('\ncontent-addressing the pages a prompt fills');
         [...tight.pool.index.keys()], ['z16:4@p1:-#0']);
 }
 
+console.log('\nsharing a prefix on a hybrid checkpoint: the recurrent snapshot');
+{
+    // A Gated DeltaNet layer has no position axis: its state folds in
+    // everything fed so far, so a prefix cannot be paged out of it the way KV
+    // can. What is shareable is the whole state at one position.
+    //
+    // Which position is the one two prompts diverge at, and only the probe
+    // that carries both prefixes' hashes knows it — a first prompt cannot
+    // guess. So the peer learns it from a miss: a probe that finds pages and
+    // no snapshot records what it wanted, and the next pass to end exactly
+    // there takes one.
+    const r = new Runner(device, DH, hybridWeightsFor(0, LAYER_TYPES.length + 1),
+        { lo: 0, hi: LAYER_TYPES.length + 1, nMax: 32, tMax: 4, slots: 2, sessions: 3,
+          pageTokens: 16, idleMs: 0, peerId: 'p', snapSlots: 1 });
+    const hashes = ['h4', 'h8', 'h12', 'h16'];
+    const feed = async (id) => {
+        for (let past = 0; past < 16; past += 4) {
+            await r.run({ k: 'job', s: id, pos: 0, past, n: 4, ids: [1, 1, 1, 1], opts: {},
+                          ...(past === 12 && { hash: 'h16' }) }, null);
+        }
+    };
+    const probe = (id) => r.probe({ k: 'probe', s: id, pos: 0, hashes },
+                                  LAYER_TYPES.length + 1);
+
+    const bare = r.vramBytes;
+    await feed('a');
+    eq('the first prompt keys its pages', r.pool.index.size, 1);
+    eq('but takes no snapshot: nothing has asked for one', r.counts.snapped, 0);
+
+    eq('so a probe finds the pages and will not offer them', probe('b'), 0);
+    eq('and records where a snapshot was wanted', r.wanted.size, 1);
+
+    // The same prefix fed again. Its pass ends exactly where the probe asked.
+    await feed('b');
+    eq('which the next pass ending there takes', r.counts.snapped, 1);
+    eq('consuming the request', r.wanted.size, 0);
+    ok('and costing one recurrent state per linear block this peer holds',
+        r.vramBytes > bare, `${bare} -> ${r.vramBytes}`);
+
+    eq('now the probe offers the whole page, in chunks', probe('c'), 4);
+    await r.run({ k: 'job', s: 'c', pos: 0, past: 16, n: 4, ids: [1, 1, 1, 1], opts: {},
+                  adopt: 4 }, null);
+    eq('and a session starts from it', [r.counts.adopted, r.counts.snapAdopted], [1, 1]);
+    eq('with the pages the first prompt filled', r.live.get('c').owned[0],
+        r.live.get('b').owned[0]);
+    // A linear block demands exact continuation (#checkFed), so the seeded
+    // `fed` and the restored state have to agree, or this throws.
+    await r.run({ k: 'job', s: 'c', pos: 0, past: 20, n: 4, ids: [1, 1, 1, 1], opts: {} }, null);
+    eq('and continues from there', r.live.get('c').owned.length, 2);
+}
+
+{
+    // The snapshot is for one position, so it is held against the probe that
+    // promised it: #snapSlot may not recycle a leased one even when a better
+    // ranked prefix wants the slot.
+    const r = new Runner(device, DH, hybridWeightsFor(0, LAYER_TYPES.length + 1),
+        { lo: 0, hi: LAYER_TYPES.length + 1, nMax: 32, tMax: 4, slots: 2, sessions: 3,
+          pageTokens: 16, idleMs: 0, peerId: 'p', snapSlots: 1 });
+    const feed = async (id, tag) => {
+        for (let past = 0; past < 16; past += 4) {
+            await r.run({ k: 'job', s: id, pos: 0, past, n: 4, ids: [1, 1, 1, 1], opts: {},
+                          ...(past === 12 && { hash: `${tag}16` }) }, null);
+        }
+    };
+    const hs = (tag) => [`${tag}4`, `${tag}8`, `${tag}12`, `${tag}16`];
+    const probe = (id, tag) => r.probe({ k: 'probe', s: id, pos: 0, hashes: hs(tag) },
+                                       LAYER_TYPES.length + 1);
+
+    await feed('a', 'h');
+    probe('b', 'h');                 // asks
+    await feed('b', 'h');            // supplies
+    eq('one snapshot, one slot', [r.snaps.size, r.counts.snapped], [1, 1]);
+    eq('a probe leases it', probe('c', 'h'), 4);
+
+    // A second prefix wants the only slot while the first is promised.
+    await feed('c2', 'z');
+    probe('d', 'z');
+    await feed('d', 'z');
+    eq('the leased one is not recycled out from under the probe',
+        [r.snaps.size, r.counts.snapped], [1, 1]);
+    ok('and the first prefix is still the one held', r.snaps.has([...r.snaps.keys()][0]));
+}
+
 console.log('\nthe probe: how far a prefix is held, and the lease on it');
 {
     // pageTokens 16 against tMax 4: four chunks fill a page, so the chunk whose
@@ -929,6 +1012,33 @@ console.log('\nthe probe: how far a prefix is held, and the lease on it');
     eq('a plain prompt adopts it', r.probe({ k: 'probe', s: 'b', pos: 0, hashes }, 4), 4);
     eq('and a speculating one does not',
         r.probe({ k: 'probe', s: 'c', pos: 0, hashes, mtp: true }, 4), 0);
+
+}
+
+{
+    // The other way round, which is the half a live run found missing: a
+    // speculating prompt keys its pages apart, so only a probe that says it
+    // speculates too can find them. A probe that leaves the flag off looks up
+    // a key nothing ever wrote, and then no prefix is ever shared on a cluster
+    // whose clients all speculate — which is every clusterchat CLI client,
+    // since cli/bin.js's sampling sets `spec: true` with no way to turn it off.
+    const gpu = makeGpu();
+    const { marker: mk } = await import('./stub-gpu.mjs');
+    const r = new Runner(gpu.device, { ...D, mtp: { file: 'mtp.bin', draftVocab: 20 } },
+        weightsFor(0, 4), { lo: 0, hi: 4, nMax: 32, tMax: 4, slots: 2, sessions: 2,
+                            pageTokens: 16, idleMs: 0, peerId: 'p1' });
+    r.attachMtp({ ...Object.fromEntries(['input_layernorm', 'q_proj', 'k_proj', 'v_proj',
+        'o_proj', 'post_attention_layernorm', 'gate_proj', 'up_proj', 'down_proj', 'enorm',
+        'hnorm', 'fc_e', 'fc_h', 'mtp_norm', 'embed_draft', 'head_draft']
+        .map((n) => [n, mk('M')])), kind: 'full_attention', draftVocab: 20, bytes: 5000 });
+    for (let past = 0; past < 16; past += 4) {
+        await r.run({ k: 'job', s: 'a', pos: 0, past, n: 4, ids: [1, 1, 1, 1], opts: {},
+                      mtp: true, ...(past === 12 && { hash: 'm16' }) }, null);
+    }
+    const hashes = ['m4', 'm8', 'm12', 'm16'];
+    eq('a speculating prompt adopts what a speculating prompt filled',
+        r.probe({ k: 'probe', s: 'b', pos: 0, hashes, mtp: true }, 4), 4);
+    eq('and a plain one does not', r.probe({ k: 'probe', s: 'c', pos: 0, hashes }, 4), 0);
 }
 
 {
@@ -1002,9 +1112,11 @@ console.log('\nthe probe: how far a prefix is held, and the lease on it');
 }
 
 {
-    // A linear_attention block's recurrent state lives on the frame and is not
-    // shared, so a page from a range crossing one cannot be handed to another
-    // chat. Refuse to key it here rather than discover it on the read side.
+    // A page from a range crossing a linear_attention block *is* keyed: it
+    // holds the full_attention rows, which are a pure function of the ids and
+    // the path whatever else the range contains. What a linear block cannot
+    // give back is handled on the read side, where probe() will not offer the
+    // prefix without a snapshot of the recurrent state at the same position.
     const r = new Runner(device, DH, hybridWeightsFor(0, LAYER_TYPES.length + 1),
         { lo: 0, hi: LAYER_TYPES.length + 1, nMax: 16, tMax: 4, slots: 1,
           idleMs: 0, peerId: 'p' });
@@ -1014,7 +1126,12 @@ console.log('\nthe probe: how far a prefix is held, and the lease on it');
         await r.run({ k: 'job', s: 'a', pos: 0, past, n: 4, ids: [1, 1, 1, 1], opts: {},
                       ...(past === 12 && { hash: 'h16' }) }, null);
     }
-    eq('so no page of it is keyed', [r.pool.index.size, r.counts.indexed], [0, 0]);
+    eq('its page is keyed anyway', [r.pool.index.size, r.counts.indexed], [1, 1]);
+    const hashes = ['h4', 'h8', 'h12', 'h16'];
+    eq('but a probe will not offer it without a recurrent snapshot',
+        r.probe({ k: 'probe', s: 'b', pos: 0, hashes }, LAYER_TYPES.length + 1), 0);
+    eq('and it remembers where one was wanted, so a later pass can take it',
+        r.wanted.size, 1);
 }
 
 {
