@@ -47,8 +47,9 @@ function origin(s) {
 // to the GPUs; requests are refused until there is one.
 //
 // `on(step, detail)` follows along: 'joined' with info, then 'no-gpus', or
-// 'linking' and then 'linked' { seconds } or 'unlinked'.
-export async function join(target, { on = () => {}, client = null } = {}) {
+// 'linking' and then 'linked' { seconds } or 'unlinked'. `onEvent` is the
+// Engine's (web/engine.js), for a caller that wants its repairs.
+export async function join(target, { on = () => {}, client = null, onEvent = () => {} } = {}) {
     let Polyfill, WebSocket;
     try {
         ({ RTCPeerConnection: Polyfill } = await import('node-datachannel/polyfill'));
@@ -67,7 +68,7 @@ export async function join(target, { on = () => {}, client = null } = {}) {
         }
     }
     const room = await openRoom(readInvite(target.hash), { model: inviteModel(target.hash) });
-    const engine = new Engine();
+    const engine = new Engine({ onEvent });
     let manifest, timer;
     try {
         // The mesh retries a server it cannot reach for as long as it runs,

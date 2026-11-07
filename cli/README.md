@@ -44,7 +44,7 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:4747 ANTHROPIC_AUTH_TOKEN=clusterchat \
 `/models` switches back and forth:
 
 ```bash
-clusterchat setup opencode > opencode.json
+npx clusterchat@latest setup opencode > opencode.json
 ```
 
 Anything else that speaks the OpenAI Chat Completions API can use

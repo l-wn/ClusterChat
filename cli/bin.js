@@ -108,8 +108,10 @@ async function connect(args) {
     const url = `http://${host.includes(':') ? `[${host}]` : host}:${port}`;
     ui.line('✓', 'serving', `${c.bold(url)} ${c.dim(`· ${protocols.map((p) => p.name).join(' · ')}`)}`);
 
-    const cmd = typeof __VERSION__ !== 'undefined' ? 'clusterchat'
-        : `node ${relative(process.cwd(), fileURLToPath(import.meta.url)) || 'bin.js'}`;
+    // Under npx there is no clusterchat on the PATH, so the hint names npx too.
+    const cmd = typeof __VERSION__ === 'undefined'
+        ? `node ${relative(process.cwd(), fileURLToPath(import.meta.url)) || 'bin.js'}`
+        : process.env.npm_command === 'exec' ? 'npx clusterchat@latest' : 'clusterchat';
     const setupCmd = (h) => `${cmd} setup ${h.name}${port !== PORT ? ` --port ${port}` : ''}`;
     for (const h of harnesses) ui.section(h.label, h.brief?.(url, info, setupCmd(h)) ?? h.setup(url, info));
     ui.rule('requests');
@@ -135,7 +137,7 @@ async function setup(args) {
     if (!h) throw new Error(`say which tool: ${harnesses.map((x) => x.name).join(', ')}`);
     const url = `http://${args.host ?? HOST}:${Number(args.port ?? PORT)}`;
     const info = await fetch(`${url}/clusterchat`).then((r) => r.json()).catch(() => {
-        throw new Error(`nothing is serving ${url}. Run clusterchat connect first.`);
+        throw new Error(`nothing is serving ${url}. Run npx clusterchat@latest connect first.`);
     });
     console.log(h.setup(url, info));
 }
