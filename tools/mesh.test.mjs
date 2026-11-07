@@ -2264,6 +2264,38 @@ console.log('\nsharing a prefix on a hybrid checkpoint: recurrent keyframes');
     eq('and nothing silently continued', w.violations, []);
 }
 
+console.log('\nserving a duplicate chunk: two prompts at once, one computation');
+{
+    // Four agents started together share a prefix and share nothing, because
+    // sharing needs a finished writer and they all begin at zero in lockstep.
+    // A probe cannot help: it runs once, before anything exists.
+    //
+    // So a peer keeps what each chunk produced under the chain hash naming the
+    // whole prefix, and a chunk another session is computing right now is
+    // answered from that. Interleaved here with no stagger at all, which is
+    // the arrangement that used to share nothing.
+    const long = Array.from({ length: 3 * T_MAX }, (_, i) => (i * 47) % 90 + 1);
+    const { w, asker } = chain([0, 3, N], {}, { hybrid: true, snapEvery: 1 });
+    const other = w.join(101);
+    const runners = [0, 1].map((id) => w.tabs.get(id).runner.real);
+
+    const both = await Promise.all([
+        generate(asker, long, 2, { whole: true }),
+        generate(other, long, 2, { whole: true }),
+    ]);
+    eq('both prompts answer the same tokens', both[0], both[1]);
+    ok('and one of them computed nothing for the shared chunks',
+        runners.every((r) => r.counts.served > 0),
+        runners.map((r) => `served ${r.counts.served} of ${r.counts.indexed} keyed`).join(', '));
+    // The saving stated as a number: each distinct chunk is keyed once, not
+    // once per session.
+    for (const r of runners) {
+        ok(`peer keyed each chunk about once (${r.counts.indexed} keyed, ${r.counts.served} served)`,
+            r.counts.indexed <= 2 * (r.counts.indexed + r.counts.served) / 3);
+    }
+    eq('with nothing silently continued', w.violations, []);
+}
+
 console.log('\nrewind on a hybrid checkpoint: the cut tokens must leave the recurrent state too');
 for (const [label, hybridRouter] of [['a router that knows', true],
                                      ['a router that does not: the runners refuse', false]]) {

@@ -260,6 +260,23 @@ export function ensurePages(device, pool, frame, tokens) {
     return true;
 }
 
+// Append a page this frame did not fill as its next logical page, so a chunk
+// whose rows another session already computed costs no pass at all.
+//
+// ensurePages' mid-frame sibling: that one takes whatever the pool offers and
+// forgets what it held, this one takes a named page and keeps its content and
+// its index entry, because that content is the whole point. Both frames hold
+// it afterwards, which is what `refs` is for.
+export function takePage(device, pool, frame, phys) {
+    if (frame.owned.length >= frame.maxPages) return false;
+    if (!Number.isInteger(phys) || phys < 0 || phys >= pool.nPages) return false;
+    const logical = frame.owned.length;
+    refPages(pool, [phys]);
+    frame.owned.push(phys);
+    device.queue.writeBuffer(frame.pages, logical * 4, new Uint32Array([phys]));
+    return true;
+}
+
 // The physical page behind this frame's logical page `j`, or undefined, so a
 // caller can name a page without knowing how the table is laid out.
 export function pageAt(frame, j) {

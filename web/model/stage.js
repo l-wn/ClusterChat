@@ -18,7 +18,7 @@ import { F32, makeStorage, makeReadback, readF32, gatherEmbedNoPos, rmsnorm, mat
          withPass, counters, copyF32, topkRows, topkPairs, roundF16, GEMV_ROWS_MAX } from './kernels.js';
 import { blockSegs, makeSegScratch, makeCache, makeScratch, makeRecurrentState, recurrentStateBytes,
          makePagePool, makeSessionFrame, ensurePages, freePages, pageAt,
-         dropIndex, putIndex, adoptPages, refPages, unrefPages, makeReplayLayer,
+         dropIndex, putIndex, adoptPages, refPages, unrefPages, takePage, makeReplayLayer,
          replayLayerBytes, mtpBlock, mtpChain, makeMtpScratch } from './model.js';
 import { makeGpuProf } from './gpuprof.js';
 import { sampleFromLogitsRow } from './generate.js';
@@ -238,7 +238,12 @@ export class Runner {
                         probed: 0, adopted: 0, adoptRefused: 0,
                         // Recurrent snapshots taken for a prefix a probe asked
                         // for, and sessions started from one (#snapIfWanted).
-                        snapped: 0, snapAdopted: 0 };
+                        snapped: 0, snapAdopted: 0,
+                        // Prefill chunks answered from a recent result instead
+                        // of a pass, and the pages that came with them
+                        // (#served). In lockstep `indexed` is one prompt's
+                        // worth and `served` is every other session's.
+                        served: 0, servedPages: 0 };
 
         // Speculative decoding's replay slots (see #specSlot()): at most
         // `specSlots` sessions speculate through this Runner's linear_attention
@@ -1447,19 +1452,33 @@ export class Runner {
     // Null when there is no room, which is not an error — the prefix simply
     // stays unshared and the next prompt feeds it in full.
     //
-    // Ranked by hits, like a cache: a prefix adopted often outranks one
-    // adopted once. `leased` holds the snapshot a probe has already promised.
+    // Ranked by hits, like a cache: a prefix used often outranks one used once.
+    // `leased` holds an entry a probe has already promised.
+    //
+    // A recent entry is dropped before a keyframe, however well ranked. The two
+    // classes answer different questions — recent ones serve a session running
+    // right now, keyframes one that starts minutes later — and writing an entry
+    // per chunk would otherwise evict every keyframe within a few chunks and
+    // leave a late session nothing to adopt.
     async #snapSlot() {
         if (this.snaps.size >= this.snapSlots) {
-            let worst = null, low = null;
-            for (const [k, snap] of this.snaps) {
-                if (snap.leased) continue;          // promised to a probe already
-                if (!low || snap.hits < low.hits
-                    || (snap.hits === low.hits && snap.at < low.at)) { worst = k; low = snap; }
-            }
+            const pick = (keyframe) => {
+                let worst = null, low = null;
+                for (const [k, snap] of this.snaps) {
+                    if (snap.leased || !!snap.keyframe !== keyframe) continue;
+                    if (!low || snap.hits < low.hits
+                        || (snap.hits === low.hits && snap.at < low.at)) { worst = k; low = snap; }
+                }
+                return [worst, low];
+            };
+            let [worst, low] = pick(false);
+            if (!low) [worst, low] = pick(true);
             if (!low) return null;
             this.snaps.delete(worst);
             low.hits = 0;
+            low.rows = null;
+            low.keyframe = false;
+            low.ready = false;
             return low;
         }
         const { device } = this;
@@ -1477,7 +1496,8 @@ export class Runner {
             for (const rc of layers) if (rc) for (const b of RECUR_BUFS) rc[b].destroy();
             return null;
         }
-        return { layers, bytes, hits: 0, at: 0, leased: 0 };
+        return { layers, bytes, hits: 0, at: 0, leased: 0, keyframe: false,
+                 rows: null, ready: false };
     }
 
     // Copy a session's recurrent state into a snapshot, or a snapshot back
@@ -1495,24 +1515,31 @@ export class Runner {
         this.device.queue.submit([enc.finish()]);
     }
 
-    // Copy this session's recurrent state aside, if this pass ended on a
-    // keyframe boundary. Called where a page is keyed, so every rule
-    // #indexPages applies to a page applies here too.
+    // Keep what this pass produced, under the key its pages were keyed by, so a
+    // chunk of the same prefix costs no pass at all. Called where a page is
+    // keyed, so every rule #indexPages applies to a page applies here too.
     //
-    // Every SNAP_EVERY chunks, not at a position some probe asked for: the
-    // state is overwritten as the prompt feeds, so the copy has to be taken on
-    // the way past, and a fixed spacing means no one has to know in advance
-    // where two prompts will diverge. A later prompt takes the deepest
-    // keyframe at or below its own divergence and re-feeds the rest.
-    async #keyframe(cache, key, end) {
-        if (end % (this.snapEvery * this.tMax) !== 0) return;
-        if (this.snaps.has(key)) return;
-        if (!cache.recurrent.some(Boolean)) return;      // nothing recurrent to copy
+    // Written at every chunk, not only where a probe asked: the recurrent state
+    // is overwritten as the prompt feeds, so a copy has to be taken on the way
+    // past. An entry on a SNAP_EVERY boundary is a keyframe and is kept for a
+    // session that starts later; the rest are a recent window, which is what
+    // lets sessions running at the same time serve each other.
+    //
+    // The rows are filled in by #finish, which is where the f16 bits exist. A
+    // dense checkpoint keeps no state and still serves.
+    async #remember(cache, key, end) {
+        const have = this.snaps.get(key);
+        if (have) { have.at = performance.now(); return have; }
         const slot = await this.#snapSlot();
-        if (!slot) return;
-        this.#copyRecurrent(cache.recurrent, slot.layers, `keyframe ${key}`);
+        if (!slot) return undefined;
+        slot.keyframe = end % (this.snapEvery * this.tMax) === 0;
+        slot.at = performance.now();
+        if (cache.recurrent.some(Boolean)) {
+            this.#copyRecurrent(cache.recurrent, slot.layers, `prefix state ${key}`);
+            this.counts.snapped++;
+        }
         this.snaps.set(key, slot);
-        this.counts.snapped++;
+        return slot;
     }
 
     // Everything the snapshots held. Called where the block layout changes: a
@@ -1523,6 +1550,50 @@ export class Runner {
             for (const rc of snap.layers) if (rc) for (const b of RECUR_BUFS) rc[b].destroy();
         }
         this.snaps.clear();
+    }
+
+    // Everything this chunk needs to be answered without a pass: the pages its
+    // rows are in, the recurrent state as it stood after it, and the rows it
+    // handed on. Undefined when any of the three is missing, which is the
+    // ordinary case and not an error.
+    //
+    // The key is a chain hash over the whole prefix, not this chunk alone
+    // (#pageKey), so an entry under it was produced by a job fed identical ids
+    // through identical cuts: its pages, its state and its rows are the ones
+    // this job would have computed.
+    #served(h, cache, to, T) {
+        if (!this.share || h.hash === undefined || !h.fill) return undefined;
+        if (h.replay || h.rb || h.drafts != null) return undefined;
+        const P = this.pool.pageTokens;
+        const end = h.past + T;
+        if ((cache.hi ?? 0) !== h.past) return undefined;
+        // The chunk has to cover whole pages, start included: a chunk narrower
+        // than a page shares one with its neighbours, and this session has
+        // already written its own rows into that page. In production
+        // PAGE_TOKENS and T_MAX are both 64, so every chunk is exactly a page.
+        if (h.past % P !== 0 || end % P !== 0) return undefined;
+        // Those pages must be exactly the ones the frame is about to append, or
+        // the table would end up out of order — and they must all fit, so
+        // taking them cannot fail halfway and leave the frame holding half a
+        // chunk.
+        if (cache.owned.length !== h.past / P) return undefined;
+        if (end / P > cache.maxPages) return undefined;
+        const key = this.#pageKey(h, to);
+        const entry = this.snaps.get(key);
+        // `ready` is set once #finish has put this chunk's rows in, or settled
+        // that it hands none on. An entry written this pass but not yet
+        // finished cannot answer another job.
+        if (!entry?.ready) return undefined;
+        // A checkpoint with linear blocks needs the state; a dense one has none
+        // to need.
+        if (cache.recurrent.some(Boolean) && !entry.layers.some(Boolean)) return undefined;
+        const pages = [];
+        for (let j = h.past / P; j < end / P; j++) {
+            const phys = this.pool.index.get(`${key}#${j}`);
+            if (phys === undefined) return undefined;
+            pages.push(phys);
+        }
+        return { entry, pages };
     }
 
     // The pages this job may adopt, or null if it may not.
@@ -1630,6 +1701,22 @@ export class Runner {
             let plan;
             try { plan = await this.#prepare(job.h, job.hidden, job.want); } catch (err) {
                 this.#failed(job, err);
+                continue;
+            }
+            // A chunk another session already computed is answered here: it
+            // joins no pass, and #timed never sees it, since a service time of
+            // nothing would have this peer report itself as faster than it is
+            // and route.js balances on that.
+            if (plan.served) {
+                const { at, to, T, h } = plan;
+                if (plan.filling) {
+                    job.resolve({ at: to, filled: true, phases: {} });
+                } else {
+                    const rows = plan.served.rows;
+                    this.#log(h.s, to, h.past, rows);
+                    job.resolve({ at: to, hidden: rows, phases: {} });
+                }
+                void at; void T;
                 continue;
             }
             const key = `${plan.to}:${plan.head}:${plan.filling}:${plan.spent}`;
@@ -1795,6 +1882,27 @@ export class Runner {
         // The MTP head writes its own rows past the job's: the drafts it
         // chains after the sample.
         const mtp = (head || filling) && !!this.mtp && !!h.mtp && h.s !== WARMUP;
+        // Another session has already computed this exact chunk: take its
+        // pages, its recurrent state and its rows, and run no pass. Decided
+        // here because #pagesFor below would otherwise take a fresh page for
+        // rows that already exist, and then this one would have to give it
+        // back.
+        const serve = h.s === WARMUP ? undefined : this.#served(h, cache, to, T);
+        if (serve) {
+            // #served checked the table has room for all of them, so none of
+            // these can fail partway and leave the frame holding half a chunk.
+            for (const phys of serve.pages) takePage(this.device, this.pool, cache, phys);
+            for (let p = first; p < last; p++) cache.fed.set(p - 1, h.past + T);
+            cache.hi = h.past + T;
+            if (serve.entry.layers.some(Boolean)) {
+                this.#copyRecurrent(serve.entry.layers, cache.recurrent, `served state ${h.s}`);
+            }
+            serve.entry.hits++;
+            serve.entry.at = performance.now();
+            this.counts.served++;
+            this.counts.servedPages += serve.pages.length;
+            return { h, at, to, T, cache, served: serve.entry, filling };
+        }
         if (h.s !== WARMUP) {
             this.#pagesFor(h.s, cache, mtp && head ? Math.min(this.nMax, h.past + T + SPEC_COLS) : h.past + T);
         }
@@ -1965,7 +2073,7 @@ export class Runner {
                 else cache.specAt.delete(p - 1);
             }
             const key = this.#indexPages(plan, was);
-            if (key !== undefined) toSnap.push([plan.cache, key, h.past + n]);
+            if (key !== undefined) toSnap.push([plan, key, h.past + n]);
         }
 
         // A replay that reached the end returns neither a token nor a hidden
@@ -1991,7 +2099,9 @@ export class Runner {
         // After the readback, not before it: the pass is settled, the copy is
         // off the path of this job's own answer, and a model of the buffers'
         // contents (tools/mesh.test.mjs) sees the pass's rows in them by now.
-        for (const [cache, key, end] of toSnap) await this.#keyframe(cache, key, end);
+        for (const [plan, key, end] of toSnap) {
+            plan.remember = await this.#remember(plan.cache, key, end);
+        }
         const t4 = performance.now();
         const gpu = prof?.collect();
         const c1 = counters();
@@ -2027,6 +2137,9 @@ export class Runner {
         };
         const timed = () => this.#timed(h, queuedAt, t0, t3, to - at, batch);
         if (filling) {
+            // Nothing is handed on from the end of the line, so the entry is
+            // complete as it stands and can answer another job now.
+            if (p.remember) p.remember.ready = true;
             timed();
             return { at: to, filled: true, phases, ...(gpu && { gpu }) };
         }
@@ -2078,6 +2191,13 @@ export class Runner {
         // boundary log and any replay of it all see the same values.
         const rows = batch > 1 ? out.subarray(p.rowOff * H, (p.rowOff + T) * H) : out;
         const bits = toF16(rows);
+        // Kept so a chunk of the same prefix can hand the same rows on without
+        // a pass. A copy, because `bits` goes to the next peer and into the
+        // boundary log, and the entry outlives both.
+        if (p.remember) {
+            p.remember.rows = bits.slice();
+            p.remember.ready = true;
+        }
         this.#log(h.s, to, h.past, bits);
         phases.log = ms(tf, performance.now());
         timed();

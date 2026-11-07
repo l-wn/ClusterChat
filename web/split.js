@@ -130,10 +130,19 @@ export const SNAP_EVERY = 16;
 // How many a runner keeps. Not the number of keyframe positions a context has
 // (a 16K context has 16 of them) but a cache bound, so the cost does not grow
 // with the context: one costs `recurrentStateBytes` per linear block the peer
-// holds — 50 MiB for the whole of Qwen3.5-4B, 150 MiB for Qwen3.8-27B. The
-// shallow ones are evicted first, which keeps the deep ones that are worth
-// most (stage.js's #snapSlot).
-export const SNAP_SLOTS = 8;
+// holds — 50 MiB for the whole of Qwen3.5-4B, 150 MiB for Qwen3.8-27B, and a
+// fraction of that for a peer holding a fraction of the model.
+//
+// The pool holds two classes and evicts the first before the second
+// (stage.js's #snapSlot):
+//
+//   recent     every chunk, so a chunk another session is computing right now
+//              can be served from one instead of run again. Only has to span
+//              how far two sessions in lockstep drift, which the prefill
+//              window bounds at a few chunks.
+//   keyframes  every SNAP_EVERY chunks, kept, so a session starting minutes
+//              later can still adopt a prefix.
+export const SNAP_SLOTS = 12;
 
 // How long a probe's page lease is held. A probe answers from the content
 // index and takes a lease on the pages it named, so they still hold those

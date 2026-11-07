@@ -816,6 +816,77 @@ console.log('\nsharing a prefix on a hybrid checkpoint: recurrent keyframes');
                 LAYER_TYPES.length + 1), 8);
 }
 
+console.log('\nserving a duplicate chunk from a recent result');
+for (const [label, dims, weights] of [['dense', D, weightsFor(0, 4)],
+                                      ['hybrid', DH, hybridWeightsFor(0, LAYER_TYPES.length + 1)]]) {
+    // Four agents with the same tool block start at once: nobody is ahead, so
+    // nothing can be adopted, and every one of them would prefill the same
+    // chunks. A peer keeps what each chunk produced — its pages, the recurrent
+    // state after it, and the rows it handed on — under the chain hash that
+    // names the whole prefix. The second session's chunk is then answered from
+    // that, and runs no pass at all.
+    const gpu = makeGpu();
+    const hi = dims === D ? 4 : LAYER_TYPES.length + 1;
+    const r = new Runner(gpu.device, dims, weights,
+        // pageTokens 4 against tMax 4, as PAGE_TOKENS and T_MAX both being 64
+        // makes it in production: one chunk is exactly one page, so a chunk can
+        // be served whole. A chunk narrower than a page shares one with its
+        // neighbours and cannot be.
+        { lo: 0, hi, nMax: 32, tMax: 4, slots: 3, sessions: 3, pageTokens: 4,
+          idleMs: 0, peerId: 'p' });
+    const chunk = (id, past, hash) => r.run(
+        { k: 'job', s: id, pos: 0, past, n: 4, ids: [1, 1, 1, 1], opts: {}, fill: true,
+          ...(hash && { hash }) }, null);
+    const feed = async (id) => {
+        for (let past = 0; past < 16; past += 4) await chunk(id, past, `h${past + 4}`);
+    };
+
+    await feed('a');
+    const page = r.live.get('a').owned[0];
+    eq(`${label}: the first session keyed a page per chunk`, r.pool.index.size, 4);
+    eq(`${label}: and nothing was served to it`, r.counts.served, 0);
+
+    // The same chunks again, as a second session in lockstep would send them.
+    // Only the one that completes a page can be served: the three before it do
+    // not end on a page boundary, so there is nothing keyed to serve them from.
+    gpu.resetTrace();
+    await feed('b');
+    eq(`${label}: every one of its chunks runs no pass at all`, gpu.takeTrace(), []);
+    eq(`${label}: all four are counted as served`,
+        [r.counts.served, r.counts.servedPages], [4, 4]);
+    eq(`${label}: and points at the page the first session filled`,
+        r.live.get('b').owned[0], page);
+    eq(`${label}: which both sessions now hold`, r.pool.refs[page], 2);
+    eq(`${label}: with its blocks fed where a real pass would have left them`,
+        r.live.get('b').fed.get(0), 16);
+
+    // The next chunk continues normally, which is what proves `fed` and the
+    // restored state agree: a linear_attention block refuses anything else.
+    await chunk('b', 16, undefined);
+    eq(`${label}: so the session continues from there`, r.live.get('b').owned.length, 5);
+    ok(`${label}: and that chunk did run`, gpu.takeTrace().length > 0);
+}
+
+{
+    // A recent entry is dropped before a keyframe, however badly ranked. The
+    // two answer different questions, and writing one per chunk would
+    // otherwise evict every keyframe within a few chunks and leave a session
+    // starting later with nothing to adopt.
+    const r = new Runner(device, DH, hybridWeightsFor(0, LAYER_TYPES.length + 1),
+        { lo: 0, hi: LAYER_TYPES.length + 1, nMax: 64, tMax: 4, slots: 2, sessions: 2,
+          pageTokens: 16, idleMs: 0, peerId: 'p', snapEvery: 1, snapSlots: 2 });
+    // snapEvery 1 against pageTokens 16 and tMax 4: every page boundary is a
+    // keyframe, so fill both slots with keyframes first.
+    for (let past = 0; past < 32; past += 4) {
+        await r.run({ k: 'job', s: 'a', pos: 0, past, n: 4, ids: [1, 1, 1, 1], opts: {},
+                      fill: true, ...((past + 4) % 16 === 0 && { hash: `h${past + 4}` }) }, null);
+    }
+    eq('two keyframes fill the pool', [r.snaps.size, [...r.snaps.values()]
+        .filter((x) => x.keyframe).length], [2, 2]);
+    ok('and a third prefix cannot evict one of them',
+        [...r.snaps.values()].every((x) => x.keyframe));
+}
+
 console.log('\nthe probe: how far a prefix is held, and the lease on it');
 {
     // pageTokens 16 against tMax 4: four chunks fill a page, so the chunk whose
@@ -1120,13 +1191,15 @@ console.log('\nthe probe: how far a prefix is held, and the lease on it');
     }
     eq('its page is keyed anyway', [r.pool.index.size, r.counts.indexed], [1, 1]);
     const hashes = ['h4', 'h8', 'h12', 'h16'];
-    // This Runner's keyframes are every 64 tokens (the default spacing times
-    // its tMax), and nMax is 16, so no pass here ever lands on one. The pages
-    // are keyed and the prefix is still not offered, because the recurrent
-    // half of it was never copied aside.
-    eq('but a probe will not offer it with no keyframe to restore from',
+    // The state is copied aside at every chunk, so an identical chunk running
+    // right now can be served from it. But a *probe* jumps a prompt to a
+    // position, which only a keyframe can answer: keyframes here are every 64
+    // tokens (the default spacing times this Runner's tMax) and nMax is 16, so
+    // no pass lands on one and the prefix is not offered.
+    eq('the state is copied aside anyway, for a chunk running right now',
+        r.counts.snapped, 1);
+    eq('but a probe will not offer it with no keyframe to jump to',
         r.probe({ k: 'probe', s: 'b', pos: 0, hashes }, LAYER_TYPES.length + 1), 0);
-    eq('and nothing was copied aside', r.counts.snapped, 0);
 }
 
 {
