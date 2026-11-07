@@ -1104,6 +1104,9 @@ process.env.MAX_CHATS = '2';
 process.env.MAX_PRIVATE_CHATS = '3';
 process.env.MESH_SESSIONS = '6';
 process.env.MAX_PRIVATE_SESSIONS = '12';
+// Shared prefix slots, small enough that the section below reaches the cap.
+process.env.MESH_SNAPS = '5';
+process.env.MAX_PRIVATE_SNAPS = '9';
 process.env.CHAT_LEASE_MS = '300';
 // The limit on people chatting in the global mesh, and an idle time short
 // enough to see a spot freed within the test.
@@ -1862,6 +1865,42 @@ console.log('\nsignal-server: chats in memory');
     eq('none asked for gives MESH_SESSIONS', await alone({}), 6);
     eq('a non-integer is ignored', await alone({ sessions: 2.5 }), 6);
     eq('and so is zero', await alone({ sessions: 0 }), 6);
+}
+
+console.log('\nsignal-server: shared prefix slots');
+{
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    const welcomed = async (p) => (await p.next((m) => m.type === 'welcome')).snaps;
+
+    // MESH_SNAPS is 5, MAX_PRIVATE_SNAPS 9. These travel exactly as `sessions`
+    // does: the creator's join fixes them, the welcome brings them back, and a
+    // peer sizes its Runner's snapshot pool with them once.
+    const g = connect(null, { snaps: 7 });
+    eq('the welcome gives the global mesh\'s number, whatever the join asks', await welcomed(g), 5);
+
+    const t1 = (await openRoom(newSecret())).joinToken;
+    const owner = connect(t1, { snaps: 8 });
+    eq('a private mesh takes its creator\'s number', await welcomed(owner), 8);
+    const guest = connect(t1, { snaps: 2 });
+    eq('and a later join cannot change it', await welcomed(guest), 8);
+
+    for (const p of [g, owner, guest]) p.close();
+    await sleep(150);
+
+    // One private mesh at a time: the suite's MAX_ROOMS is 3.
+    const alone = async (extra) => {
+        const p = connect((await openRoom(newSecret())).joinToken, extra);
+        const n = await welcomed(p);
+        p.close();
+        await sleep(150);
+        return n;
+    };
+    eq('a number above the cap is clamped to it', await alone({ snaps: 40 }), 9);
+    // Not SNAP_SLOTS: an operator who raises MESH_SNAPS means it for the
+    // private meshes on that server too, or the two silently disagree.
+    eq('none asked for gives MESH_SNAPS', await alone({}), 5);
+    eq('a non-integer is ignored', await alone({ snaps: 2.5 }), 5);
+    eq('and so is zero', await alone({ snaps: 0 }), 5);
 }
 
 console.log('\nsignal-server: the model a private cluster runs');

@@ -6,7 +6,7 @@
 // own peers, placement uses only its own claims, and an SDP is relayed only to
 // a peer in the same Room.
 
-import { assign, covers, minDepth, gaps, served, SESSIONS, DEFAULT_CTX } from './web/split.js';
+import { assign, covers, minDepth, gaps, served, SESSIONS, SNAP_SLOTS, DEFAULT_CTX } from './web/split.js';
 
 const send = (ws, msg) => ws.readyState === 1 && ws.send(JSON.stringify(msg));
 
@@ -35,6 +35,10 @@ export class Room {
     // `room <tag> ` for a private one. The tag is a hash prefix, not the token.
     // `maxChats` caps the replies generating at once in this room (Infinity:
     // no cap). `chatLeaseMs` frees a seat whose `chat-end` never came.
+    // `snaps` is how many shared prefix slots each peer here keeps, which is
+    // what lets several agents prompting at once serve each other's prefill
+    // chunks instead of all computing them (web/model/stage.js's #served).
+    //
     // `sessions` is how many chats each peer here keeps in memory, sent in
     // the welcome, as is `ctx`, the context window in tokens.
     // `maxPeople` caps the people chatting here (Infinity: no cap), lenders
@@ -42,6 +46,7 @@ export class Room {
     // has not sent a message for that long.
     constructor({ label = '', positions, head, minBlocks, maxPeers = Infinity,
                   maxChats = Infinity, chatLeaseMs = 600000, sessions = SESSIONS,
+                  snaps = SNAP_SLOTS,
                   ctx = DEFAULT_CTX, maxPeople = Infinity, idleMs = 600000,
                   log = console.log }) {
         this.label = label;
@@ -52,6 +57,8 @@ export class Room {
         this.maxChats = maxChats;
         this.chatLeaseMs = chatLeaseMs;
         this.sessions = sessions;
+        // Shared prefix slots each peer here keeps (split.js's SNAP_SLOTS).
+        this.snaps = snaps;
         this.ctx = ctx;
         this.maxPeople = maxPeople;
         this.idleMs = idleMs;

@@ -288,8 +288,9 @@ export class Mesh {
     // `room` is the mesh to join (web/room.js), the global one by default.
     // `chats` is the limit on replies at once this tab asks for when its join
     // creates a private mesh (the server ignores it otherwise).
-    // `sessions` is how many chats each peer keeps in memory, and `ctx` the
-    // context window in tokens, asked for the same way.
+    // `sessions` is how many chats each peer keeps in memory, `snaps` how many
+    // shared prefix slots it keeps, and `ctx` the context window in tokens,
+    // asked for the same way.
     // `relayOnly` routes every link through TURN, so no peer learns this tab's
     // address. `rate`, `linkWait`, `readyTimeout`, `linkRetry`, `linkOpen`
     // and `fullRetry` override RATE, LINK_WAIT_MS, READY_TIMEOUT_MS,
@@ -297,7 +298,7 @@ export class Mesh {
     // `server` is the signaling server's origin, e.g. 'https://clusterchat.io'.
     // `WebSocket` and `RTCPeerConnection` are the constructors to use.
     constructor({ onMessage, onChange, rate = RATE, room = GLOBAL, chats = null, sessions = null,
-                  ctx = null, relayOnly = true,
+                  snaps = null, ctx = null, relayOnly = true,
                   server = location.origin,
                   WebSocket = globalThis.WebSocket,
                   RTCPeerConnection = globalThis.RTCPeerConnection,
@@ -326,6 +327,11 @@ export class Mesh {
         // Chats each peer keeps in memory in this mesh, from the welcome. Null
         // if the server sends none.
         this.sessions = null;
+        this.askSnaps = snaps;
+        // Shared prefix slots each peer keeps in this mesh, from the welcome.
+        // Null if the server sends none (split.js's runnerSnaps() then picks
+        // the default).
+        this.snaps = null;
         this.askCtx = ctx;
         // The context window of this mesh's chats, from the welcome. Null if
         // the server sends none (split.js's runnerCtx() then picks the default).
@@ -423,6 +429,7 @@ export class Mesh {
                        ...(this.client && { client: this.client }),
                        ...(this.chats && { chats: this.chats }),
                        ...(this.askSessions && { sessions: this.askSessions }),
+                       ...(this.askSnaps && { snaps: this.askSnaps }),
                        ...(this.askCtx && { ctx: this.askCtx }) });
         });
         ws.addEventListener('message', (e) => {
@@ -942,6 +949,11 @@ export class Mesh {
                 console.warn(`the cluster now keeps ${sessions ?? 'the default number of'} chats in `
                     + `memory per peer; this tab keeps ${this.sessions} until it is reloaded`);
             }
+            const snaps = Number.isInteger(m.snaps) && m.snaps >= 1 ? m.snaps : null;
+            if (this.snaps != null && snaps !== this.snaps) {
+                console.warn(`the cluster now keeps ${snaps ?? 'the default number of'} shared `
+                    + `prefixes per peer; this tab keeps ${this.snaps} until it is reloaded`);
+            }
             const ctx = Number.isInteger(m.ctx) && m.ctx >= 1 ? m.ctx : null;
             if (this.ctx != null && ctx !== this.ctx) {
                 console.warn(`the cluster now has a ${ctx ?? 'default'}-token context; this tab `
@@ -955,6 +967,7 @@ export class Mesh {
                 weightsUrl: (this.#firstUrl ??= url),
                 maxChats: m.maxChats ?? null,
                 sessions: this.sessions ?? sessions,
+                snaps: this.snaps ?? snaps,
                 ctx: this.ctx ?? ctx,
             });
             this.#welcomed();

@@ -16,7 +16,8 @@ import { dirname, join } from 'node:path';
 import { createHash, createHmac } from 'node:crypto';
 import { WebSocketServer } from 'ws';
 import { costDims, floorBlocks, blockBytes, positions, headPos, SESSIONS, PROTOCOL,
-         CONTEXTS, runnerCtx } from './web/split.js';
+         CONTEXTS, runnerCtx, MAX_PRIVATE_SNAPS as DEFAULT_MAX_PRIVATE_SNAPS,
+         SNAP_SLOTS } from './web/split.js';
 import { Room } from './signal-room.js';
 import { LEGACY_MODEL } from './web/room.js';
 
@@ -303,7 +304,12 @@ const CHAT_LEASE_MS = Number(process.env.CHAT_LEASE_MS) || 600000;
 // by MAX_PRIVATE_SESSIONS. Peers size their KV pool to match (split.js's
 // poolSlots()), so more costs VRAM and leaves fewer blocks per peer.
 const MESH_SESSIONS = count(process.env.MESH_SESSIONS, SESSIONS);
+// Shared prefix slots each peer in the global mesh keeps (split.js's
+// SNAP_SLOTS). A private mesh's creator chooses its own, capped by
+// MAX_PRIVATE_SNAPS.
+const MESH_SNAPS = count(process.env.MESH_SNAPS, SNAP_SLOTS);
 const MAX_PRIVATE_SESSIONS = count(process.env.MAX_PRIVATE_SESSIONS, 32);
+const MAX_PRIVATE_SNAPS = count(process.env.MAX_PRIVATE_SNAPS, DEFAULT_MAX_PRIVATE_SNAPS);
 
 // The context window of every chat: see geometry() above.
 const MESH_CTX = MESH_MODEL.meshCtx;
@@ -331,10 +337,10 @@ export const CLOSE_MODEL = 4003;
 const TOKEN_RE = /^[A-Za-z0-9_-]{43}$/;
 
 // A room runs one model for its whole life, kept as `room.model`.
-function makeRoom(model, label, maxChats, sessions, ctx, maxPeople = Infinity) {
+function makeRoom(model, label, maxChats, sessions, snaps, ctx, maxPeople = Infinity) {
     const room = new Room({
         label, positions: model.positions, head: model.head, minBlocks: model.minBlocks,
-        maxPeers: MAX_PEERS_PER_ROOM, maxChats, chatLeaseMs: CHAT_LEASE_MS, sessions, ctx,
+        maxPeers: MAX_PEERS_PER_ROOM, maxChats, chatLeaseMs: CHAT_LEASE_MS, sessions, snaps, ctx,
         maxPeople, idleMs: PEOPLE_IDLE_MS,
     });
     room.model = model;
@@ -342,7 +348,8 @@ function makeRoom(model, label, maxChats, sessions, ctx, maxPeople = Infinity) {
 }
 
 const GLOBAL = 'global';
-const rooms = new Map([[GLOBAL, makeRoom(MESH_MODEL, '', MAX_CHATS, MESH_SESSIONS, MESH_CTX, MAX_PEOPLE)]]);
+const rooms = new Map([[GLOBAL,
+    makeRoom(MESH_MODEL, '', MAX_CHATS, MESH_SESSIONS, MESH_SNAPS, MESH_CTX, MAX_PEOPLE)]]);
 
 // One id counter for all rooms: monotonic and never reused. A browser keys
 // links by peer id, so an id must never refer to a later peer, even after a
@@ -420,12 +427,12 @@ if (!dims) console.warn('no manifest, falling back to a flat 10-block floor. '
     + 'Set MIN_BLOCKS if that is wrong for this model.');
 
 // The room a `join` names, created if new, or a close code if it is refused.
-// `chats`, `sessions` and `ctx` are the creator's choices, read only when
+// `chats`, `sessions`, `snaps` and `ctx` are the creator's choices, read only when
 // this join creates the room. `model` comes from the invite link and is sent
 // by every join, so whoever arrives first after a restart recreates the room
 // with its model. It is also part of the join token (web/room.js), so a
 // mismatch here is a bug, refused all the same.
-function roomFor(token, chats, sessions, ctx, modelId) {
+function roomFor(token, chats, sessions, snaps, ctx, modelId) {
     if (token == null) return { key: GLOBAL, room: rooms.get(GLOBAL) };
     if (typeof token !== 'string' || !TOKEN_RE.test(token)) return { refuse: CLOSE_BAD_JOIN };
     const model = modelFor(modelId);
@@ -440,7 +447,13 @@ function roomFor(token, chats, sessions, ctx, modelId) {
             ? Math.min(sessions, MAX_PRIVATE_SESSIONS) : Math.min(MESH_SESSIONS, MAX_PRIVATE_SESSIONS);
         const windowCtx = Number.isInteger(ctx) && ctx >= 1
             ? Math.min(model.ctxFor(ctx), model.maxPrivateCtx) : model.meshCtx;
-        room = makeRoom(model, `room ${key.slice(0, 6)} `, Math.min(asked, MAX_PRIVATE_CHATS), kept, windowCtx);
+        // Shared prefix slots: more lets several agents prompting at once serve
+        // each other's prefill chunks, at a recurrent state per slot per linear
+        // block the peer holds.
+        const prefixes = Number.isInteger(snaps) && snaps >= 1
+            ? Math.min(snaps, MAX_PRIVATE_SNAPS) : Math.min(MESH_SNAPS, MAX_PRIVATE_SNAPS);
+        room = makeRoom(model, `room ${key.slice(0, 6)} `, Math.min(asked, MAX_PRIVATE_CHATS), kept,
+                        prefixes, windowCtx);
         rooms.set(key, room);
         // clusterDash (rooms-dashboard.mjs) reads this line as `opened, `
         // followed by the creator's choices, one per `, `-separated part, and
@@ -450,7 +463,8 @@ function roomFor(token, chats, sessions, ctx, modelId) {
         // too.
         room.log(`opened, model ${model.name}, `
             + `${room.chatLimit === 1 ? '1 chat' : `${room.chatLimit ?? 'no limit on'} chats`} at once, `
-            + `${kept} in memory per peer, ${windowCtx}-token context`);
+            + `${kept} in memory per peer, ${prefixes} shared prefixes, `
+            + `${windowCtx}-token context`);
     }
     return { key, room };
 }
@@ -476,7 +490,8 @@ wss.on('connection', (ws, req) => {
         if (m.type !== 'join') return ws.close(CLOSE_BAD_JOIN, 'join first');
         clearTimeout(timer);
         if (m.v !== PROTOCOL) return ws.close(CLOSE_BAD_JOIN, `protocol ${m.v}, not ${PROTOCOL}`);
-        const { key, room, refuse, why } = roomFor(m.room, m.chats, m.sessions, m.ctx, m.model);
+        const { key, room, refuse, why } = roomFor(m.room, m.chats, m.sessions, m.snaps, m.ctx,
+                                                   m.model);
         if (refuse) return ws.close(refuse, why ?? 'bad join');
         if (room.full) {
             if (!room.size) rooms.delete(key);
@@ -503,6 +518,8 @@ wss.on('connection', (ws, req) => {
             maxChats: room.chatLimit,
             // Chats each peer keeps in memory here.
             sessions: room.sessions,
+            // Shared prefix slots each peer keeps here.
+            snaps: room.snaps,
             // The context window of every chat here, in tokens.
             ctx: room.ctx,
             // People chatting here and the limit on them (null for none).

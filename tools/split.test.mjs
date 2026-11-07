@@ -6,7 +6,8 @@ import {
     holds, holders, depths, minDepth, covers, gaps, size, place, assign,
     blockBytes, blockWeightBytes, kvRowBytes, modelBytes, endBytes, kvShare, recurrentStateBytes, replayLayerBytes, floorBlocks, budgetBlocks, costDims, MIN_BYTES,
     positions, headPos, blockRange, served, filling, coverage, EMBED,
-    SESSIONS, SLOTS, MAX_SESSIONS, SNAP_SLOTS, poolSlots, runnerSessions,
+    SESSIONS, SLOTS, MAX_SESSIONS, SNAP_SLOTS, MAX_PRIVATE_SNAPS, poolSlots, runnerSessions,
+    runnerSnaps,
 } from '../web/split.js';
 
 // The floor depends on the model, so every call passes one. Ten is
@@ -760,6 +761,29 @@ console.log('\nchats in memory: the pool grows with the session count');
         linear_key_head_dim: 128, linear_value_head_dim: 128, linear_conv_kernel_dim: 4 });
     ok('more chats in memory make a block cost more',
         blockBytes(d, { sessions: 16, slots: 4 }) > blockBytes(d));
+}
+
+console.log('\nshared prefixes: the slot count a mesh chooses');
+{
+    // Shaped like runnerSessions() and resolved in the same place in serve(),
+    // so a creator's number beats the mesh's and nonsense falls back.
+    eq('the mesh\'s number sizes the runner', runnerSnaps(undefined, 32), 32);
+    eq('a caller\'s number beats the mesh\'s', runnerSnaps(4, 32), 4);
+    eq('with neither, the default', runnerSnaps(undefined, null), SNAP_SLOTS);
+    eq('clamped to MAX_PRIVATE_SNAPS', runnerSnaps(undefined, 1000), MAX_PRIVATE_SNAPS);
+    eq('a nonsense number falls back to the default',
+        [0, -2, NaN, 'x'].map((n) => runnerSnaps(n)), Array(4).fill(SNAP_SLOTS));
+
+    // Each slot holds one recurrent state per linear block the peer holds, so
+    // the budget has to price them or growth overshoots the VRAM limit.
+    const d = costDims({ ...SMOLLM2_135M, layer_types: Array.from({ length: 8 },
+        (_, i) => (i % 4 === 3 ? 'full_attention' : 'linear_attention')),
+        linear_num_key_heads: 16, linear_num_value_heads: 48,
+        linear_key_head_dim: 128, linear_value_head_dim: 128, linear_conv_kernel_dim: 4 });
+    ok('more shared prefixes make a linear block cost more',
+        blockBytes(d, { snaps: 48 }) > blockBytes(d, { snaps: 4 }));
+    eq('and cost a full-attention block nothing, which keeps no state',
+        blockBytes(d, { snaps: 48, index: 3 }), blockBytes(d, { snaps: 4, index: 3 }));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);

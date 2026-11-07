@@ -169,8 +169,12 @@ const SCENARIOS = [
     // hybrid run would copy nothing aside and share nothing. Only the hybrid
     // pass reads it; it is inert on a dense checkpoint, which has no recurrent
     // state to copy.
+    // `snapSlots` is the slot count a private mesh's creator picks. Each chunk
+    // in flight holds a slot while it is a candidate to serve another session,
+    // so two askers a PREFILL_WINDOW deep need more than the default 12 for a
+    // served hit to be reachable at all.
     { name: 'share', workers: chain(3), askers: 2, sessions: 4, long: true, replay: true,
-      promptCount: 4, snapEvery: 1 },
+      promptCount: 4, snapEvery: 1, snapSlots: 32 },
 
     // Paging must not change the output. The same setup with pages a quarter
     // the size, which changes how many pages a context spans and where page
@@ -562,6 +566,7 @@ async function runScenario(browser, base, scenario, reference) {
             + (scenario.waitMs !== undefined ? `&wait=${scenario.waitMs}` : '')
             + (scenario.pageTokens ? `&pages=${scenario.pageTokens}` : '')
             + (scenario.snapEvery ? `&snapevery=${scenario.snapEvery}` : '')
+            + (scenario.snapSlots ? `&snapslots=${scenario.snapSlots}` : '')
             + (NO_BATCH ? '&batch=0' : '');
 
         const peers = [];
@@ -1441,7 +1446,7 @@ function verdict(rows, reference) {
             `${w.map((x) => x.runner.indexSize ?? 0).join('/')} held, ` +
             `${sum('probed')} probed, ${sum('adopted')} adopted, ` +
             `${sum('adoptRefused')} refused, ${sum('snapped')} snapshots, ` +
-            `${sum('snapAdopted')} restored`);
+            `${sum('snapAdopted')} restored, ${sum('served')} served`);
     }
 
     // The read side must actually have fired somewhere, or the `share` row

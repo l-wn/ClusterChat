@@ -283,6 +283,8 @@ Signaling server environment:
 | `CHAT_LEASE_MS` | 600000 | a seat whose `chat-end` never arrives is freed after this long |
 | `MESH_SESSIONS` | 8 | chats each peer keeps in memory in the global mesh, and in a private mesh whose creator set none. Peers size their KV pool to match, about 335 MiB per chat across Qwen3.8-27B at 16K |
 | `MAX_PRIVATE_SESSIONS` | 32 | cap on a private mesh creator's "Chats in memory" |
+| `MESH_SNAPS` | 12 | shared prefix slots each peer keeps in the global mesh, and in a private mesh whose creator set none. Each slot holds one prompt beginning's recurrent state, about 150 MiB across Qwen3.8-27B, and is what lets concurrent agents reuse each other's prefill |
+| `MAX_PRIVATE_SNAPS` | 48 | cap on a private mesh creator's "Shared prefixes" |
 | `MESH_CTX` | 16384 | context window in tokens in the global mesh, and in a private mesh whose creator set none. Rounded down to a length in `split.js`'s `CONTEXTS` and to the model's `n_pos` |
 | `MAX_PRIVATE_CTX` | 32768 | cap on a private mesh creator's "Chat length" |
 

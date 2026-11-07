@@ -144,6 +144,26 @@ export const SNAP_EVERY = 16;
 //              later can still adopt a prefix.
 export const SNAP_SLOTS = 12;
 
+// The most a mesh's creator can ask for, whatever they choose. A slot is
+// `recurrentStateBytes` per linear block the peer holds, which is the largest
+// per-slot cost in the runner, so this is the one creation-time number that
+// can price a peer out of holding a useful range.
+export const MAX_PRIVATE_SNAPS = 48;
+
+// The shared prefix slots a runner is sized for: the creator's number, else
+// the mesh's from the welcome, else SNAP_SLOTS, clamped to
+// [1, MAX_PRIVATE_SNAPS]. Shaped like runnerSessions(), and read in the same
+// place.
+//
+// Worth more than it looks when several agents prompt at once: a chunk can
+// only be served from a slot that still holds it, so the pool has to span how
+// far the sessions drift apart, which is about `sessions * PREFILL_WINDOW`
+// chunks. Too few and every session computes the same chunks again.
+export function runnerSnaps(asked, mesh) {
+    const n = Math.floor(asked ?? mesh ?? SNAP_SLOTS);
+    return Number.isFinite(n) && n >= 1 ? Math.min(n, MAX_PRIVATE_SNAPS) : SNAP_SLOTS;
+}
+
 // How long a probe's page lease is held. A probe answers from the content
 // index and takes a lease on the pages it named, so they still hold those
 // bytes when the prompt's first job arrives; the adopt consumes it. Long

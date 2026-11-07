@@ -107,6 +107,21 @@
 
       <li class="step">
         <div class="step-head">
+          <h2 class="step-title"><label for="snaps">Shared prefixes</label></h2>
+          <p class="step-desc">How many prompt beginnings each computer remembers. Agents that
+            share a long prompt then reuse each other's work instead of repeating it. More needs
+            more GPU memory.</p>
+        </div>
+        <select id="snaps" class="step-input" autocomplete="off">
+          <option value="4">4 &mdash; least memory</option>
+          <option value="12" selected>12 &mdash; recommended</option>
+          <option value="24">24 &mdash; a few agents at once</option>
+          <option value="48">48 &mdash; many agents at once</option>
+        </select>
+      </li>
+
+      <li class="step">
+        <div class="step-head">
           <h2 class="step-title"><label for="name">Your name <span class="optional">(optional)</span></label></h2>
           <p class="step-desc">People you invite see "Ana invited you".</p>
         </div>

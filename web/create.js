@@ -8,8 +8,8 @@
 // the invite link (`&model=<id>`, web/room.js), so the cluster keeps it even
 // after the signaling server restarts.
 
-import { newSecret, cleanName, nameKey, creatorKey, chatsKey, ctxKey, LEGACY_MODEL } from './room.js';
-import { storedBytes, costDims, modelBytes, CONTEXTS, DEFAULT_CTX } from './split.js';
+import { newSecret, cleanName, nameKey, creatorKey, chatsKey, ctxKey, snapsKey, LEGACY_MODEL } from './room.js';
+import { storedBytes, costDims, modelBytes, CONTEXTS, DEFAULT_CTX, SNAP_SLOTS } from './split.js';
 import { saveChoice, joinedKey } from './welcome.js';
 import { lendSlider, previewRange, cellsFor } from './lend.js';
 
@@ -26,12 +26,17 @@ let chosen = LEGACY_MODEL;          // the chosen model's id
 // has loaded.
 let offered = [];
 
+// The shared prefix slots chosen, which every GB figure on this page has to
+// price: each slot keeps one recurrent state per linear block, so going from
+// 12 to 48 adds gigabytes across a hybrid model.
+const snapsNow = () => Number($('snaps').value) || SNAP_SLOTS;
+
 // The chat lengths a cluster can have, with what the whole model then takes.
 const k = (n) => `${n / 1024}K`;
 function fillCtx() {
     const sel = $('ctx'), at = Number(sel.value) || DEFAULT_CTX;
     sel.replaceChildren(...CONTEXTS.filter((n) => !dims?.n_pos || n <= dims.n_pos).map((n) => {
-        const gb = dims && modelBytes(dims, { nMax: n }) / 2 ** 30;
+        const gb = dims && modelBytes(dims, { nMax: n, snaps: snapsNow() }) / 2 ** 30;
         const o = new Option(`${k(n)} tokens${gb ? `, about ${Math.round(gb)} GB in all` : ''}`, String(n));
         o.selected = n === at;
         return o;
@@ -39,12 +44,20 @@ function fillCtx() {
 }
 fillCtx();
 $('ctx').addEventListener('change', () => { setModelSize(); render(slider.value); });
+// The slot count moves the same figures the chat length does, so it redraws
+// the same three things, the context list included.
+$('snaps').addEventListener('change', () => {
+    fillCtx();
+    setModelSize();
+    render(slider.value);
+});
 
 // The model's size at the chosen context: weights plus every block's KV.
 // Every tile shows its own model's, at that context or its longest.
 function setModelSize() {
     const ctx = Number($('ctx').value) || DEFAULT_CTX;
-    const gbOf = (d) => modelBytes(d, { nMax: Math.min(ctx, d.n_pos || ctx) }) / 2 ** 30;
+    const gbOf = (d) => modelBytes(d, { nMax: Math.min(ctx, d.n_pos || ctx),
+                                       snaps: snapsNow() }) / 2 ** 30;
     for (const m of offered) {
         const need = document.querySelector(`[data-need="${m.id}"]`);
         if (m.dims && need) need.textContent = `${Math.round(gbOf(m.dims))} GB`;
@@ -160,6 +173,9 @@ $('create').addEventListener('click', () => {
     const cap = Number($('capacity').value);
     if (Number.isInteger(cap) && cap >= 1) store(() => sessionStorage.setItem(chatsKey(secret), String(cap)));
     store(() => sessionStorage.setItem(ctxKey(secret), $('ctx').value));
+    // Shared prefix slots each peer keeps: what lets several agents prompting
+    // at once reuse each other's prefill instead of repeating it.
+    store(() => sessionStorage.setItem(snapsKey(secret), $('snaps').value));
     store(() => sessionStorage.setItem(nameKey(secret), cleanName($('name').value)));
     saveChoice(gb ? { contribute: true, limit: `${gb}gb` } : { contribute: false, limit: '' });
     // LEGACY_MODEL's links name no model, as every link did before there

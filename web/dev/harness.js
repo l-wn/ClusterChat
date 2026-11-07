@@ -169,6 +169,11 @@ export async function boot() {
         // default spacing is wider than a short test prompt, so a hybrid
         // sharing row sets it small.
         const snapEvery = q.has('snapevery') ? Number(q.get('snapevery')) : undefined;
+        // Shared prefix slots this peer keeps (split.js's SNAP_SLOTS), which a
+        // private mesh's creator chooses on the create page. It is the binding
+        // constraint when several agents prompt at once: each chunk in flight
+        // holds a slot, so four sessions a PREFILL_WINDOW deep need ~32.
+        const snapSlots = q.has('snapslots') ? Number(q.get('snapslots')) : undefined;
         // `?floor=N`: claim this many positions initially, then grow as usual.
         // Unlike `?blocks=`, growth stays on (see engine.serve).
         const floor = q.has('floor') ? Number(q.get('floor')) : null;
@@ -182,7 +187,7 @@ export async function boot() {
         // GROWTH_QUIET_MS wait, and a limit set after boot() resolves races it.
         if (q.has('vramlimit')) await engine.setVramLimit(Number(q.get('vramlimit')));
         const r = await engine.serve({ at: placement(), blocks, sessions, pageTokens, snapEvery,
-                                       floor, waitMs });
+                                       snapSlots, floor, waitMs });
         Object.assign(out, { role: r.role, held: r.held, note: r.note, error: r.error });
         // The adapter this tab got. A headless Chrome without the Vulkan flags
         // falls back to SwiftShader and everything still passes, on the CPU.

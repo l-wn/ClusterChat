@@ -20,7 +20,7 @@ import { ContextFullError } from './errors.js';
 import { Mesh } from './net.js';
 import { makeRouter, makeConversation, T_MAX } from './route.js';
 import { blockBytes, endBytes, mtpBytes, floorBlocks, positions, describeRange, DEFAULT_CTX, SLOTS,
-         SESSIONS, runnerSessions, runnerCtx } from './split.js';
+         SESSIONS, SNAP_SLOTS, runnerSessions, runnerSnaps, runnerCtx } from './split.js';
 
 // How long a Runner must be idle before #growClaim() takes another step, so
 // downloads and warm-ups do not compete with live chats.
@@ -174,18 +174,20 @@ export class Engine {
     //
     // `relayOnly` (default true) sends every link through a TURN relay, so no
     // peer sees this tab's address (see web/net.js). `chats` is the limit on
-    // replies at once, `sessions` the chats each peer keeps in memory and
+    // replies at once, `sessions` the chats each peer keeps in memory,
+    // `snaps` the shared prefix slots it keeps, and
     // `ctx` the context window, to ask for if this join creates a private mesh.
     //
     // `platform` is `{ server, WebSocket, RTCPeerConnection, client }`, for
     // running outside a page (see net.js). A page leaves it out.
-    async connect({ room, relayOnly = true, chats = null, sessions = null, ctx = null,
+    async connect({ room, relayOnly = true, chats = null, sessions = null, snaps = null, ctx = null,
                     platform = {} } = {}) {
         const net = new Mesh({
             ...platform,
             room,
             chats,
             sessions,
+            snaps,
             ctx,
             relayOnly,
             ran: () => this.#router?.ran ?? 0,
@@ -249,7 +251,7 @@ export class Engine {
     // field or URL parameter.
     async serve({ blocks = null, vram = null, at = null, slowMs = 0, floor = null,
                   sessions = undefined, ctx = undefined, pageTokens = undefined,
-                  snapEvery = undefined,
+                  snapEvery = undefined, snapSlots = undefined,
                   waitMs = undefined } = {}) {
         const { net, manifest, baseUrl } = this;
         // Chats kept in memory and the context window: the caller's numbers
@@ -257,6 +259,9 @@ export class Engine {
         // later welcome cannot resize a Runner that is already allocated.
         let slots;
         ({ sessions, slots } = runnerSessions(sessions, net?.sessions));
+        // Shared prefix slots, resolved once like `sessions`: the caller's
+        // number, else the mesh's from the welcome, else the default.
+        snapSlots = runnerSnaps(snapSlots, net?.snaps);
         this.#ctx = runnerCtx(ctx, net?.ctx, manifest?.n_pos);
         try {
             const d = dimsFromManifest(manifest);
@@ -279,7 +284,8 @@ export class Engine {
 
             this.#emit('progress', { text: 'asking for a range of blocks…' });
             const cap = at ? at[1] - at[0]
-                : this.#capacity(d, net, { blocks, vram, floor, sessions, slots, ctx: this.ctxMax });
+                : this.#capacity(d, net, { blocks, vram, floor, sessions, slots,
+                                           snaps: snapSlots, ctx: this.ctxMax });
             const range = await net.claim(cap, at);
             if (!range) {
                 throw new Error(`this tab offered ${cap} blocks and the network's minimum is ` +
@@ -296,11 +302,11 @@ export class Engine {
             // `blocks`/`vram`/`at` fix the holding, so they turn growth off.
             // `floor` only sets the starting size, so growth stays on.
             const autoGrow = !at && blocks == null && vram == null;
-            this.#serveArgs = { sessions, slots, ctx: this.ctxMax, pageTokens, snapEvery,
+            this.#serveArgs = { sessions, slots, ctx: this.ctxMax, pageTokens, snapEvery, snapSlots,
                                 waitMs, autoGrow };
 
             await this.#fill(device, d, lo, hi, slowMs, sessions, slots, this.ctxMax, pageTokens,
-                             snapEvery, waitMs);
+                             snapEvery, snapSlots, waitMs);
 
             const note = `Holding ${held} of ${manifest.model}: ${hi - lo} of ` +
                 `${positions(d.n_layer)} positions. This tab runs that stretch of every job ` +
@@ -373,7 +379,8 @@ export class Engine {
         if (!this.#manifest || !net?.positions || !(bytes > 0)) return 0;
         const d = dimsFromManifest(this.#manifest);
         const { sessions, slots } = runnerSessions(null, net.sessions);
-        const n = this.#capacity(d, net, { vram: bytes, sessions, slots, ctx: this.ctxMax });
+        const n = this.#capacity(d, net, { vram: bytes, sessions, slots,
+                                           snaps: runnerSnaps(null, net.snaps), ctx: this.ctxMax });
         return n >= Math.max(1, net.minBlocks || 1) ? n : 0;
     }
 
@@ -381,6 +388,7 @@ export class Engine {
     // bytes, or by default the network's minimum, which background growth then
     // extends.
     #capacity(d, net, { blocks, vram, floor = null, sessions = SESSIONS, slots = SLOTS,
+                        snaps = SNAP_SLOTS,
                         ctx = DEFAULT_CTX }) {
         const N = net.positions || positions(d.n_layer);
         const clamp = (n) => Math.max(0, Math.min(Math.floor(n) || 0, N));
@@ -392,7 +400,7 @@ export class Engine {
             const fixed = scratchBytes(d, T_MAX, ctx)
                 + (this.#batch ? segScratchBytes(d, GEMV_ROWS_MAX) : 0)
                 + Math.max(endBytes(d, 'embed'), endBytes(d, 'head'));
-            return clamp((vram - fixed) / blockBytes(d, { nMax: ctx, sessions, slots }));
+            return clamp((vram - fixed) / blockBytes(d, { nMax: ctx, sessions, slots, snaps }));
         }
         return clamp(floor ?? floorBlocks(d, N));
     }
@@ -401,7 +409,8 @@ export class Engine {
     // loaded. Ascending from `lo`, because a holding is the contiguous prefix
     // `[lo, have)`.
     async #fill(device, d, lo, hi, slowMs, sessions = SESSIONS, slots = SLOTS, ctx = DEFAULT_CTX,
-                pageTokens = undefined, snapEvery = undefined, waitMs = undefined) {
+                pageTokens = undefined, snapEvery = undefined, snapSlots = undefined,
+                waitMs = undefined) {
         const { net } = this;
         const L = d.n_layer, N = positions(L);
 
@@ -414,6 +423,7 @@ export class Engine {
               ...(this.#batch ? {} : { batchRows: 1 }),
               ...(pageTokens ? { pageTokens } : {}),
               ...(snapEvery ? { snapEvery } : {}),
+              ...(snapSlots ? { snapSlots } : {}),
               ...(waitMs !== undefined ? { waitMs } : {}) });
         const validation = await device.popErrorScope();
         const oom = await device.popErrorScope();
@@ -695,7 +705,8 @@ export class Engine {
         const tied = d.tied_lm_head !== false;
         if (p === 0) return tied && r.w.lm_head ? 0 : endBytes(d, 'embed');
         if (p === positions(d.n_layer) - 1) return tied && r.w.wte ? 0 : endBytes(d, 'head');
-        return blockBytes(d, { nMax: r.nMax, slots: r.slots, sessions: r.sessions, index: p - 1 });
+        return blockBytes(d, { nMax: r.nMax, slots: r.slots, sessions: r.sessions,
+                               snaps: r.snapSlots, index: p - 1 });
     }
 
     async #openDevice() {
@@ -813,7 +824,7 @@ export class Engine {
                 throw new Error(`the server did not give back positions ${lo}-${hi - 1}`);
             }
             await this.#fill(device, d, lo, hi, 0, a.sessions, a.slots, a.ctx, a.pageTokens,
-                             a.snapEvery, a.waitMs);
+                             a.snapEvery, a.snapSlots, a.waitMs);
             this.#emit('status', {
                 code: 'gpu-recovered',
                 text: `Lending again, holding ${describeRange(lo, hi, d.n_layer)}.`,

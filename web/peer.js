@@ -19,7 +19,7 @@ import { chatFormat, stopRe } from './prompt.js';
 import { runTurn } from './turn.js';
 import { makeMessage } from './message.js';
 import { summarize, formatLine, formatText } from './profile.js';
-import { readInvite, inviteModel, openRoom, inviteUrl, cleanName, NAME_MAX, nameKey, creatorKey, chatsKey, sessionsKey, ctxKey } from './room.js';
+import { readInvite, inviteModel, openRoom, inviteUrl, cleanName, NAME_MAX, nameKey, creatorKey, chatsKey, sessionsKey, snapsKey, ctxKey } from './room.js';
 import { saveChoice } from './welcome.js';
 import { lendSlider, limitGb, MAX_GB, DEFAULT_GB } from './lend.js';
 import { PROBLEMS, classify, report, ContextFullError } from './errors.js';
@@ -461,7 +461,8 @@ function missingBytes(cov) {
 function positionBytes(manifest) {
     if (!storedBytes(manifest)) return null;
     const d = { ...costDims(manifest), n_pos: manifest.n_pos };
-    const opts = { nMax: engine.ctxMax, ...(engine.net?.sessions && { sessions: engine.net.sessions }) };
+    const opts = { nMax: engine.ctxMax, ...(engine.net?.sessions && { sessions: engine.net.sessions }),
+                   ...(engine.net?.snaps && { snaps: engine.net.snaps }) };
     return [endBytes(d, 'embed'),
         ...Array.from({ length: d.n_layer }, (_, i) => blockBytes(d, { ...opts, index: i })),
         endBytes(d, 'head') + mtpBytes(d, opts)];
@@ -873,6 +874,7 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
             relayOnly: !directParam(),
             chats: creatorChats(secret),
             sessions: creatorSessions(secret),
+            snaps: creatorSnaps(secret),
             ctx: creatorCtx(secret) }));
     } catch (err) {
         console.warn('connect failed:', err);
@@ -1092,6 +1094,8 @@ function creatorNumber(s, key) {
 const creatorChats = (s) => creatorNumber(s, chatsKey);
 // The chats each peer keeps in memory, chosen and kept the same way.
 const creatorSessions = (s) => creatorNumber(s, sessionsKey);
+// The shared prefix slots each peer keeps, chosen and kept the same way.
+const creatorSnaps = (s) => creatorNumber(s, snapsKey);
 // The context window, in tokens, chosen and kept the same way.
 const creatorCtx = (s) => creatorNumber(s, ctxKey);
 

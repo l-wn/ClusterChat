@@ -103,6 +103,17 @@ its Runner with it once, in `serve()`. A different number in a later welcome
 (after a server restart) is logged and not applied until the tab reloads.
 Peers need not agree on it: each sizes only its own memory.
 
+**Shared prefixes.** Each mesh likewise fixes how many prompt beginnings every
+peer keeps, its snapshot slots (see Sharing a prefix). The global mesh's is
+`MESH_SNAPS` (default 12). A private mesh's is chosen by its creator (the
+page's "Shared prefixes", sent as `snaps` in the join that creates the room),
+capped by `MAX_PRIVATE_SNAPS` (default 48), and `MESH_SNAPS` when the creator
+chose none. It travels and is applied exactly as `sessions` is, including the
+reconnect warning. It is the binding constraint when several agents prompt at
+once: every chunk in flight holds a slot, so four sessions a `PREFILL_WINDOW`
+deep need about 32 to serve each other rather than recompute. The cost is
+memory, which is why it is the creator's call and not a constant.
+
 Nothing is sent to a socket until its `join`; one that sends anything else, or
 nothing for 10 s, is closed with code 4001, a full mesh with 4002, and a join
 naming a model the server does not offer with 4003. A join
