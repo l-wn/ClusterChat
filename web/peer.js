@@ -863,6 +863,14 @@ export async function boot(gpuConsent = Promise.resolve({ contribute: true, limi
                                 batch: params.get('batch') !== '0',
                                 share: params.get('share') !== '0' });
 
+    // Diagnostics, like window.lastProfile below: the Runner's own counters
+    // (stage.js's `counts`, carried over in the worker's snapshot by
+    // serve-host.js). Prefix sharing is measured with `indexed` against
+    // `served` — a chunk computed against one answered from a recent result —
+    // and neither shows up in a reply's token counts, since a served chunk is
+    // still a chunk the session asked for. Nothing in the page reads this.
+    window.ccRunner = () => engine?.runner ?? null;
+
     let manifest;
     try {
         // The invite, not the room: openRoom()'s result closes over a
