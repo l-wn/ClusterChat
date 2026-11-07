@@ -47,8 +47,8 @@ class NetView {
 }
 
 for (const k of ['id', 'peers', 'people', 'maxPeople', 'positions', 'blocks', 'minBlocks',
-                 'sessions', 'maxChats', 'ctx', 'online', 'connected', 'trouble', 'refused',
-                 'idled', 'full', 'staffed', 'redundancy', 'authFailures', 'relay',
+                 'sessions', 'maxChats', 'snaps', 'ctx', 'online', 'connected', 'trouble',
+                 'refused', 'idled', 'full', 'staffed', 'redundancy', 'authFailures', 'relay',
                  'relayOnly', 'weightsUrl', 'linking', 'me', 'readyPeers', 'coverage',
                  'transports', 'links', 'open', 'room']) {
     Object.defineProperty(NetView.prototype, k, {
@@ -156,9 +156,10 @@ export class EngineClient {
     // CryptoKey, so it cannot be cloned; the worker derives it instead, and
     // the page keeps its tag and historyTag from the snapshot.
     async connect({ invite = null, relayOnly = true, chats = null, sessions = null,
-                    ctx = null, server = null } = {}) {
+                    snaps = null, ctx = null, server = null } = {}) {
         await this.start();
-        const r = await this.call('connect', { invite, relayOnly, chats, sessions, ctx, server });
+        const r = await this.call('connect',
+            { invite, relayOnly, chats, sessions, snaps, ctx, server });
         // The page tokenizes as well as the worker: web/turn.js decodes here to
         // find where a stop sequence cut the reply, so it can rewind the
         // context by the right number of tokens. web/model/tokenizer.js is a

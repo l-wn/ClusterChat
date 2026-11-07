@@ -102,6 +102,7 @@ function snapshot(engine, convIds, cache) {
             minBlocks: net.minBlocks,
             sessions: net.sessions,
             maxChats: net.maxChats,
+            snaps: net.snaps,
             ctx: net.ctx,
             online: net.online,
             connected: net.connected,
@@ -259,14 +260,15 @@ export function install(post) {
         // non-extractable CryptoKey, which cannot be cloned. crypto.subtle is
         // available here, so the room is derived on this side and the page
         // keeps only its tag and historyTag (see the snapshot).
-        async connect({ invite, relayOnly, chats, sessions, ctx, server }) {
+        async connect({ invite, relayOnly, chats, sessions, snaps, ctx, server }) {
             const room = await openRoom(invite?.secret ?? null,
                 { model: invite?.model ?? null, overrideToken: invite?.overrideToken ?? null });
             const platform = {
                 ...(server && { server }),
                 ...(rtc && { RTCPeerConnection: rtc.RTCPeerConnection }),
             };
-            const r = await engine.connect({ room, relayOnly, chats, sessions, ctx, platform });
+            const r = await engine.connect({ room, relayOnly, chats, sessions, snaps, ctx,
+                                             platform });
             // `weightsUrl` goes back because the page tokenizes too — see
             // web/serve-client.js's connect().
             return { manifest: r.manifest, canPrompt: r.canPrompt,
