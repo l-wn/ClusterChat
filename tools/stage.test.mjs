@@ -741,20 +741,21 @@ console.log('\ncontent-addressing the pages a prompt fills');
         [...tight.pool.index.keys()], ['z16:4@p1:-#0']);
 }
 
-console.log('\nsharing a prefix on a hybrid checkpoint: the recurrent snapshot');
+console.log('\nsharing a prefix on a hybrid checkpoint: recurrent keyframes');
 {
     // A Gated DeltaNet layer has no position axis: its state folds in
-    // everything fed so far, so a prefix cannot be paged out of it the way KV
-    // can. What is shareable is the whole state at one position.
+    // everything fed so far, so a prefix cannot be paged out of it. What is
+    // shareable is the whole state at one position — and because the state is
+    // overwritten as a prompt feeds, the copy has to be taken on the way past.
     //
-    // Which position is the one two prompts diverge at, and only the probe
-    // that carries both prefixes' hashes knows it — a first prompt cannot
-    // guess. So the peer learns it from a miss: a probe that finds pages and
-    // no snapshot records what it wanted, and the next pass to end exactly
-    // there takes one.
+    // So it is taken every `snapEvery` chunks, like keyframes in a video. No
+    // one has to know in advance where two prompts will diverge: a later one
+    // adopts the deepest keyframe at or below its own divergence and re-feeds
+    // the rest. Here snapEvery 4 against tMax 4 puts a keyframe every 16
+    // tokens, which is also this Runner's page size.
     const r = new Runner(device, DH, hybridWeightsFor(0, LAYER_TYPES.length + 1),
         { lo: 0, hi: LAYER_TYPES.length + 1, nMax: 32, tMax: 4, slots: 2, sessions: 3,
-          pageTokens: 16, idleMs: 0, peerId: 'p', snapSlots: 1 });
+          pageTokens: 16, idleMs: 0, peerId: 'p', snapEvery: 4 });
     const hashes = ['h4', 'h8', 'h12', 'h16'];
     const feed = async (id) => {
         for (let past = 0; past < 16; past += 4) {
@@ -768,60 +769,51 @@ console.log('\nsharing a prefix on a hybrid checkpoint: the recurrent snapshot')
     const bare = r.vramBytes;
     await feed('a');
     eq('the first prompt keys its pages', r.pool.index.size, 1);
-    eq('but takes no snapshot: nothing has asked for one', r.counts.snapped, 0);
-
-    eq('so a probe finds the pages and will not offer them', probe('b'), 0);
-    eq('and records where a snapshot was wanted', r.wanted.size, 1);
-
-    // The same prefix fed again. Its pass ends exactly where the probe asked.
-    await feed('b');
-    eq('which the next pass ending there takes', r.counts.snapped, 1);
-    eq('consuming the request', r.wanted.size, 0);
-    ok('and costing one recurrent state per linear block this peer holds',
+    eq('and copies the state aside on the way past, unasked', r.counts.snapped, 1);
+    ok('which costs one recurrent state per linear block this peer holds',
         r.vramBytes > bare, `${bare} -> ${r.vramBytes}`);
 
-    eq('now the probe offers the whole page, in chunks', probe('c'), 4);
-    await r.run({ k: 'job', s: 'c', pos: 0, past: 16, n: 4, ids: [1, 1, 1, 1], opts: {},
+    // The point of keyframes: the *next* prompt adopts. Nothing had to ask
+    // first, so no prompt pays in full to teach the peer where to copy.
+    eq('so the very next prompt is offered the whole page, in chunks', probe('b'), 4);
+    await r.run({ k: 'job', s: 'b', pos: 0, past: 16, n: 4, ids: [1, 1, 1, 1], opts: {},
                   adopt: 4 }, null);
-    eq('and a session starts from it', [r.counts.adopted, r.counts.snapAdopted], [1, 1]);
-    eq('with the pages the first prompt filled', r.live.get('c').owned[0],
-        r.live.get('b').owned[0]);
+    eq('and starts from it', [r.counts.adopted, r.counts.snapAdopted], [1, 1]);
+    eq('with the pages the first prompt filled', r.live.get('b').owned[0],
+        r.live.get('a').owned[0]);
     // A linear block demands exact continuation (#checkFed), so the seeded
     // `fed` and the restored state have to agree, or this throws.
-    await r.run({ k: 'job', s: 'c', pos: 0, past: 20, n: 4, ids: [1, 1, 1, 1], opts: {} }, null);
-    eq('and continues from there', r.live.get('c').owned.length, 2);
+    await r.run({ k: 'job', s: 'b', pos: 0, past: 20, n: 4, ids: [1, 1, 1, 1], opts: {} }, null);
+    eq('and continues from there', r.live.get('b').owned.length, 2);
 }
 
 {
-    // The snapshot is for one position, so it is held against the probe that
-    // promised it: #snapSlot may not recycle a leased one even when a better
-    // ranked prefix wants the slot.
+    // A prefix that diverges above the deepest keyframe is offered as far as
+    // the keyframe below it, and the prompt re-feeds the rest. That is the
+    // whole trade: at most `snapEvery` chunks of work instead of needing a
+    // snapshot at the exact position two prompts differ.
     const r = new Runner(device, DH, hybridWeightsFor(0, LAYER_TYPES.length + 1),
-        { lo: 0, hi: LAYER_TYPES.length + 1, nMax: 32, tMax: 4, slots: 2, sessions: 3,
-          pageTokens: 16, idleMs: 0, peerId: 'p', snapSlots: 1 });
-    const feed = async (id, tag) => {
-        for (let past = 0; past < 16; past += 4) {
+        { lo: 0, hi: LAYER_TYPES.length + 1, nMax: 64, tMax: 4, slots: 2, sessions: 3,
+          pageTokens: 16, idleMs: 0, peerId: 'p', snapEvery: 4 });
+    // 32 tokens: two pages, so keyframes at 16 and 32.
+    const feed = async (id, to) => {
+        for (let past = 0; past < to; past += 4) {
             await r.run({ k: 'job', s: id, pos: 0, past, n: 4, ids: [1, 1, 1, 1], opts: {},
-                          ...(past === 12 && { hash: `${tag}16` }) }, null);
+                          ...((past + 4) % 16 === 0 && { hash: `h${past + 4}` }) }, null);
         }
     };
-    const hs = (tag) => [`${tag}4`, `${tag}8`, `${tag}12`, `${tag}16`];
-    const probe = (id, tag) => r.probe({ k: 'probe', s: id, pos: 0, hashes: hs(tag) },
-                                       LAYER_TYPES.length + 1);
+    await feed('a', 32);
+    eq('two keyframes, one per page boundary', r.counts.snapped, 2);
 
-    await feed('a', 'h');
-    probe('b', 'h');                 // asks
-    await feed('b', 'h');            // supplies
-    eq('one snapshot, one slot', [r.snaps.size, r.counts.snapped], [1, 1]);
-    eq('a probe leases it', probe('c', 'h'), 4);
-
-    // A second prefix wants the only slot while the first is promised.
-    await feed('c2', 'z');
-    probe('d', 'z');
-    await feed('d', 'z');
-    eq('the leased one is not recycled out from under the probe',
-        [r.snaps.size, r.counts.snapped], [1, 1]);
-    ok('and the first prefix is still the one held', r.snaps.has([...r.snaps.keys()][0]));
+    // A prompt sharing only the first page and a bit: it offers 4 chunks, the
+    // keyframe at 16, not the 8 its pages would allow.
+    eq('a prefix shared only to the first keyframe is offered that far',
+        r.probe({ k: 'probe', s: 'b', pos: 0, hashes: ['h4', 'h8', 'h12', 'h16', 'x20'] },
+                LAYER_TYPES.length + 1), 4);
+    eq('and one sharing both pages is offered both',
+        r.probe({ k: 'probe', s: 'c', pos: 0,
+                  hashes: ['h4', 'h8', 'h12', 'h16', 'h20', 'h24', 'h28', 'h32'] },
+                LAYER_TYPES.length + 1), 8);
 }
 
 console.log('\nthe probe: how far a prefix is held, and the lease on it');
@@ -1128,10 +1120,13 @@ console.log('\nthe probe: how far a prefix is held, and the lease on it');
     }
     eq('its page is keyed anyway', [r.pool.index.size, r.counts.indexed], [1, 1]);
     const hashes = ['h4', 'h8', 'h12', 'h16'];
-    eq('but a probe will not offer it without a recurrent snapshot',
+    // This Runner's keyframes are every 64 tokens (the default spacing times
+    // its tMax), and nMax is 16, so no pass here ever lands on one. The pages
+    // are keyed and the prefix is still not offered, because the recurrent
+    // half of it was never copied aside.
+    eq('but a probe will not offer it with no keyframe to restore from',
         r.probe({ k: 'probe', s: 'b', pos: 0, hashes }, LAYER_TYPES.length + 1), 0);
-    eq('and it remembers where one was wanted, so a later pass can take it',
-        r.wanted.size, 1);
+    eq('and nothing was copied aside', r.counts.snapped, 0);
 }
 
 {

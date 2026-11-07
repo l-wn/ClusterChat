@@ -25,7 +25,7 @@ import { sampleFromLogitsRow } from './generate.js';
 import { sampleFromCandidates, candidatesFor, TOPK_MAX } from './sampling.js';
 import { toF16, fromF16 } from '../f16.js';
 import { positions, blockRange, kvRowBytes, PAGE_TOKENS, IDLE_MS, WAIT_MS, LEASE_MS,
-         SNAP_SLOTS, SPEC_COLS } from '../split.js';
+         SNAP_SLOTS, SNAP_EVERY, SPEC_COLS } from '../split.js';
 
 // The session id a warm-up pass runs under. Peer-minted ids are
 // `${peerId}-${base36}`, so it cannot collide with a chat.
@@ -101,10 +101,6 @@ const SLOT_BUFS = ['S', 'histQ', 'histK', 'histV', 'linQ', 'linK', 'linV', 'linA
 // which is what a shared prefix snapshot holds and what it is copied into.
 const RECUR_BUFS = ['S', 'histQ', 'histK', 'histV'];
 
-// Keys a probe may have asked a snapshot for, as a multiple of the slots: a
-// little history, so a prefix probed for twice is still remembered when the
-// pass that could snapshot it finally arrives, and no more.
-const WANTED_SLACK = 4;
 
 // Thrown by #cacheFor for a job that must wait for a frame. The queue catches
 // it and parks the job. Never leaves this file.
@@ -119,6 +115,7 @@ export class Runner {
                                 sessions = slots, pageTokens = PAGE_TOKENS,
                                 idleMs = IDLE_MS, waitMs = WAIT_MS, leaseMs = LEASE_MS,
                                 specSlots = slots, snapSlots = SNAP_SLOTS,
+                                snapEvery = SNAP_EVERY,
                                 keepWarmMs = 0, batchRows = GEMV_ROWS_MAX, share = true,
                                 peerId = '' }) {
         const [blockLo, blockHi] = blockRange(lo, hi, d.n_layer);
@@ -264,20 +261,16 @@ export class Runner {
         this.leases = new Map();
         this.leaseMs = leaseMs;
 
-        // Shared prefix snapshots of the linear_attention blocks' recurrent
-        // state: key -> { layers, at, bytes, hits, leased }. A Gated DeltaNet
-        // layer has no position axis, so a prefix cannot be paged out of it
-        // the way KV can — what is shareable is the whole state at one
-        // position, and this is that. See #snapSlot() and split.js's
-        // SNAP_SLOTS.
+        // Shared prefix keyframes: the linear_attention blocks' recurrent
+        // state as it stood at a position, key -> { layers, at, bytes, hits,
+        // leased }. A Gated DeltaNet layer has no position axis, so a prefix
+        // cannot be paged out of it the way KV can, and the state is
+        // overwritten as a prompt feeds — so a copy is taken on the way past,
+        // every SNAP_EVERY chunks. See #keyframe() and split.js.
         this.snapSlots = snapSlots;
+        // Chunks between keyframes (split.js's SNAP_EVERY).
+        this.snapEvery = snapEvery;
         this.snaps = new Map();
-        // Keys a probe asked for and found no snapshot behind, with the
-        // position each wants: key -> at. Where two prompts diverge is known
-        // only to the probe that carries both prefixes' hashes, and a first
-        // prompt cannot guess it, so the peer learns where to snapshot from
-        // the miss and takes one the next time a pass ends there.
-        this.wanted = new Map();
 
         // Keep-warm (see KEEP_WARM_MS). 0 turns it off.
         this.keepWarmMs = keepWarmMs;
@@ -1395,31 +1388,32 @@ export class Runner {
         // With a linear block in range the answer is capped at the deepest
         // position a snapshot exists for, searched down from the pages' own
         // reach: a shallower snapshot is still usable, a deeper one is not.
-        // A snapshot is keyed exactly as this prefix's pages are, without the
+        // A keyframe is keyed exactly as this prefix's pages are, without the
         // page index: #chunkFor(m - 1)'s hash names the context up to m pages,
         // so the key fixes the position and the two sides cannot drift.
         const snapKey = (m) => this.#pageKey({ ...h, hash: h.hashes[this.#chunkFor(m - 1)] }, to);
-        // Every position a snapshot exists for, not only the deepest: the
-        // answer is the minimum over the whole path, so another peer may cut
-        // this prefix shorter, and then the state has to come from a snapshot
-        // at *that* position. There are at most `snapSlots` of them, and the
-        // adopting job carries no hashes to look one up with later.
+        // With a linear block in range the pages are only half the state, and
+        // the other half exists as a copy only at a keyframe. So the answer is
+        // the deepest keyframe at or below what the pages reach — the prompt
+        // re-feeds the chunks above it, at most SNAP_EVERY of them.
+        //
+        // Every keyframe found is leased, not only the deepest: the enqueuer
+        // acts on the minimum over the whole path, so another peer may cut this
+        // prefix shorter, and the adopting job carries no hashes to look a
+        // shallower one up with later.
         const snaps = new Map();
         if (recur) {
-            const step = span / P;
+            const KF = this.snapEvery * T;           // tokens between keyframes
             let deepest = 0;
-            for (let m = n; m >= step; m -= step) {
+            for (let at = Math.floor(n * P / KF) * KF; at >= KF; at -= KF) {
+                if (at % P !== 0) continue;          // not a page boundary here
+                const m = at / P;
                 const snap = this.#snapFor(snapKey(m));
                 if (!snap) continue;
                 snaps.set(m, snap);
                 deepest ||= m;
             }
-            // Nothing to restore the state from. Remember where this prompt
-            // wanted one, so the next pass that ends there takes it.
-            if (!deepest) {
-                if (n) this.#wantSnap(snapKey(n), n);
-                return 0;
-            }
+            if (!deepest) return 0;
             n = deepest;
         }
         if (!n) return 0;
@@ -1446,17 +1440,6 @@ export class Runner {
         const snap = this.snaps.get(key);
         if (snap) { snap.hits++; snap.at = performance.now(); }
         return snap;
-    }
-
-    // Remember that a probe wanted a snapshot at `key` and did not find one.
-    // Bounded by the slot count times a little slack: a client cannot make
-    // this peer remember an unbounded number of prefixes by probing.
-    #wantSnap(key, pages) {
-        if (this.wanted.has(key)) return;
-        if (this.wanted.size >= this.snapSlots * WANTED_SLACK) {
-            this.wanted.delete(this.wanted.keys().next().value);
-        }
-        this.wanted.set(key, pages);
     }
 
     // A set of per-linear-block recurrent buffers to snapshot into: a free
@@ -1512,16 +1495,22 @@ export class Runner {
         this.device.queue.submit([enc.finish()]);
     }
 
-    // Take a snapshot of this session's recurrent state, if a probe asked for
-    // one at exactly this key. Called where a page is keyed, so every rule
+    // Copy this session's recurrent state aside, if this pass ended on a
+    // keyframe boundary. Called where a page is keyed, so every rule
     // #indexPages applies to a page applies here too.
-    async #snapIfWanted(cache, key) {
-        if (!this.wanted.has(key) || this.snaps.has(key)) return;
-        if (!cache.recurrent.some(Boolean)) return;      // nothing recurrent to snapshot
+    //
+    // Every SNAP_EVERY chunks, not at a position some probe asked for: the
+    // state is overwritten as the prompt feeds, so the copy has to be taken on
+    // the way past, and a fixed spacing means no one has to know in advance
+    // where two prompts will diverge. A later prompt takes the deepest
+    // keyframe at or below its own divergence and re-feeds the rest.
+    async #keyframe(cache, key, end) {
+        if (end % (this.snapEvery * this.tMax) !== 0) return;
+        if (this.snaps.has(key)) return;
+        if (!cache.recurrent.some(Boolean)) return;      // nothing recurrent to copy
         const slot = await this.#snapSlot();
         if (!slot) return;
-        this.wanted.delete(key);
-        this.#copyRecurrent(cache.recurrent, slot.layers, `snapshot prefix ${key}`);
+        this.#copyRecurrent(cache.recurrent, slot.layers, `keyframe ${key}`);
         this.snaps.set(key, slot);
         this.counts.snapped++;
     }
@@ -1534,7 +1523,6 @@ export class Runner {
             for (const rc of snap.layers) if (rc) for (const b of RECUR_BUFS) rc[b].destroy();
         }
         this.snaps.clear();
-        this.wanted.clear();
     }
 
     // The pages this job may adopt, or null if it may not.
@@ -1977,7 +1965,7 @@ export class Runner {
                 else cache.specAt.delete(p - 1);
             }
             const key = this.#indexPages(plan, was);
-            if (key !== undefined) toSnap.push([plan.cache, key]);
+            if (key !== undefined) toSnap.push([plan.cache, key, h.past + n]);
         }
 
         // A replay that reached the end returns neither a token nor a hidden
@@ -1997,13 +1985,13 @@ export class Runner {
             readback.unmap();
         }
         // A linear_attention block cannot give a prefix back the way a page
-        // can, so what a later chat needs is the whole state at this position.
-        // Taken after the readback, not before it: the pass is settled, the
-        // copy is off the path of this job's own answer, and a model of the
-        // buffers' contents (tools/mesh.test.mjs) sees the pass's rows in them
-        // by now. Only for a prefix a probe asked for — the copy is cheap but
-        // the slots are few, and only a probe knows where two prompts diverge.
-        for (const [cache, key] of toSnap) await this.#snapIfWanted(cache, key);
+        // can, so what a later chat needs is the whole state at a position —
+        // copied aside every SNAP_EVERY chunks as this prompt goes past.
+        //
+        // After the readback, not before it: the pass is settled, the copy is
+        // off the path of this job's own answer, and a model of the buffers'
+        // contents (tools/mesh.test.mjs) sees the pass's rows in them by now.
+        for (const [cache, key, end] of toSnap) await this.#keyframe(cache, key, end);
         const t4 = performance.now();
         const gpu = prof?.collect();
         const c1 = counters();

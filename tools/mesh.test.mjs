@@ -429,7 +429,7 @@ class World {
     constructor({ maxRepairs, maxFixes, maxLocalReplay, hybrid = false, hybridRouter = hybrid,
                   idleMs = 0, ackRate = Infinity, toyVocab = null, prefillWindow,
                   ackCap = 45, rebuildBackoff = 0, share, leaseMs, probeTimeout,
-                  dropProbes = false } = {}) {
+                  dropProbes = false, snapEvery } = {}) {
         // How many distinct tokens the toy model samples. A small one makes
         // replies repeat, so prompt lookup finds drafts and some are accepted.
         this.toyVocab = toyVocab;
@@ -469,6 +469,10 @@ class World {
         // know what a probe is, so nothing ever answers one.
         this.probeTimeout = probeTimeout;
         this.dropProbes = dropProbes;
+        // Chunks between recurrent keyframes (split.js's SNAP_EVERY). The
+        // default spacing is wider than this suite's whole context, so a
+        // hybrid sharing test sets it small.
+        this.snapEvery = snapEvery;
         // Pause before a second rebuild (route.js's REBUILD_BACKOFF_MS). 0 in
         // most of this suite, whose timings are tuned to a 500ms jobTimeout.
         this.rebuildBackoff = rebuildBackoff;
@@ -499,7 +503,8 @@ class World {
         const runner = lo == null ? null
             : peerRunner(this, id, lo, hi, have, slots, this.idleMs, specSlots, sessions,
                          { ...(this.share !== undefined && { share: this.share }),
-                           ...(this.leaseMs !== undefined && { leaseMs: this.leaseMs }) });
+                           ...(this.leaseMs !== undefined && { leaseMs: this.leaseMs }),
+                           ...(this.snapEvery !== undefined && { snapEvery: this.snapEvery }) });
         const tab = { id, net, runner, repairs: 0, fixes: [], sessions: [],
                       progress: [], cancelled: false };
 
@@ -2222,42 +2227,38 @@ console.log('\nonly the tail evicted it: the boundary log repairs that without a
     eq('and no ledger violations', w.violations, []);
 }
 
-console.log('\nsharing a prefix on a hybrid checkpoint: the recurrent snapshot');
+console.log('\nsharing a prefix on a hybrid checkpoint: recurrent keyframes');
 {
-    // The whole point of the snapshot, end to end and checked on tokens. A
-    // Gated DeltaNet layer folds in everything fed so far, so an adopting
-    // session whose recurrent state were left empty would attend over pages it
-    // did not earn and answer something else entirely. The assertion that
-    // matters is that it answers exactly what a chat that fed the prefix
-    // itself answers.
+    // The whole point, end to end and checked on tokens. A Gated DeltaNet
+    // layer folds in everything fed so far, so an adopting session whose
+    // recurrent state were left empty would attend over pages it did not earn
+    // and answer something else. The assertion that matters is that it answers
+    // exactly what a chat that fed the prefix itself answers.
     //
-    // Three prompts of the same text: the first keys pages, the second's probe
-    // asks for a snapshot and its own pass supplies one, the third adopts.
+    // The state is copied aside every `snapEvery` chunks as the first prompt
+    // feeds, so the *second* adopts: nothing has to pay in full to teach the
+    // peers where to copy.
     const long = Array.from({ length: 3 * T_MAX }, (_, i) => (i * 43) % 90 + 1);
-    const { w, asker } = chain([0, 3, N], {}, { hybrid: true });
+    const { w, asker } = chain([0, 3, N], {}, { hybrid: true, snapEvery: 1 });
     const runners = [0, 1].map((id) => w.tabs.get(id).runner.real);
     ok('this world is hybrid', runners.every((r) => r.d.layer_types?.includes('linear_attention')));
 
     const first = await generate(asker, long, 2, { whole: true });
-    eq('the first prompt keys pages on both peers',
-        runners.every((r) => r.pool.index.size > 0), true);
-    eq('and neither takes a snapshot yet', runners.map((r) => r.counts.snapped), [0, 0]);
-
-    asker.router.newChat();
-    const second = await generate(asker, long, 2, { whole: true });
-    eq('the second asks for one, and its own pass supplies it',
-        runners.map((r) => r.counts.snapped), [1, 1]);
+    ok('the first prompt keys pages on both peers',
+        runners.every((r) => r.pool.index.size > 0));
+    ok('and both copy the state aside as it goes past, unasked',
+        runners.every((r) => r.counts.snapped > 0),
+        runners.map((r) => r.counts.snapped).join('/'));
     eq('having adopted nothing itself', runners.map((r) => r.counts.adopted), [0, 0]);
-    eq('and answering the same tokens', second, first);
 
     asker.router.newChat();
     w.wire.length = 0;
-    const third = await generate(asker, long, 2, { whole: true });
-    ok('the third adopts the prefix, pages and recurrent state together',
+    const second = await generate(asker, long, 2, { whole: true });
+    ok('so the second adopts, pages and recurrent state together',
         runners.every((r) => r.counts.adopted > 0 && r.counts.snapAdopted > 0),
         runners.map((r) => `${r.counts.adopted}/${r.counts.snapAdopted}`).join(' '));
-    eq('and answers exactly what a chat that fed the prefix itself answers',
-        third, first);
+    eq('and answers exactly what the chat that fed the prefix answered',
+        second, first);
     const jobs = w.wire.filter((m) => m.k === 'job' && m.s === asker.sessions.at(-1));
     eq('with no job sent for the adopted chunks', jobs.filter((m) => m.past < T_MAX), []);
     eq('and nothing silently continued', w.violations, []);

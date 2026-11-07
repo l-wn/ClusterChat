@@ -165,6 +165,10 @@ export async function boot() {
         // which checks the paging arithmetic: the same prompts at 16, 64 and a
         // page as wide as the whole window must give the same token ids.
         const pageTokens = q.has('pages') ? Number(q.get('pages')) : undefined;
+        // Chunks between recurrent keyframes (split.js's SNAP_EVERY). The
+        // default spacing is wider than a short test prompt, so a hybrid
+        // sharing row sets it small.
+        const snapEvery = q.has('snapevery') ? Number(q.get('snapevery')) : undefined;
         // `?floor=N`: claim this many positions initially, then grow as usual.
         // Unlike `?blocks=`, growth stays on (see engine.serve).
         const floor = q.has('floor') ? Number(q.get('floor')) : null;
@@ -177,7 +181,8 @@ export async function boot() {
         // no job counts as idle, so the first growth step is taken with no
         // GROWTH_QUIET_MS wait, and a limit set after boot() resolves races it.
         if (q.has('vramlimit')) await engine.setVramLimit(Number(q.get('vramlimit')));
-        const r = await engine.serve({ at: placement(), blocks, sessions, pageTokens, floor, waitMs });
+        const r = await engine.serve({ at: placement(), blocks, sessions, pageTokens, snapEvery,
+                                       floor, waitMs });
         Object.assign(out, { role: r.role, held: r.held, note: r.note, error: r.error });
         // The adapter this tab got. A headless Chrome without the Vulkan flags
         // falls back to SwiftShader and everything still passes, on the CPU.

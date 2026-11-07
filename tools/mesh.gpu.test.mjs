@@ -164,8 +164,13 @@ const SCENARIOS = [
     // against a one-peer run of the same prompts: a page adopted behind a
     // different path, or holding something other than what its key says, is
     // otherwise silent.
+    // `snapEvery: 1` puts a recurrent keyframe at every chunk. The default
+    // spacing is 16 chunks, which is wider than one of these prompts, so a
+    // hybrid run would copy nothing aside and share nothing. Only the hybrid
+    // pass reads it; it is inert on a dense checkpoint, which has no recurrent
+    // state to copy.
     { name: 'share', workers: chain(3), askers: 2, sessions: 4, long: true, replay: true,
-      promptCount: 4 },
+      promptCount: 4, snapEvery: 1 },
 
     // Paging must not change the output. The same setup with pages a quarter
     // the size, which changes how many pages a context spans and where page
@@ -556,6 +561,7 @@ async function runScenario(browser, base, scenario, reference) {
             + (scenario.sessions ? `&sessions=${scenario.sessions}` : '')
             + (scenario.waitMs !== undefined ? `&wait=${scenario.waitMs}` : '')
             + (scenario.pageTokens ? `&pages=${scenario.pageTokens}` : '')
+            + (scenario.snapEvery ? `&snapevery=${scenario.snapEvery}` : '')
             + (NO_BATCH ? '&batch=0' : '');
 
         const peers = [];

@@ -249,6 +249,7 @@ export class Engine {
     // field or URL parameter.
     async serve({ blocks = null, vram = null, at = null, slowMs = 0, floor = null,
                   sessions = undefined, ctx = undefined, pageTokens = undefined,
+                  snapEvery = undefined,
                   waitMs = undefined } = {}) {
         const { net, manifest, baseUrl } = this;
         // Chats kept in memory and the context window: the caller's numbers
@@ -295,9 +296,11 @@ export class Engine {
             // `blocks`/`vram`/`at` fix the holding, so they turn growth off.
             // `floor` only sets the starting size, so growth stays on.
             const autoGrow = !at && blocks == null && vram == null;
-            this.#serveArgs = { sessions, slots, ctx: this.ctxMax, pageTokens, waitMs, autoGrow };
+            this.#serveArgs = { sessions, slots, ctx: this.ctxMax, pageTokens, snapEvery,
+                                waitMs, autoGrow };
 
-            await this.#fill(device, d, lo, hi, slowMs, sessions, slots, this.ctxMax, pageTokens, waitMs);
+            await this.#fill(device, d, lo, hi, slowMs, sessions, slots, this.ctxMax, pageTokens,
+                             snapEvery, waitMs);
 
             const note = `Holding ${held} of ${manifest.model}: ${hi - lo} of ` +
                 `${positions(d.n_layer)} positions. This tab runs that stretch of every job ` +
@@ -398,7 +401,7 @@ export class Engine {
     // loaded. Ascending from `lo`, because a holding is the contiguous prefix
     // `[lo, have)`.
     async #fill(device, d, lo, hi, slowMs, sessions = SESSIONS, slots = SLOTS, ctx = DEFAULT_CTX,
-                pageTokens = undefined, waitMs = undefined) {
+                pageTokens = undefined, snapEvery = undefined, waitMs = undefined) {
         const { net } = this;
         const L = d.n_layer, N = positions(L);
 
@@ -410,6 +413,7 @@ export class Engine {
               share: this.#share, peerId: net.id,
               ...(this.#batch ? {} : { batchRows: 1 }),
               ...(pageTokens ? { pageTokens } : {}),
+              ...(snapEvery ? { snapEvery } : {}),
               ...(waitMs !== undefined ? { waitMs } : {}) });
         const validation = await device.popErrorScope();
         const oom = await device.popErrorScope();
@@ -808,7 +812,8 @@ export class Engine {
             if (!range || range[0] !== lo || range[1] !== hi) {
                 throw new Error(`the server did not give back positions ${lo}-${hi - 1}`);
             }
-            await this.#fill(device, d, lo, hi, 0, a.sessions, a.slots, a.ctx, a.pageTokens, a.waitMs);
+            await this.#fill(device, d, lo, hi, 0, a.sessions, a.slots, a.ctx, a.pageTokens,
+                             a.snapEvery, a.waitMs);
             this.#emit('status', {
                 code: 'gpu-recovered',
                 text: `Lending again, holding ${describeRange(lo, hi, d.n_layer)}.`,

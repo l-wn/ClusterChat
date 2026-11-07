@@ -115,12 +115,25 @@ export const IDLE_MS = 2000;
 // position axis, so a prefix cannot be paged out of it the way KV can — what
 // is shareable is the whole state at one position, and a snapshot is that.
 //
-// One costs `recurrentStateBytes` per linear block the peer holds: 50 MiB for
-// the whole of Qwen3.5-4B, 150 MiB for Qwen3.8-27B, against the
-// `recurrentStateBytes * SESSIONS` every peer already reserves for frames. So
-// a handful is affordable where general dedup is not, and they are ranked by
-// how often they are adopted.
-export const SNAP_SLOTS = 2;
+// The state is also overwritten in place as a prompt feeds, so a copy has to
+// be taken as it goes past, at a position chosen in advance. Taking one every
+// SNAP_EVERY chunks makes those positions predictable — keyframes, as in a
+// video — so a later prompt adopts the deepest keyframe at or below where it
+// diverges and re-feeds at most SNAP_EVERY chunks. Nothing has to know in
+// advance where any two prompts differ.
+//
+// 16 chunks is 1,024 tokens: about 6 s of prefill to re-feed on the 4B,
+// against the 45 s the whole prefix costs. Smaller spacing buys little and
+// costs a snapshot each time.
+export const SNAP_EVERY = 16;
+
+// How many a runner keeps. Not the number of keyframe positions a context has
+// (a 16K context has 16 of them) but a cache bound, so the cost does not grow
+// with the context: one costs `recurrentStateBytes` per linear block the peer
+// holds — 50 MiB for the whole of Qwen3.5-4B, 150 MiB for Qwen3.8-27B. The
+// shallow ones are evicted first, which keeps the deep ones that are worth
+// most (stage.js's #snapSlot).
+export const SNAP_SLOTS = 8;
 
 // How long a probe's page lease is held. A probe answers from the content
 // index and takes a lease on the pages it named, so they still hold those

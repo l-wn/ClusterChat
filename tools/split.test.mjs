@@ -177,7 +177,7 @@ console.log('\nrecurrent state: charged once per session on linear layers');
         blockBytes(qwen, { sessions: 8, kind: 'linear_attention' }),
         blockWeightBytes(qwen, { kind: 'linear_attention' }) + per * (8 + SNAP_SLOTS)
             + replayLayerBytes(qwen) * 2);
-    eq('a shared prefix snapshot is one more state per linear block',
+    eq('a shared prefix keyframe is one more state per linear block',
         blockBytes(qwen, { snaps: 3, kind: 'linear_attention' })
             - blockBytes(qwen, { snaps: 2, kind: 'linear_attention' }), per);
     eq('a replay slot: the state and conv rings again, plus 8 tokens of inputs',
@@ -234,8 +234,8 @@ console.log('\nstored bytes: a block costs what its file weighs');
     eq('a full block is its file', blockWeightBytes(d, { index: 3 }), FULL);
     eq('by kind, the mean of that kind', blockWeightBytes(d, { kind: 'full_attention' }), FULL);
     eq('unnamed, the mean of the model', blockWeightBytes(d), (LIN * 48 + FULL * 16) / 64);
-    eq('a linear block: 388.5 MiB + (8 + 2) recurrent states + 2 replay slots = 427 MiB',
-        Math.round(blockBytes(d, { index: 0 }) / MiB), 427);
+    eq('a linear block: 388.5 MiB + (8 + 8) recurrent states + 2 replay slots = 445 MiB',
+        Math.round(blockBytes(d, { index: 0 }) / MiB), 445);
     eq('a full block: 377.2 MiB + 72 MiB of KV pool = 449 MiB',
         Math.round(blockBytes(d, { index: 3 }) / MiB), 449);
     eq('the KV pool is 2 16K contexts of int8 K and V, one scale per 32',
@@ -268,9 +268,9 @@ console.log('\nstored bytes: a block costs what its file weighs');
     // The cost of the whole model, for a peer holding all of it.
     const whole = kinds.reduce((n, _, i) => n + blockBytes(d, { index: i }), 0)
         + endBytes(d, 'embed') + endBytes(d, 'head');
-    // 29.2 GiB before the two shared prefix snapshots the linear blocks now
-    // reserve (split.js's SNAP_SLOTS), which are 0.3 GiB of it.
-    eq('the whole of Qwen3.8-27B at 16K is 29.5 GiB before scratch', (whole / 2 ** 30).toFixed(1), '29.5');
+    // 29.2 GiB before the shared prefix keyframes the linear blocks reserve
+    // (split.js's SNAP_SLOTS), which are 1.2 GiB of it.
+    eq('the whole of Qwen3.8-27B at 16K is 30.4 GiB before scratch', (whole / 2 ** 30).toFixed(1), '30.4');
     eq('modelBytes() sums the same', modelBytes(d), whole);
     eq('and at 32K the KV pool doubles: 1.1 GiB more',
         ((modelBytes(d, { nMax: 32768 }) - whole) / 2 ** 30).toFixed(2),
