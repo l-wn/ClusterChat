@@ -169,7 +169,15 @@ export function makeConversation({ mesh = 'global', history = [] } = {}) {
              // Tokens of the last prompt the peers already held, so it was
              // never sent (sendPrompt()/send()); and whether to stop probing
              // for them, set when a prompt that adopted failed anyway.
-             shared: 0, noProbe: false };
+             shared: 0, noProbe: false,
+             // Tokens of the last prompt that were sent and then answered from
+             // another session's result rather than computed (stage.js's
+             // #reused). Kept apart from `shared` because that one is a control
+             // signal too — a prompt that adopted must not probe again on a
+             // retry, since the entry peer no longer has its ids, and a prompt
+             // whose chunks were merely reused still has all of them. They are
+             // added together only where the turn is reported (`lastShared`).
+             reused: 0 };
 }
 
 // `runner` is a getter: there is no Runner until the download starts, and
@@ -1142,6 +1150,13 @@ export function makeRouter({
             // boundary this job leaves at, because this job's ack arrives
             // after its trace has left.
             const round = (x) => Math.round(x * 100) / 100;
+            // True only while every peer that has run rows for this chunk
+            // answered it from another session's result instead of a pass
+            // (stage.js's #reused). Anded down the path, as `adopt` is taken as
+            // the minimum over it: a chunk one peer still had to compute cost
+            // the mesh a pass. Every peer reaching here runs rows — a relay
+            // never does — so an absent `r.reused` is a pass, not a relay.
+            const reused = (h.reused ?? true) && !!r.reused;
             const hop = { id: net.id, ms: round(t3 - t0), blocks: r.at - h.pos };
             if (r.phases) {
                 Object.assign(hop, { from: h.pos, to: r.at, plan: round(t1 - t0),
@@ -1184,7 +1199,8 @@ export function makeRouter({
                           // nothing here, which is right — a relay computes no
                           // rows.
                           ...(h.hash !== undefined
-                              && { path: [...(h.path ?? []), `${r.at}@${net.id}`] }) },
+                              && { path: [...(h.path ?? []), `${r.at}@${net.id}`],
+                                   reused }) },
                         r.hidden, null, from);
                 // Packing and sending time on this tab, stored with the RTT.
                 if (!h.replay) put(links, out, { ...links.get(out), send: round(performance.now() - t3) });
@@ -1192,7 +1208,8 @@ export function makeRouter({
             else if (r.filled) {
                 // A prefill chunk reached the end of the line. The answer only
                 // paces the enqueuer: the prompt's last chunk is what commits it.
-                route({ k: 'filled', s: h.s, key: h.key, to: h.from, past: h.past, n: h.n, trace });
+                route({ k: 'filled', s: h.s, key: h.key, to: h.from, past: h.past, n: h.n,
+                        ...(reused && { reused: true }), trace });
             }
             // Neither: a replay reached the end of the line. Nobody is waiting.
         } catch (err) {
@@ -1682,6 +1699,8 @@ export function makeRouter({
             answer(h) {
                 const w = done(h.past);
                 if (!w) return;
+                // Sent, but no peer on the path ran a pass for it.
+                if (h.reused) c.reused += w.n;
                 onChunk?.({ n: w.n, rt: Math.round((performance.now() - w.t0) * 100) / 100,
                             trace: h.trace ?? [],
                             ...(links.has(`${s}|0`) && { link: links.get(`${s}|0`) }) });
@@ -1752,6 +1771,7 @@ export function makeRouter({
             ? await probePrefix(c, hashes.slice(0, cut / T_MAX), !!opts.spec) : 0;
         const skip = adopt * T_MAX;
         c.shared = skip;
+        c.reused = 0;
         // A prompt that adopts carries no hashes. verifyHash() checks a chunk
         // against the chain through every chunk before it, and the entry peer
         // has none of the adopted ids, so the chain cannot be continued and
@@ -1996,6 +2016,7 @@ export function makeRouter({
         const chunks = (hashes, adopt) => {
             const skip = adopt * T_MAX;
             c.shared = skip;
+            c.reused = 0;
             if (skip === cut) return job(null, adopt);
             const pre = sendFills(c, ids.slice(skip, cut), past + skip, opts,
                                   { onChunk, cancellable, hashes, adopt });
@@ -2301,9 +2322,13 @@ export function makeRouter({
         // says whether an asymmetric hit is worth handling. `silent` is probes
         // nothing answered at all, which is a mesh older than this tab.
         get shared() { return { ...shared }; },
-        // Tokens of the last prompt the peers already held, so this tab never
-        // sent them. cli/ui.js prints it next to `cached`.
-        get lastShared() { return conv.shared ?? 0; },
+        // Tokens of the last prompt the mesh did not compute: the prefix it
+        // already held, so this tab never sent it, plus the chunks it did send
+        // that a peer answered from another session's result (stage.js's
+        // #reused). One number, because the difference is in how the saving was
+        // found and not in what it is worth. cli/ui.js prints it next to
+        // `cached`.
+        get lastShared() { return (conv.shared ?? 0) + (conv.reused ?? 0); },
         get eos() { return eos; },
         set eos(v) { eos = v; },
         get hybrid() { return hybrid; },

@@ -241,9 +241,9 @@ export class Runner {
                         snapped: 0, snapAdopted: 0,
                         // Prefill chunks answered from a recent result instead
                         // of a pass, and the pages that came with them
-                        // (#served). In lockstep `indexed` is one prompt's
-                        // worth and `served` is every other session's.
-                        served: 0, servedPages: 0 };
+                        // (#reused). In lockstep `indexed` is one prompt's
+                        // worth and `reused` is every other session's.
+                        reused: 0, reusedPages: 0 };
 
         // Speculative decoding's replay slots (see #specSlot()): at most
         // `specSlots` sessions speculate through this Runner's linear_attention
@@ -1561,7 +1561,7 @@ export class Runner {
     // (#pageKey), so an entry under it was produced by a job fed identical ids
     // through identical cuts: its pages, its state and its rows are the ones
     // this job would have computed.
-    #served(h, cache, to, T) {
+    #reused(h, cache, to, T) {
         if (!this.share || h.hash === undefined || !h.fill) return undefined;
         if (h.replay || h.rb || h.drafts != null) return undefined;
         const P = this.pool.pageTokens;
@@ -1601,7 +1601,7 @@ export class Runner {
     // `h.adopt` is the minimum over the whole path, which can be shorter than
     // what this peer's own probe found, so only the first `adopt` chunks of the
     // lease are taken. The header names no pages at all: a count larger than
-    // the lease, or one with no lease behind it, is refused rather than served
+    // the lease, or one with no lease behind it, is refused rather than reused
     // from pages nobody promised.
     #adoptable(h) {
         const lease = this.leases.get(h.s);
@@ -1707,14 +1707,20 @@ export class Runner {
             // joins no pass, and #timed never sees it, since a service time of
             // nothing would have this peer report itself as faster than it is
             // and route.js balances on that.
-            if (plan.served) {
+            if (plan.reused) {
                 const { at, to, T, h } = plan;
+                // `reused: true` so the enqueuer can report the tokens it did
+                // not have to pay for. It asked for them and sent the job, so
+                // nothing it already counts can show this: `cached` and
+                // `shared` are both work it decided not to send, and this is
+                // work this peer decided not to run. route.js ands it down the
+                // path and reports it next to `shared`.
                 if (plan.filling) {
-                    job.resolve({ at: to, filled: true, phases: {} });
+                    job.resolve({ at: to, filled: true, reused: true, phases: {} });
                 } else {
-                    const rows = plan.served.rows;
+                    const rows = plan.reused.rows;
                     this.#log(h.s, to, h.past, rows);
-                    job.resolve({ at: to, hidden: rows, phases: {} });
+                    job.resolve({ at: to, hidden: rows, reused: true, phases: {} });
                 }
                 void at; void T;
                 continue;
@@ -1814,7 +1820,7 @@ export class Runner {
                 && drafts.every((id) => Number.isInteger(id) && id >= 0))) {
             throw new Error(`a verify job needs 1–${SPEC_COLS - 1} draft ids, one fewer than its ${T} tokens`);
         }
-        // `adopt` is the chunk count a probe answered for this session, served
+        // `adopt` is the chunk count a probe answered for this session, taken
         // from the lease that probe left here. A session that already has a
         // frame ignores it: that is a first chunk re-sent by a repair, and the
         // cache it continues is its own.
@@ -1887,21 +1893,21 @@ export class Runner {
         // here because #pagesFor below would otherwise take a fresh page for
         // rows that already exist, and then this one would have to give it
         // back.
-        const serve = h.s === WARMUP ? undefined : this.#served(h, cache, to, T);
-        if (serve) {
-            // #served checked the table has room for all of them, so none of
+        const reuse = h.s === WARMUP ? undefined : this.#reused(h, cache, to, T);
+        if (reuse) {
+            // #reused checked the table has room for all of them, so none of
             // these can fail partway and leave the frame holding half a chunk.
-            for (const phys of serve.pages) takePage(this.device, this.pool, cache, phys);
+            for (const phys of reuse.pages) takePage(this.device, this.pool, cache, phys);
             for (let p = first; p < last; p++) cache.fed.set(p - 1, h.past + T);
             cache.hi = h.past + T;
-            if (serve.entry.layers.some(Boolean)) {
-                this.#copyRecurrent(serve.entry.layers, cache.recurrent, `served state ${h.s}`);
+            if (reuse.entry.layers.some(Boolean)) {
+                this.#copyRecurrent(reuse.entry.layers, cache.recurrent, `reused state ${h.s}`);
             }
-            serve.entry.hits++;
-            serve.entry.at = performance.now();
-            this.counts.served++;
-            this.counts.servedPages += serve.pages.length;
-            return { h, at, to, T, cache, served: serve.entry, filling };
+            reuse.entry.hits++;
+            reuse.entry.at = performance.now();
+            this.counts.reused++;
+            this.counts.reusedPages += reuse.pages.length;
+            return { h, at, to, T, cache, reused: reuse.entry, filling };
         }
         if (h.s !== WARMUP) {
             this.#pagesFor(h.s, cache, mtp && head ? Math.min(this.nMax, h.past + T + SPEC_COLS) : h.past + T);

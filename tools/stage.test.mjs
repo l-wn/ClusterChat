@@ -830,7 +830,7 @@ for (const [label, dims, weights] of [['dense', D, weightsFor(0, 4)],
     const r = new Runner(gpu.device, dims, weights,
         // pageTokens 4 against tMax 4, as PAGE_TOKENS and T_MAX both being 64
         // makes it in production: one chunk is exactly one page, so a chunk can
-        // be served whole. A chunk narrower than a page shares one with its
+        // be reused whole. A chunk narrower than a page shares one with its
         // neighbours and cannot be.
         { lo: 0, hi, nMax: 32, tMax: 4, slots: 3, sessions: 3, pageTokens: 4,
           idleMs: 0, peerId: 'p' });
@@ -844,16 +844,16 @@ for (const [label, dims, weights] of [['dense', D, weightsFor(0, 4)],
     await feed('a');
     const page = r.live.get('a').owned[0];
     eq(`${label}: the first session keyed a page per chunk`, r.pool.index.size, 4);
-    eq(`${label}: and nothing was served to it`, r.counts.served, 0);
+    eq(`${label}: and nothing was reused for it`, r.counts.reused, 0);
 
     // The same chunks again, as a second session in lockstep would send them.
-    // Only the one that completes a page can be served: the three before it do
-    // not end on a page boundary, so there is nothing keyed to serve them from.
+    // Only the one that completes a page can be reused: the three before it do
+    // not end on a page boundary, so there is nothing keyed to answer them from.
     gpu.resetTrace();
     await feed('b');
     eq(`${label}: every one of its chunks runs no pass at all`, gpu.takeTrace(), []);
-    eq(`${label}: all four are counted as served`,
-        [r.counts.served, r.counts.servedPages], [4, 4]);
+    eq(`${label}: all four are counted as reused`,
+        [r.counts.reused, r.counts.reusedPages], [4, 4]);
     eq(`${label}: and points at the page the first session filled`,
         r.live.get('b').owned[0], page);
     eq(`${label}: which both sessions now hold`, r.pool.refs[page], 2);
@@ -1192,7 +1192,7 @@ console.log('\nthe probe: how far a prefix is held, and the lease on it');
     eq('its page is keyed anyway', [r.pool.index.size, r.counts.indexed], [1, 1]);
     const hashes = ['h4', 'h8', 'h12', 'h16'];
     // The state is copied aside at every chunk, so an identical chunk running
-    // right now can be served from it. But a *probe* jumps a prompt to a
+    // right now can be answered from it. But a *probe* jumps a prompt to a
     // position, which only a keyframe can answer: keyframes here are every 64
     // tokens (the default spacing times this Runner's tMax) and nMax is 16, so
     // no pass lands on one and the prefix is not offered.

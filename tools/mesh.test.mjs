@@ -2264,7 +2264,7 @@ console.log('\nsharing a prefix on a hybrid checkpoint: recurrent keyframes');
     eq('and nothing silently continued', w.violations, []);
 }
 
-console.log('\nserving a duplicate chunk: two prompts at once, one computation');
+console.log('\nreusing a duplicate chunk: two prompts at once, one computation');
 {
     // Four agents started together share a prefix and share nothing, because
     // sharing needs a finished writer and they all begin at zero in lockstep.
@@ -2279,20 +2279,34 @@ console.log('\nserving a duplicate chunk: two prompts at once, one computation')
     const other = w.join(101);
     const runners = [0, 1].map((id) => w.tabs.get(id).runner.real);
 
+    // `lastShared` is the *last prompt's* saving, so it is read where the CLI
+    // reads it (cli/core.js's `end`): once the prompt is answered, before the
+    // decode turns that follow reset it.
+    const shares = [];
+    const grab = (i, tab) => (n) => { if (n === 0) shares[i] = tab.router.lastShared; };
     const both = await Promise.all([
-        generate(asker, long, 2, { whole: true }),
-        generate(other, long, 2, { whole: true }),
+        generate(asker, long, 2, { whole: true, between: grab(0, asker) }),
+        generate(other, long, 2, { whole: true, between: grab(1, other) }),
     ]);
     eq('both prompts answer the same tokens', both[0], both[1]);
     ok('and one of them computed nothing for the shared chunks',
-        runners.every((r) => r.counts.served > 0),
-        runners.map((r) => `served ${r.counts.served} of ${r.counts.indexed} keyed`).join(', '));
+        runners.every((r) => r.counts.reused > 0),
+        runners.map((r) => `reused ${r.counts.reused} of ${r.counts.indexed} keyed`).join(', '));
     // The saving stated as a number: each distinct chunk is keyed once, not
     // once per session.
     for (const r of runners) {
-        ok(`peer keyed each chunk about once (${r.counts.indexed} keyed, ${r.counts.served} served)`,
-            r.counts.indexed <= 2 * (r.counts.indexed + r.counts.served) / 3);
+        ok(`peer keyed each chunk about once (${r.counts.indexed} keyed, ${r.counts.reused} reused)`,
+            r.counts.indexed <= 2 * (r.counts.indexed + r.counts.reused) / 3);
     }
+    // And the enqueuer is told, which is the only way anyone sees it. A reused
+    // chunk was asked for and sent, so neither `cached` nor the probe's own
+    // skip can account for it: without this the whole saving is invisible in
+    // every number a client prints, which is how it came to be mistaken for no
+    // sharing at all on a live cluster.
+    ok('and at least one enqueuer counts the reuse in what it reports',
+        shares.some((n) => n > 0), shares.join(' / '));
+    ok('never more than the prompt it sent', shares.every((n) => n <= long.length),
+        shares.join(' / '));
     eq('with nothing silently continued', w.violations, []);
 }
 

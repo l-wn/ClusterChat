@@ -294,10 +294,13 @@ export function makeCluster({ engine, template, info, sampling = {}, count: toke
             : stopped === 'length' || stopped === 'context' ? 'length' : 'end';
         yield { type: 'end', stop,
                 // `cached`: tokens this chat already had on the peers.
-                // `shared`: tokens of this prompt the peers held from another
-                // chat, so they were never sent (route.js's probe). Two
-                // sessions in different directories share no chat but almost
-                // all of their prompt, which is the whole point.
+                // `shared`: tokens of this prompt the mesh did not compute
+                // because another chat already had. Either it held the prefix
+                // and they were never sent (route.js's probe), or they were
+                // sent and a peer answered them from a chat running right now
+                // (stage.js's #reused). Two sessions in different directories
+                // share no chat but almost all of their prompt, which is the
+                // whole point.
                 usage: { input: cached + result.promptTokens, output: result.ids.length, cached,
                          shared: engine.lastShared } };
     }

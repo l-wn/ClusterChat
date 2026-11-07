@@ -150,11 +150,13 @@ export function request({ agent }, totals) {
             const tps = rate();
             const why = ended.stop === 'tool' ? c.violet(' → tool') : ended.stop === 'length' ? c.yellow(' (cut at the token limit)') : '';
             // `cached` is this chat's own context; `shared` is tokens of this
-            // prompt the peers already held from another chat and so were
-            // never sent. Two agent sessions in different directories can
-            // never share a chat (the system prompt carries the cwd) and still
-            // share almost all of their prompt, so the two are worth telling
-            // apart.
+            // prompt the mesh did not compute because another chat already
+            // had — whether the peers held the prefix and it was never sent,
+            // or it was sent and a peer answered it from a chat running right
+            // now (route.js's lastShared). Two agent sessions in different
+            // directories can never share a chat (the system prompt carries
+            // the cwd) and still share almost all of their prompt, so the two
+            // are worth telling apart.
             const shared = u.shared ? c.dim(` · ${n(u.shared)} shared`) : '';
             print(`${IN}${who} ${c.green('✓')} ${n(u.input - u.cached)} in `
                 + `${c.dim(`· ${n(u.cached)} cached`)}${shared}${c.dim(' ·')} `
