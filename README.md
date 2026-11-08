@@ -22,9 +22,9 @@ Everyone gets their own chat, several replies run at once, and anyone can leave 
 
 <br />
 
-| [**12 people**](#performance) | [**19.7 tok/s**](#performance) | [**8.1 tok/s**](#performance) | **0 installs** |
-|:-:|:-:|:-:|:-:|
-| chatting at once on two RTX 3090s | two RTX 3090s, one machine | one RTX 3090 in France, one in Spain | a browser tab |
+| [**12 people**](#performance) | [**8 coding agents**](#coding-agents) | [**19.7 tok/s**](#performance) | [**8.1 tok/s**](#performance) | **0 installs** |
+|:-:|:-:|:-:|:-:|:-:|
+| chatting at once on two RTX 3090s | opencode at once on two RTX 3090s, each response starting in 3.6 s | two RTX 3090s, one machine | one RTX 3090 in France, one in Spain | a browser tab |
 
 <br />
 
@@ -46,6 +46,12 @@ running a model instead of the pieces of a file.
   browser runs the waiting chats' next tokens as one GPU pass, so with twelve
   people on two RTX 3090s, a reply still writes at 7.1 tok/s with 5 to 8
   concurrent prompts ([numbers](#performance)).
+- **Runs your whole team's coding agents.** Point opencode or Claude Code at
+  the cluster with one command. With eight opencode sessions on two RTX
+  3090s, each agent's response still starts in a median 3.6 s, against
+  2.4 s for one. The cluster keeps every conversation in memory and shares the
+  system prompt between sessions, so each request only processes what's new
+  ([numbers](#coding-agents)).
 - **Nobody has to stay.** There is no host. Each piece of the model can be
   held by more than one browser. When someone leaves mid-reply, the browser
   before them replays the lost work into another holder, and the reply
@@ -79,6 +85,7 @@ running a model instead of the pieces of a file.
 | **Replies at once** | set by whoever starts the cluster |
 | **Chats each browser keeps in memory** | 8 by default, up to 32 in a private cluster |
 | **People per cluster** | up to 64 |
+| **Coding agents** | opencode and Claude Code, through [`npx clusterchat@latest connect`](#use-it-from-your-coding-agent); 8 opencode sessions at once, each response starts in a median 3.6 s ([Coding agents](#coding-agents)) |
 | **Install** | none: a browser tab |
 
 ## How it compares
@@ -154,6 +161,86 @@ node tools/load.mjs --url <cluster url> --users 12 --ramp 30 --turns 3 --think 1
 
 </details>
 
+### Coding agents
+
+Point a whole team's coding agents at one cluster. Up to eight opencode
+sessions at once on two RTX 3090s, each working in its own repo, 16K context:
+
+| opencode agents at once | 1 | 2 | 4 | 8 |
+|---|--:|--:|--:|--:|
+| Each response starts after | 2.4 s | 3.1 s | 2.8 s | **3.6 s** |
+| A new session's first response starts after | 21 s | 22 s | 27 s | **33 s** |
+| Tokens written, all agents together | 5.2 tok/s | 7.3 tok/s | 8.5 tok/s | **8.9 tok/s** |
+
+Medians, waiting in line included.
+
+- **Each request only processes what's new.** An agent resends the whole
+  conversation every time it asks the model something, 8,000 to 10,000 tokens
+  here. The cluster keeps every conversation in memory, so a request usually
+  adds about a hundred new tokens, and eight agents wait barely longer than
+  one.
+- **The system prompt is processed once for everyone.** Every opencode session
+  opens with the same ~8,000-token system prompt and tool list, which takes the
+  cluster about 100 s. Each new session reuses 7,168 of those tokens, so its
+  first response starts after 21 s, or 33 s with eight agents running.
+- **The work gets done.** Bug fixes, edits across files and shell tasks: 82 of
+  82 tasks passed across the 16K and 32K runs, with no malformed tool calls in
+  544 requests.
+
+<details>
+<summary>How it was measured, and the full numbers</summary>
+
+Qwen3.8-27B q8 on two RTX 3090s in one rented machine, one GPU per browser
+tab, each holding half the model. A private cluster with 32 chats in memory.
+opencode 2.2.5, one `clusterchat connect` per session, run on a separate
+machine and reaching the cluster through the relay. One session runs five
+tasks: fix a bug, answer a question about the code, add a function with a
+test, rename a function across files, and a multi-step shell task. At 2, 4 and
+8 sessions, each session runs the bug fix and the shell task.
+
+| Context | Agents | Each response starts (median) | New session's first response (median) | Any request, first token p50 / p95 | Writing speed, each response | All agents | Tasks passed | Time per task (median) | Retried |
+|---|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| 16K | 1 | 2.4 s | 21 s | 6.2 / 21.5 s | 12.7 tok/s | 5.2 tok/s | 5/5 | 59 s | 0 |
+| 16K | 2 | 3.1 s | 22 s | 5.5 / 34.7 s | 9.9 tok/s | 7.3 tok/s | 4/4 | 197 s | 0 |
+| 16K | 4 | 2.8 s | 27 s | 5.5 / 50.6 s | 3.8 tok/s | 8.5 tok/s | 8/8 | 223 s | 0 |
+| 16K | 8 | 3.6 s | 33 s | 6.5 / 41.6 s | 1.6 tok/s | 8.9 tok/s | 16/16 | 475 s | 15 |
+| 32K | 1 | 2.4 s | 22 s | 5.8 / 22.2 s | 11.1 tok/s | 5.9 tok/s | 5/5 | 82 s | 0 |
+| 32K | 2 | 5.5 s | 31 s | 5.9 / 35.0 s | 8.8 tok/s | 8.9 tok/s | 4/4 | 115 s | 0 |
+| 32K | 4 | 2.8 s | 32 s | 4.4 / 37.5 s | 4.0 tok/s | 9.2 tok/s | 8/8 | 135 s | 2 |
+| 32K | 8 | 2.9 s | 44 s | 5.1 / 48.7 s | 1.6 tok/s | 10.2 tok/s | 16/16 | 317 s | 18 |
+
+*Each response starts* is the time to first token for a request that
+continues a conversation, typically after the agent ran a tool. *New session's
+first response* is the same for
+the ~8,000-token first request of a session that reused the shared system
+prompt. Both include waiting in line. *Any request*
+also counts each session's first request and opencode's title requests.
+*Retried* counts requests the cluster turned away with "try again in a moment"
+while busy; opencode sent them again and every task still passed. The 32K run
+happened to need fewer requests for the same tasks, so its times are not a sign
+that 32K is faster.
+
+**Several agents through one connect** also works: four opencode sessions
+pointed at a single `clusterchat connect` passed 8 of 8 tasks (median 374 s at
+16K, 263 s at 32K). A connect writes one reply at a time, so requests wait
+their turn (median 37–39 s). Give each agent its own connect for speed.
+
+```bash
+# All five tasks, one session.
+node tools/cli.opencode.mjs '<invite link>' --ctx 16k --levels 1
+
+# 2, 4 and 8 sessions at once, one connect each.
+node tools/cli.opencode.mjs '<invite link>' --ctx 16k --levels 2,4,8 --tasks fix,shell
+
+# Four sessions through one connect.
+node tools/cli.opencode.mjs '<invite link>' --ctx 16k --levels 4 --tasks fix,shell --shared
+```
+
+Before the cluster shared prompts between sessions, eight opencode sessions
+finished 1 task of 8 in 50 minutes.
+
+</details>
+
 ## How it works
 
 <img src="docs/img/how-it-works.svg" alt="Ana's laptop and Lab PC 3 each hold pieces 1 to 6 of the model. Ben's gaming PC and Mia's desktop each hold pieces 7 to 12. Ben's message runs on Ana's laptop, then his own PC. Mia's runs on Lab PC 3, then her desktop. All four connect to a signaling server and a relay." width="100%" />
@@ -197,6 +284,8 @@ share the invite link.
 
 ## Use it from your coding agent
 
+<img src="docs/img/agents.gif" alt="Four computers lend their GPUs to one cluster. Four developers point opencode and Claude Code at it with npx clusterchat connect, and the agents read, edit and run tests at the same time. Ana closes her laptop and every agent keeps going." width="100%" />
+
 The [`clusterchat`](cli/README.md) npm package joins a cluster from your
 terminal, with no GPU or browser needed, and serves it to Claude Code, opencode
 and other tools as local Anthropic and OpenAI APIs:
@@ -205,6 +294,10 @@ and other tools as local Anthropic and OpenAI APIs:
 npx clusterchat@latest connect '<invite link>'
 ```
 
+A whole team can run agents on one cluster at once: eight opencode sessions on
+two RTX 3090s, and each response still starts in a median 3.6 s
+([Coding agents](#coding-agents)).
+
 The invite card on a private cluster's page shows this command with the link
 filled in. It works the same with a self-hosted server: the client takes the
 server from the link. See [cli/README.md](cli/README.md) for each tool's setup.
@@ -212,8 +305,9 @@ server from the link. See [cli/README.md](cli/README.md) for each tool's setup.
 ## What it doesn't do yet
 
 - **One model per cluster.**
-- **Chat only.** There is no API and no tool use yet. Claude Code and OpenAI-compatible APIs
-  are planned.
+- **Agents share the cluster's speed.** Total throughput grows as you add
+  agents, but each one's replies slow down: at eight opencode sessions on two
+  RTX 3090s, each reply writes at about 1.6 tok/s.
 - **Peers are trusted.** Nothing checks that a browser ran its piece honestly.
 - **First come, first served.** Each browser runs one job queue, so a long
   prompt can briefly slow other chats on the same peers.
