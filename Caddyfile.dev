@@ -29,6 +29,12 @@
 		reverse_proxy 127.0.0.1:{$SIGNAL_PORT:8081}
 	}
 
+	# The GitHub star count for the front page's star button, which the
+	# signaling server keeps (signal-server.js).
+	handle /stars.json {
+		reverse_proxy 127.0.0.1:{$SIGNAL_PORT:8081}
+	}
+
 	# The chat page runs its serving peer in a worker that reads each link's
 	# bufferedAmount out of a SharedArrayBuffer, which needs the page to be
 	# cross-origin isolated. Production sets these in Caddyfile's

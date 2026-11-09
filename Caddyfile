@@ -60,6 +60,12 @@
 		reverse_proxy 127.0.0.1:8080
 	}
 
+	# The GitHub star count for the front page's star button, which the
+	# signaling server keeps (signal-server.js).
+	handle /stars.json {
+		reverse_proxy 127.0.0.1:8080
+	}
+
 	handle {
 		# Clean URLs: /chat serves chat.html, and site/about.html is /about.
 		try_files {path} {path}.html

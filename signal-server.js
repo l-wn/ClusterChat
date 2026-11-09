@@ -12,6 +12,7 @@
 //   node signal-server.js        # ws://127.0.0.1:8080, proxied at /ws by Caddy
 
 import { readFileSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { dirname, join } from 'node:path';
 import { createHash, createHmac } from 'node:crypto';
 import { WebSocketServer } from 'ws';
@@ -386,8 +387,47 @@ setInterval(() => {
 
 const conns = new Map();          // CF-Connecting-IP -> open socket count
 
+// The repo's GitHub star count, for the front page's star button. Asked of
+// GitHub here, every STARS_MS, so a visitor's browser never contacts GitHub;
+// the page reads it from /stars.json. null until the first answer, and kept
+// through a failed refresh.
+const REPO = process.env.GITHUB_REPO || 'l-wn/ClusterChat';
+const STARS_MS = 10 * 60 * 1000;
+let stars = null;
+async function refreshStars() {
+    try {
+        const r = await fetch(`https://api.github.com/repos/${REPO}`, {
+            headers: { accept: 'application/vnd.github+json', 'user-agent': 'clusterchat-signal' },
+            signal: AbortSignal.timeout(10000),
+        });
+        if (!r.ok) throw new Error(`GitHub answered ${r.status}`);
+        const n = (await r.json()).stargazers_count;
+        if (Number.isInteger(n) && n >= 0) stars = n;
+    } catch (err) {
+        console.warn(`stars: ${err.message}`);
+    }
+}
+refreshStars();
+setInterval(refreshStars, STARS_MS).unref?.();
+
+// Plain HTTP on the signaling port answers /stars.json; everything else
+// here is the WebSocket upgrade.
+const http = createServer((req, res) => {
+    if (req.method === 'GET' && req.url?.split('?')[0] === '/stars.json') {
+        res.writeHead(stars == null ? 503 : 200, {
+            'content-type': 'application/json',
+            'cache-control': stars == null ? 'no-store' : 'public, max-age=300',
+        });
+        res.end(JSON.stringify({ stars }));
+        return;
+    }
+    res.writeHead(426, { 'content-type': 'text/plain' });
+    res.end('upgrade required');
+});
+http.listen(PORT, HOST);
+
 const wss = new WebSocketServer({
-    host: HOST, port: PORT, maxPayload: MAX_PAYLOAD,
+    server: http, maxPayload: MAX_PAYLOAD,
     verifyClient: ({ origin, req }, done) => {
         if (!originAllowed(origin)) return done(false, 403, 'origin not allowed');
         const ip = req.headers['cf-connecting-ip'];
