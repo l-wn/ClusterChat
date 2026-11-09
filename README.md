@@ -5,32 +5,95 @@
 # ClusterChat
 
 **The AI your group runs together.**<br />
-Cluster the graphics cards you already have to run a 27B model in the browser.<br />
-Everyone gets their own chat, several replies run at once, and anyone can leave without breaking it.
+Cluster the GPUs you already have to run one 27B model.<br />
+Chat with it in a browser tab, or point your whole team's coding agents at it.
 
 [![Live demo](https://img.shields.io/badge/live%20demo-clusterchat.io-7022d6)](https://clusterchat.io/chat)
+[![npm](https://img.shields.io/badge/npx-clusterchat-cb3837)](cli/README.md)
 [![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-0b0b0c)](LICENSE)
 [![WebGPU](https://img.shields.io/badge/WebGPU-hand--written%20kernels-0b0b0c)](docs/model.md)
 [![WebRTC](https://img.shields.io/badge/WebRTC-relay%20only-0b0b0c)](docs/architecture.md)
 [![Model](https://img.shields.io/badge/model-Qwen3.8--27B%20q8-0b0b0c)](#what-it-can-run)
 
-[**Start a private cluster**](https://clusterchat.io/create) ·
-[**Try it now**](https://clusterchat.io/chat) ·
-[How it works](#how-it-works) ·
+### [**Try it now**](https://clusterchat.io/chat) · [**Start a private cluster**](https://clusterchat.io/create) · [**Connect a coding agent**](#connect-in-one-command)
+
+[At a glance](#at-a-glance) ·
+[Chat](#chat-together) ·
+[Coding agents](#coding-agents) ·
+[Benchmarks](#benchmarks) ·
 [How it compares](#how-it-compares) ·
+[How it works](#how-it-works) ·
+[Limitations](#limitations) ·
+[Run it yourself](#run-it-yourself) ·
 [Docs](#documentation)
 
 <br />
 
-| [**12 people**](#performance) | [**8 coding agents**](#coding-agents) | [**19.7 tok/s**](#performance) | [**8.1 tok/s**](#performance) | **0 installs** |
-|:-:|:-:|:-:|:-:|:-:|
-| chatting at once on two RTX 3090s | opencode at once on two RTX 3090s, each response starting in 3.6 s | two RTX 3090s, one machine | one RTX 3090 in France, one in Spain | a browser tab |
+| [**12 people**](#speed) | [**8 coding agents**](#benchmarks) | [**82 / 82**](#built-for-a-whole-team) | [**19.7 tok/s**](#speed) | [**8.1 tok/s**](#speed) | **0 installs** |
+|:-:|:-:|:-:|:-:|:-:|:-:|
+| chatting at once on two RTX 3090s | concurrent opencode sessions (3.6 s to 1st tok) | agent tasks passed, no malformed tool calls | one chat, two RTX 3090s in one PC | across the internet, France ↔ Spain | a browser tab is enough |
 
 <br />
 
 <img src="docs/img/demo.gif" alt="Four computers join one cluster, each lending a different amount of GPU memory. Each person asks their own question and the replies are written at the same time. Ana closes her laptop mid-reply, the other chats keep going, and Mia starts a new one." width="900" />
 
 </div>
+
+## At a glance
+
+ClusterChat splits a 27B model across the browsers of everyone in a group, so
+machines that could never run it alone run it together. Anyone with the link
+can **chat** in a browser tab, and anyone with a terminal can **run their coding
+agents** on it through local Anthropic and OpenAI APIs. Many people and agents
+use it at once, any machine can leave mid-reply without breaking it, and the
+invite code never reaches the server.
+
+| | |
+|---|---|
+| **Model** | Qwen3.8-27B, 8-bit, about 27 GiB across the cluster |
+| **Speed** | up to 19.7 tok/s per chat ([Speed](#speed)) |
+| **Context** | 4K to 32K tokens, chosen when the cluster is created (16K by default); the KV cache is int8 |
+| **People per cluster** | up to 64, each with their own chat |
+| **Replies at once** | set by whoever starts the cluster |
+| **Chats each browser keeps in memory** | 8 by default, up to 32 in a private cluster |
+| **Coding agents** | opencode, Claude Code and any OpenAI-compatible tool; 8 opencode sessions at once ([Benchmarks](#benchmarks)) |
+| **Install** | none to chat or lend a GPU; `npx clusterchat@latest` for agents |
+
+## Two ways to use it
+
+<table>
+<tr>
+<th width="50%">Chat in your browser</th>
+<th width="50%">Run your coding agents on it</th>
+</tr>
+<tr>
+<td valign="top">
+
+Open the invite link. Lend as much GPU memory as you like, or none, and
+start chatting. Everyone gets their own chat, and the replies are written at
+the same time.
+
+**12 people** on two RTX 3090s, each reply at about 7 tok/s.
+
+[Try the demo](https://clusterchat.io/chat) · [Start a private cluster](https://clusterchat.io/create) · [More](#chat-together)
+
+</td>
+<td valign="top">
+
+One command in your terminal. No GPU or browser needed:
+
+```bash
+npx clusterchat@latest connect '<invite link>'
+```
+
+Then point opencode or Claude Code at it. **8 agents at once**, and each
+response starts in a median **3.6 s**.
+
+[Setup](#connect-in-one-command) · [Benchmarks](#benchmarks)
+
+</td>
+</tr>
+</table>
 
 ## Why ClusterChat
 
@@ -40,18 +103,6 @@ ClusterChat turns those machines into one model that the whole group uses at
 the same time. It works like a torrent, except people share the work of
 running a model instead of the pieces of a file.
 
-- **Built for many people at once.** Everyone gets their own chat, saved in
-  their own browser. One cluster writes several replies at the same time,
-  each with its own KV cache on every machine, for up to 64 people. Each
-  browser runs the waiting chats' next tokens as one GPU pass, so with twelve
-  people on two RTX 3090s, a reply still writes at 7.1 tok/s with 5 to 8
-  concurrent prompts ([numbers](#performance)).
-- **Runs your whole team's coding agents.** Point opencode or Claude Code at
-  the cluster with one command. With eight opencode sessions on two RTX
-  3090s, each agent's response still starts in a median 3.6 s, against
-  2.4 s for one. The cluster keeps every conversation in memory and shares the
-  system prompt between sessions, so each request only processes what's new
-  ([numbers](#coding-agents)).
 - **Nobody has to stay.** There is no host. Each piece of the model can be
   held by more than one browser. When someone leaves mid-reply, the browser
   before them replays the lost work into another holder, and the reply
@@ -65,7 +116,8 @@ running a model instead of the pieces of a file.
   bit-identical whether one browser or ten hold the model.
 - **Private by design.** Invite codes live in the link's fragment and never
   reach the server. Every handshake is signed with a key derived from the
-  code. Links go through a relay, so nobody learns anyone else's IP address.
+  code. Links go through a relay, so nobody learns anyone else's IP address
+  ([more](#private-clusters)).
 - **Nothing to install.** Open a link. A new browser serves as soon as its
   first piece has downloaded and takes on more while it is idle, up to the
   VRAM limit its owner sets. Any browser can join just to chat.
@@ -75,48 +127,22 @@ running a model instead of the pieces of a file.
 > processes it. Invite people you trust. The public demo is open to anyone, so
 > don't send it anything personal.
 
-## At a glance
+## Chat together
 
-| | |
-|---|---|
-| **Model** | Qwen3.8-27B, 8-bit, about 27 GiB across the cluster |
-| **Speed** | up to 19.7 tok/s per chat ([Performance](#performance)) |
-| **Context** | 4K to 32K tokens, chosen when the cluster is created (16K by default); the KV cache is int8 |
-| **Replies at once** | set by whoever starts the cluster |
-| **Chats each browser keeps in memory** | 8 by default, up to 32 in a private cluster |
-| **People per cluster** | up to 64 |
-| **Coding agents** | opencode and Claude Code, through [`npx clusterchat@latest connect`](#use-it-from-your-coding-agent); 8 opencode sessions at once, each response starts in a median 3.6 s ([Coding agents](#coding-agents)) |
-| **Install** | none: a browser tab |
+Start a private cluster at [clusterchat.io/create](https://clusterchat.io/create).
+You choose how much GPU to lend, how many replies can run at once and the
+context length, then share the invite link. Up to 64 people can join. Everyone
+gets their own chat, saved in their own browser, and each one has its own KV
+cache on every machine. Each browser runs the waiting chats' next tokens as one
+GPU pass, so a busy cluster stays fast for everyone.
 
-## How it compares
+### Speed
 
-Projects that split a model across machines, or run one in a browser tab.
-Each published speed is for a different model on different hardware, so read
-it as what each project can do, not as a ranking. Facts are from each
-project's README or the linked source as of October 2026.
+**One person gets 19.7 tok/s on one PC, and twelve people at once still get
+about 7 tok/s each.** Qwen3.8-27B q8 on two RTX 3090s, either both in one PC or
+in two PCs, one in France and one in Spain:
 
-| Project | Runs in | Splits one model across machines | Install per machine | Several people at once | When a machine leaves | Published speed (source, hardware) |
-|---|---|---|---|---|---|---|
-| **ClusterChat** | browser tab (WebGPU) | yes, over WebRTC through a relay | none, open a link | yes, each person has their own chat, and several replies run at once | pieces are held by more than one browser; an interrupted reply is replayed elsewhere | Qwen3.8-27B q8: 19.7 tok/s on two RTX 3090s in one machine, 8.1 tok/s across two machines 28 ms apart over a real internet link ([Performance](#performance)) |
-| [Pooled](https://github.com/Nehanth/pooled) | browser tab (WebGPU) | yes, over direct WebRTC, relay as a fallback | none, open a link | one shared conversation that everyone in the room sees; requests run one at a time | the host deals the layers out again | Qwen 3.8 27B Q4_0: 20 to 27 tok/s on one GB10; 7.6 to 11.9 on two devices under emulated delay ([README](https://github.com/Nehanth/pooled#performance)) |
-| [Petals](https://github.com/bigscience-workshop/petals) | native Python | yes, layers served by volunteers | pip package, PyTorch | yes, each client runs its own session | clients route around servers that leave | up to 6 tok/s Llama 2 70B ([README](https://github.com/bigscience-workshop/petals)); last commit 2024-08-25 |
-| [exo](https://github.com/exo-explore/exo) | native (MLX); macOS app, Linux on CPU | yes, with RDMA over Thunderbolt 5 on Macs | macOS app or build from source | serves an OpenAI-compatible API | not stated | 31.9 tok/s Qwen3 235B on 4x M3 Ultra ([Jeff Geerling](https://www.jeffgeerling.com/blog/2025/15-tb-vram-on-mac-studio-rdma-over-thunderbolt-5/)) |
-| [llama.cpp RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | native | yes, remote ggml devices | build with `-DGGML_RPC=ON` on every host; trusted networks only | through llama-server | not stated | 15.2 tok/s Qwen3 235B on 4 nodes, 4x M3 Ultra ([Jeff Geerling](https://www.jeffgeerling.com/blog/2025/15-tb-vram-on-mac-studio-rdma-over-thunderbolt-5/)) |
-| [distributed-llama](https://github.com/b4rtaz/distributed-llama) | native (CPU, experimental Vulkan) | yes, tensor parallel, power-of-2 node counts | C++ build plus Python launcher | not stated | not stated | 13.04 tok/s Qwen3 30B A3B on 4 Raspberry Pi 5 ([#255](https://github.com/b4rtaz/distributed-llama/discussions/255)) |
-| [Mesh LLM](https://github.com/Mesh-LLM/mesh-llm) | native (Rust, llama.cpp) | yes, over QUIC | install script, Homebrew or distro package | serves an OpenAI-compatible API | not stated | none in the README |
-| [WebLLM](https://github.com/mlc-ai/web-llm) | browser tab (WebGPU) | no, the whole model in one tab | none for users | no, one tab | n/a | 41.1 tok/s Llama 3.1 8B on an M3 Max ([paper](https://arxiv.org/abs/2412.15803)) |
-| [Transformers.js](https://github.com/huggingface/transformers.js) | browser or Node (ONNX Runtime) | no | none for users | no, one tab | n/a | WebGPU up to 100x faster than WASM ([v3 post](https://huggingface.co/blog/transformersjs-v3)) |
-
-Where others are ahead today: ClusterChat runs one model, has no API and no
-coding agent, and its license is AGPL. See
-[What it doesn't do yet](#what-it-doesnt-do-yet).
-
-## Performance
-
-How fast each chat writes, in tokens per second. Qwen3.8-27B q8 on two RTX
-3090s, either both in one PC or in two PCs, one in France and one in Spain.
-
-| | One PC | Two PCs, France and Spain (28ms apart) |
+| | One PC | Two PCs, France and Spain (28 ms apart) |
 |---|--:|--:|
 | One person chatting | **19.7 tok/s** | **8.1 tok/s** |
 | Twelve people chatting at once | **about 7 tok/s** | **about 5 tok/s** |
@@ -161,18 +187,79 @@ node tools/load.mjs --url <cluster url> --users 12 --ramp 30 --turns 3 --think 1
 
 </details>
 
-### Coding agents
+### Private clusters
 
-Point a whole team's coding agents at one cluster. Up to eight opencode
-sessions at once on two RTX 3090s, each working in its own repo, 16K context:
+A private cluster is for a group: friends, a lab, a club.
 
-| opencode agents at once | 1 | 2 | 4 | 8 |
-|---|--:|--:|--:|--:|
-| Each response starts after | 2.4 s | 3.1 s | 2.8 s | **3.6 s** |
-| A new session's first response starts after | 21 s | 22 s | 27 s | **33 s** |
-| Tokens written, all agents together | 5.2 tok/s | 7.3 tok/s | 8.5 tok/s | **8.9 tok/s** |
+- **The invite code never reaches the server.** It lives in the link's
+  fragment (`/chat#mesh=<code>`), which browsers don't send.
+- **Handshakes are signed.** Every WebRTC handshake is signed with a key
+  derived from the code, so only browsers holding the invite can link.
+- **The servers see who, not what.** The signaling server sees who is in the
+  cluster but cannot join it or read anything in it.
+- **Relay-only links** by default, so peers don't learn each other's IP
+  addresses.
+- **Chats stay in your browser** (IndexedDB) and can be resumed or exported
+  later.
 
-Medians, waiting in line included.
+### Browser support
+
+| Browser | Can lend its GPU on |
+|---|---|
+| Chrome, Edge 113+ | Windows, macOS, ChromeOS, Android. Linux may need WebGPU switched on in `chrome://flags`. |
+| Safari 26+ | macOS, iPhone, iPad |
+| Firefox | Windows (141+), Apple silicon Macs (145+) |
+
+Any modern browser can join to chat without lending.
+
+## Coding agents
+
+<img src="docs/img/agents.gif" alt="Four computers lend their GPUs to one cluster. Four developers point opencode and Claude Code at it with npx clusterchat connect, and the agents read, edit and run tests at the same time. Ana closes her laptop and every agent keeps going." width="100%" />
+
+**Run a whole team's coding agents on GPUs you already own.** The
+[`clusterchat`](cli/README.md) npm package joins a cluster from your terminal
+as a chat-only peer, with no GPU or browser needed, and serves it to your
+agent as local Anthropic and OpenAI APIs. When someone's machine leaves, every
+agent keeps going.
+
+### Connect in one command
+
+```bash
+npx clusterchat@latest connect '<invite link>'
+```
+
+**Keep the link in quotes**: unquoted, the shell cuts it at `&` and you join a
+different, empty cluster. The invite card on a private cluster's page shows
+this command with the link filled in, and `connect` prints which cluster it
+joined and how many GPUs serve it. Then point your agent at it. `connect`
+prints these lines with the cluster's model filled in:
+
+**opencode**: write the provider into `opencode.json` in your project (or
+`~/.config/opencode/opencode.json`):
+
+```bash
+npx clusterchat@latest setup opencode > opencode.json
+```
+
+**Claude Code**: print the environment variables to start `claude` with:
+
+```bash
+npx clusterchat@latest setup claude-code
+```
+
+Claude Code's system prompt and tools are about 20K tokens, so it needs a
+cluster created with a 32K context. opencode needs less.
+
+**Anything else** that speaks the OpenAI Chat Completions API can use
+`http://127.0.0.1:4747/v1`. It works the same with a self-hosted server: the
+client takes the server from the link. See [cli/README.md](cli/README.md) for
+the options.
+
+### Built for a whole team
+
+> [!TIP]
+> **Before the cluster shared prompts between sessions, eight opencode sessions
+> finished 1 task of 8 in 50 minutes. Now they finish 16 of 16.**
 
 - **Each request only processes what's new.** An agent resends the whole
   conversation every time it asks the model something, 8,000 to 10,000 tokens
@@ -186,6 +273,24 @@ Medians, waiting in line included.
 - **The work gets done.** Bug fixes, edits across files and shell tasks: 82 of
   82 tasks passed across the 16K and 32K runs, with no malformed tool calls in
   544 requests.
+- **Give each agent its own connect.** Several agents can share one
+  `connect`, but it writes one reply at a time, so their requests wait their
+  turn.
+
+### Benchmarks
+
+**Going from one agent to eight, each response starts barely later (2.4 s →
+3.6 s) and the cluster writes 70% more in total.** opencode sessions at once on
+two RTX 3090s, each working in its own repo, 16K context:
+
+| opencode agents at once | 1 | 2 | 4 | 8 |
+|---|--:|--:|--:|--:|
+| Each response starts after | 2.4 s | 3.1 s | 2.8 s | **3.6 s** |
+| A new session's first response starts after | 21 s | 22 s | 27 s | **33 s** |
+| Tokens written, all agents together | 5.2 tok/s | 7.3 tok/s | 8.5 tok/s | **8.9 tok/s** |
+| Tasks passed | 5 / 5 | 4 / 4 | 8 / 8 | **16 / 16** |
+
+Medians, waiting in line included.
 
 <details>
 <summary>How it was measured, and the full numbers</summary>
@@ -211,19 +316,18 @@ test, rename a function across files, and a multi-step shell task. At 2, 4 and
 
 *Each response starts* is the time to first token for a request that
 continues a conversation, typically after the agent ran a tool. *New session's
-first response* is the same for
-the ~8,000-token first request of a session that reused the shared system
-prompt. Both include waiting in line. *Any request*
-also counts each session's first request and opencode's title requests.
-*Retried* counts requests the cluster turned away with "try again in a moment"
-while busy; opencode sent them again and every task still passed. The 32K run
-happened to need fewer requests for the same tasks, so its times are not a sign
-that 32K is faster.
+first response* is the same for the ~8,000-token first request of a session
+that reused the shared system prompt. Both include waiting in line. *Any
+request* also counts each session's first request and opencode's title
+requests. *Retried* counts requests the cluster turned away with "try again in
+a moment" while busy; opencode sent them again and every task still passed.
+The 32K run happened to need fewer requests for the same tasks, so its times
+are not a sign that 32K is faster.
 
 **Several agents through one connect** also works: four opencode sessions
 pointed at a single `clusterchat connect` passed 8 of 8 tasks (median 374 s at
 16K, 263 s at 32K). A connect writes one reply at a time, so requests wait
-their turn (median 37–39 s). Give each agent its own connect for speed.
+their turn (median 37–39 s).
 
 ```bash
 # All five tasks, one session.
@@ -236,10 +340,29 @@ node tools/cli.opencode.mjs '<invite link>' --ctx 16k --levels 2,4,8 --tasks fix
 node tools/cli.opencode.mjs '<invite link>' --ctx 16k --levels 4 --tasks fix,shell --shared
 ```
 
-Before the cluster shared prompts between sessions, eight opencode sessions
-finished 1 task of 8 in 50 minutes.
-
 </details>
+
+## How it compares
+
+Projects that split a model across machines, or run one in a browser tab.
+Each published speed is for a different model on different hardware, so read
+it as what each project can do, not as a ranking. Facts are from each
+project's README or the linked source as of October 2026.
+
+| Project | Runs in | Splits one model across machines | Install per machine | Several people at once | When a machine leaves | Published speed (source, hardware) |
+|---|---|---|---|---|---|---|
+| **ClusterChat** | browser tab (WebGPU) | yes, over WebRTC through a relay | none, open a link | yes, each person has their own chat and several replies run at once; coding agents connect through local Anthropic and OpenAI APIs | pieces are held by more than one browser; an interrupted reply is replayed elsewhere | Qwen3.8-27B q8: 19.7 tok/s on two RTX 3090s in one machine, 8.1 tok/s across two machines 28 ms apart over a real internet link ([Speed](#speed)) |
+| [Pooled](https://github.com/Nehanth/pooled) | browser tab (WebGPU) | yes, over direct WebRTC, relay as a fallback | none, open a link | one shared conversation that everyone in the room sees; requests run one at a time | the host deals the layers out again | Qwen 3.8 27B Q4_0: 20 to 27 tok/s on one GB10; 7.6 to 11.9 on two devices under emulated delay ([README](https://github.com/Nehanth/pooled#performance)) |
+| [Petals](https://github.com/bigscience-workshop/petals) | native Python | yes, layers served by volunteers | pip package, PyTorch | yes, each client runs its own session | clients route around servers that leave | up to 6 tok/s Llama 2 70B ([README](https://github.com/bigscience-workshop/petals)); last commit 2024-08-25 |
+| [exo](https://github.com/exo-explore/exo) | native (MLX); macOS app, Linux on CPU | yes, with RDMA over Thunderbolt 5 on Macs | macOS app or build from source | serves an OpenAI-compatible API | not stated | 31.9 tok/s Qwen3 235B on 4x M3 Ultra ([Jeff Geerling](https://www.jeffgeerling.com/blog/2025/15-tb-vram-on-mac-studio-rdma-over-thunderbolt-5/)) |
+| [llama.cpp RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | native | yes, remote ggml devices | build with `-DGGML_RPC=ON` on every host; trusted networks only | through llama-server | not stated | 15.2 tok/s Qwen3 235B on 4 nodes, 4x M3 Ultra ([Jeff Geerling](https://www.jeffgeerling.com/blog/2025/15-tb-vram-on-mac-studio-rdma-over-thunderbolt-5/)) |
+| [distributed-llama](https://github.com/b4rtaz/distributed-llama) | native (CPU, experimental Vulkan) | yes, tensor parallel, power-of-2 node counts | C++ build plus Python launcher | not stated | not stated | 13.04 tok/s Qwen3 30B A3B on 4 Raspberry Pi 5 ([#255](https://github.com/b4rtaz/distributed-llama/discussions/255)) |
+| [Mesh LLM](https://github.com/Mesh-LLM/mesh-llm) | native (Rust, llama.cpp) | yes, over QUIC | install script, Homebrew or distro package | serves an OpenAI-compatible API | not stated | none in the README |
+| [WebLLM](https://github.com/mlc-ai/web-llm) | browser tab (WebGPU) | no, the whole model in one tab | none for users | no, one tab | n/a | 41.1 tok/s Llama 3.1 8B on an M3 Max ([paper](https://arxiv.org/abs/2412.15803)) |
+| [Transformers.js](https://github.com/huggingface/transformers.js) | browser or Node (ONNX Runtime) | no | none for users | no, one tab | n/a | WebGPU up to 100x faster than WASM ([v3 post](https://huggingface.co/blog/transformersjs-v3)) |
+
+Where others are ahead today: ClusterChat runs one model per cluster, its
+peers are trusted, and its license is AGPL. See [Limitations](#limitations).
 
 ## How it works
 
@@ -264,45 +387,7 @@ When a peer leaves mid-reply, the peer before it replays the lost work into
 another holder. If that fails, the asking browser rebuilds the chat from its
 token history.
 
-## Private clusters
-
-A private cluster is for a group: friends, a lab, a club. Start one at
-[clusterchat.io/create](https://clusterchat.io/create). You choose how much
-GPU to lend, how many replies can run at once and the context length, then
-share the invite link.
-
-- **The invite code never reaches the server.** It lives in the link's
-  fragment (`/chat#mesh=<code>`), which browsers don't send.
-- **Handshakes are signed.** Every WebRTC handshake is signed with a key
-  derived from the code, so only browsers holding the invite can link.
-- **The servers see who, not what.** The signaling server sees who is in the
-  cluster but cannot join it or read anything in it.
-- **Relay-only links** by default, so peers don't learn each other's IP
-  addresses.
-- **Chats stay in your browser** (IndexedDB) and can be resumed or exported
-  later.
-
-## Use it from your coding agent
-
-<img src="docs/img/agents.gif" alt="Four computers lend their GPUs to one cluster. Four developers point opencode and Claude Code at it with npx clusterchat connect, and the agents read, edit and run tests at the same time. Ana closes her laptop and every agent keeps going." width="100%" />
-
-The [`clusterchat`](cli/README.md) npm package joins a cluster from your
-terminal, with no GPU or browser needed, and serves it to Claude Code, opencode
-and other tools as local Anthropic and OpenAI APIs:
-
-```bash
-npx clusterchat@latest connect '<invite link>'
-```
-
-A whole team can run agents on one cluster at once: eight opencode sessions on
-two RTX 3090s, and each response still starts in a median 3.6 s
-([Coding agents](#coding-agents)).
-
-The invite card on a private cluster's page shows this command with the link
-filled in. It works the same with a self-hosted server: the client takes the
-server from the link. See [cli/README.md](cli/README.md) for each tool's setup.
-
-## What it doesn't do yet
+## Limitations
 
 - **One model per cluster.**
 - **Agents share the cluster's speed.** Total throughput grows as you add
@@ -320,17 +405,9 @@ server from the link. See [cli/README.md](cli/README.md) for each tool's setup.
 The full list is under Known gaps in
 [`docs/architecture.md`](docs/architecture.md#failures).
 
-## Browser support
+## Run it yourself
 
-| Browser | Can lend its GPU on |
-|---|---|
-| Chrome, Edge 113+ | Windows, macOS, ChromeOS, Android. Linux may need WebGPU switched on in `chrome://flags`. |
-| Safari 26+ | macOS, iPhone, iPad |
-| Firefox | Windows (141+), Apple silicon Macs (145+) |
-
-Any modern browser can join to chat without lending.
-
-## What it can run
+### What it can run
 
 `tools/convert_hf.py` converts a Hugging Face checkpoint and rejects any
 architecture the kernels do not implement:
@@ -343,7 +420,7 @@ architecture the kernels do not implement:
 
 Weights are stored as f32, f16 or q8. The tokenizer must be byte-level BPE.
 
-## Quick start
+### Quick start
 
 You need Node.js, Python 3, [Caddy](https://caddyserver.com/) and a browser
 with WebGPU.
@@ -365,9 +442,10 @@ caddy run --config Caddyfile.dev
 
 Open `http://localhost:8001/chat?direct=1` in two or more tabs. Each asks
 whether to lend its GPU, then joins the cluster. One machine can hold the
-whole cluster, since every tab gets a share of the same GPU.
+whole cluster, since every tab gets a share of the same GPU. To host it on a
+LAN or a domain, see [`docs/deploying.md`](docs/deploying.md).
 
-## Tests
+### Tests
 
 ```bash
 npm test            # Node suites, no GPU
@@ -382,6 +460,7 @@ npm run test:gpu    # real peers in headless Chrome, needs a GPU
 | [`docs/architecture.md`](docs/architecture.md) | Positions, placement and growth, links, routing, the wire format, sessions, the KV cache, speculative decoding, failure recovery, known gaps |
 | [`docs/model.md`](docs/model.md) | The forward pass and what each kernel computes |
 | [`docs/development.md`](docs/development.md) | Page parameters, dev pages, tests, repo layout |
+| [`cli/README.md`](cli/README.md) | The `clusterchat` client: options, each agent's setup, self-hosting, adding a protocol or tool |
 
 ## Research it builds on
 
