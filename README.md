@@ -289,8 +289,8 @@ two RTX 3090s, each working in its own repo, 16K context:
 |---|--:|--:|--:|--:|
 | Each response starts after | 2.4 s | 3.1 s | 2.8 s | **3.6 s** |
 | A new session's first response starts after | 21 s | 22 s | 27 s | **33 s** |
-| tok/s per agent | 12.7 tok/s | 9.9 tok/s | 3.8 tok/s | **1.6 tok/s** |
-| tok/s all agents together | 5.2 tok/s | 7.3 tok/s | 8.5 tok/s | **8.9 tok/s** |
+| Each agent's writing speed, while writing | 12.7 tok/s | 9.9 tok/s | 3.8 tok/s | **1.6 tok/s** |
+| Cluster output, averaged over the whole run | 5.2 tok/s | 7.3 tok/s | 8.5 tok/s | **8.9 tok/s** |
 | Tasks passed | 5 / 5 | 4 / 4 | 8 / 8 | **16 / 16** |
 
 Medians, waiting in line included.
