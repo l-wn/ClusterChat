@@ -19,14 +19,11 @@ Chat with it in a browser tab, or point your whole team's coding agents at it.
 
 <br />
 
-| [**12 people**](#speed) | [**8 coding agents**](#benchmarks) | [**82 / 82**](#built-for-a-whole-team) | [**19.7 tok/s**](#speed) | [**8.1 tok/s**](#speed) | **0 installs** |
-|:-:|:-:|:-:|:-:|:-:|:-:|
-| chatting at once on two RTX 3090s | concurrent opencode sessions (3.6 s to 1st tok) | agent tasks passed, no malformed tool calls | one chat, two RTX 3090s in one PC | across the internet, France ↔ Spain | a browser tab is enough |
+| [**12 people**](#speed) | [**8 coding agents**](#benchmarks) | [**19.7 tok/s**](#speed) | [**8.1 tok/s**](#speed) | **0 installs** |
+|:-:|:-:|:-:|:-:|:-:|
+| chatting at once on two RTX 3090s | concurrent opencode sessions (3.6 s to 1st tok) | one chat, two RTX 3090s in one PC | across the internet, France ↔ Spain | a browser tab is enough |
 
 <br />
-
-<img src="docs/img/demo-agents.gif" alt="Four people open the same link and each lend a different amount of GPU memory, and their pieces come together into the whole model. Ana and Lab PC 3 chat in the browser while Ben and Mia point opencode and Claude Code at the same model. Ana closes her laptop mid-reply, and the chat and both agents keep going." width="900" />
-
 [At a glance](#at-a-glance) ·
 [Chat](#chat-together) ·
 [Coding agents](#coding-agents) ·
@@ -36,6 +33,9 @@ Chat with it in a browser tab, or point your whole team's coding agents at it.
 [Limitations](#limitations) ·
 [Run it yourself](#run-it-yourself) ·
 [Docs](#documentation)
+
+
+<img src="docs/img/demo-agents.gif" alt="Four people open the same link and each lend a different amount of GPU memory, and their pieces come together into the whole model. Ana and Lab PC 3 chat in the browser while Ben and Mia point opencode and Claude Code at the same model. Ana closes her laptop mid-reply, and the chat and both agents keep going." width="900" />
 
 </div>
 
