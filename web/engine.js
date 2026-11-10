@@ -99,6 +99,7 @@ export class Engine {
     #ceiling = Infinity;     // the most positions this GPU ran in one pass before a loss
     #losses = 0;             // GPU losses so far
     #share = true;           // content-address pages (see the constructor)
+    #gpu = null;             // navigator.gpu, or the platform's (connect's `platform.gpu`)
 
     // `mtp`: a runner holding the head also loads the MTP draft head, when
     // the checkpoint has one (on unless the page has ?mtp=0).
@@ -178,12 +179,15 @@ export class Engine {
     // `snaps` the shared prefix slots it keeps, and
     // `ctx` the context window, to ask for if this join creates a private mesh.
     //
-    // `platform` is `{ server, WebSocket, RTCPeerConnection, client }`, for
-    // running outside a page (see net.js). A page leaves it out.
+    // `platform` is `{ server, WebSocket, RTCPeerConnection, client, gpu }`,
+    // for running outside a page (see net.js). `gpu` stands in for
+    // navigator.gpu, for serving from Node (cli/gpu.js). A page leaves it out.
     async connect({ room, relayOnly = true, chats = null, sessions = null, snaps = null, ctx = null,
                     platform = {} } = {}) {
+        const { gpu = null, ...meshPlatform } = platform;
+        this.#gpu = gpu;
         const net = new Mesh({
-            ...platform,
+            ...meshPlatform,
             room,
             chats,
             sessions,
@@ -710,10 +714,11 @@ export class Engine {
     }
 
     async #openDevice() {
-        if (!navigator.gpu) throw new Error('This browser has no WebGPU, so this tab can chat but '
+        const webgpu = this.#gpu ?? globalThis.navigator?.gpu;
+        if (!webgpu) throw new Error('This browser has no WebGPU, so this tab can chat but '
             + 'cannot hold any of the model. WebGPU needs a recent desktop Chrome or Edge, '
             + 'Safari 26 or later, or Firefox 141 or later on Windows.');
-        const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+        const adapter = await webgpu.requestAdapter({ powerPreference: 'high-performance' });
         if (!adapter) throw new Error('WebGPU is present but no adapter was returned.');
 
         const gpu = await adapterLabel(adapter);

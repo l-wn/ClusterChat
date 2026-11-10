@@ -34,10 +34,12 @@ let cache = null;
 
 // Point the tokenizer at a different checkpoint. Must be called before the
 // first encode/decode: load() memoizes, and changing the vocab mid-session
-// would change the meaning of ids in use.
+// would change the meaning of ids in use. The same source again is fine: a
+// client that leaves and rejoins the same cluster sets it twice.
 export function source(baseUrl) {
-    if (cache) throw new Error('tokenizer already loaded; set the source before first use');
-    tokenizerPath = `${baseUrl}/tokenizer/tokenizer.json`;
+    const path = `${baseUrl}/tokenizer/tokenizer.json`;
+    if (cache && path !== tokenizerPath) throw new Error('tokenizer already loaded; set the source before first use');
+    tokenizerPath = path;
 }
 
 // tokenizerPath if source() set one, otherwise the checkpoint

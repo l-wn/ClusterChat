@@ -11,7 +11,8 @@ const BODY_MAX = 32 << 20;      // a long agent conversation, with room to spare
 export function listen(cluster, { port, host, onChat = null }) {
     // What `clusterchat setup` reads: the cluster this process serves.
     const routes = new Map([['GET /clusterchat', { protocol: { fail: (res, err) => sendJson(res, 500, { error: err.message }) },
-        handler: (req, res, c) => sendJson(res, 200, { ...c.info, gpus: c.info.gpus, ready: c.info.ready }) }]]);
+        handler: (req, res, c) => sendJson(res, 200, { ...c.info, gpus: c.info.gpus, ready: c.info.ready,
+                                                   lending: c.lending ?? null }) }]]);
     for (const p of protocols) {
         for (const [route, handler] of Object.entries(p.routes)) {
             if (routes.has(route)) throw new Error(`${p.name} and another protocol both serve ${route}`);

@@ -8,7 +8,7 @@ await build({
     entryPoints: [new URL('./bin.js', import.meta.url).pathname],
     outfile: new URL('./dist/clusterchat.js', import.meta.url).pathname,
     bundle: true, platform: 'node', format: 'esm', target: 'node18',
-    external: ['node-datachannel', 'ws'],
+    external: ['node-datachannel', 'ws', 'webgpu'],
     define: { __VERSION__: JSON.stringify(version) },
     legalComments: 'none',
 });

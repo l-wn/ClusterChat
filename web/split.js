@@ -388,6 +388,28 @@ export function endBytes(d, end) {
     return client;
 }
 
+// GPU bytes per position (the embedding, each block, the head): the weights
+// plus each block's chat memory at the cluster's context window `nMax`,
+// priced as the create page prices the whole model (modelBytes()). Null when
+// the manifest has no stored sizes.
+export function positionBytes(manifest, { nMax, sessions, snaps } = {}) {
+    if (!storedBytes(manifest)) return null;
+    const d = { ...costDims(manifest), n_pos: manifest.n_pos };
+    const opts = { nMax, ...(sessions && { sessions }), ...(snaps && { snaps }) };
+    return [endBytes(d, 'embed'),
+        ...Array.from({ length: d.n_layer }, (_, i) => blockBytes(d, { ...opts, index: i })),
+        endBytes(d, 'head') + mtpBytes(d, opts)];
+}
+
+// Bytes of the positions nobody ready holds (coverage()'s holes), or 0 when
+// the sizes are unknown.
+export function missingBytes(cov, posBytes) {
+    if (!posBytes) return 0;
+    let n = 0;
+    for (const [lo, hi] of cov.holes) for (let x = lo; x < hi; x++) n += posBytes[x] ?? 0;
+    return n;
+}
+
 // The smallest range the server hands out, in bytes of weights. In bytes so
 // it works across model sizes. Weights only: the minimum balances fetch cost
 // and extra hops against depth, and KV is local VRAM, which the engine's

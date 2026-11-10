@@ -1,7 +1,7 @@
 {
   "name": "clusterchat",
-  "version": "0.1.1",
-  "description": "Use a ClusterChat cluster from Claude Code, opencode and other coding agents.",
+  "version": "0.2.0",
+  "description": "Join a ClusterChat cluster from your terminal: lend your GPU, use it from Claude Code, opencode and other coding agents, or both.",
   "license": "AGPL-3.0-only",
   "homepage": "https://clusterchat.io",
   "repository": {
@@ -30,5 +30,8 @@
   },
   "devDependencies": {
     "esbuild": "^0.25.0"
+  },
+  "optionalDependencies": {
+    "webgpu": "^0.6.2"
   }
 }

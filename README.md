@@ -45,12 +45,13 @@ Chat with it in a browser tab, or point your whole team's coding agents at it.
 
 ## At a glance
 
-ClusterChat splits a 27B model across the browsers of everyone in a group, so
-machines that could never run it alone run it together. Anyone with the link
-can **chat** in a browser tab, and anyone with a terminal can **run their coding
-agents** on it through local Anthropic and OpenAI APIs. Many people and agents
-use it at once, any machine can leave mid-reply without breaking it, and the
-invite code never reaches the server.
+ClusterChat splits a 27B model across the machines of everyone in a group, so
+machines that could never run it alone run it together. A machine lends its
+GPU from a browser tab or, with one command, from a terminal. Anyone with the
+link can **chat** in a browser tab, and anyone with a terminal can **run their
+coding agents** on it through local Anthropic and OpenAI APIs. Many people and
+agents use it at once, any machine can leave mid-reply without breaking it,
+and the invite code never reaches the server.
 
 | | |
 |---|---|
@@ -61,7 +62,7 @@ invite code never reaches the server.
 | **Replies at once** | set by whoever starts the cluster |
 | **Chats each browser keeps in memory** | 8 by default, up to 32 in a private cluster |
 | **Coding agents** | opencode, Claude Code and any OpenAI-compatible tool; 8 opencode sessions at once ([Benchmarks](#benchmarks)) |
-| **Install** | none to chat or lend a GPU; `npx clusterchat@latest` for agents |
+| **Install** | none to chat or lend a GPU in a browser; `npx clusterchat@latest` for agents, or to lend a GPU [from a terminal](#lend-a-gpu-from-a-terminal) |
 
 ## Two ways to use it
 
@@ -91,9 +92,10 @@ npx clusterchat@latest connect '<invite link>'
 ```
 
 Then point opencode or Claude Code at it. **8 agents at once**, and each
-response starts in a median **3.6 s**.
+response starts in a median **3.6 s**. If the machine has a GPU, the same
+command can lend it.
 
-[Setup](#connect-in-one-command) · [Benchmarks](#benchmarks)
+[Setup](#connect-in-one-command) · [Benchmarks](#benchmarks) · [Lend from a terminal](#lend-a-gpu-from-a-terminal)
 
 </td>
 </tr>
@@ -124,7 +126,9 @@ running a model instead of the pieces of a file.
   ([more](#private-clusters)).
 - **Nothing to install.** Open a link. A new browser serves as soon as its
   first piece has downloaded and takes on more while it is idle, up to the
-  VRAM limit its owner sets. Any browser can join just to chat.
+  VRAM limit its owner sets. Any browser can join just to chat. A machine
+  with no browser open lends its GPU with
+  [one command](#lend-a-gpu-from-a-terminal) instead.
 
 > [!NOTE]
 > **Your chat is separate, not secret.** Every computer in your cluster
@@ -218,15 +222,50 @@ A private cluster is for a group: friends, a lab, a club.
 
 Any modern browser can join to chat without lending.
 
+### Lend a GPU from a terminal
+
+A machine doesn't need a browser to lend its GPU. The
+[`clusterchat`](cli/README.md) npm package joins the cluster from a terminal
+and holds part of the model as a lending browser tab does, so a server or a
+lab PC can serve the group with one command:
+
+```bash
+npx clusterchat@latest connect '<invite link>'
+```
+
+`connect` asks how much GPU memory to lend. It suggests what the driver
+reports as free, less some headroom for your desktop, and fills in your last
+answer next time. It then shows a full-screen dashboard of the cluster, what
+your GPU holds and how many tokens it has served, where `←/→` changes the
+amount and `s` stops lending. It asks first if stopping or leaving would take
+the model down for everyone else.
+
+```bash
+npx clusterchat@latest gpu                                             # what this machine could lend, without joining
+npx clusterchat@latest connect '<invite link>' --lend 20 --no-bridge   # a machine that only lends 20 GB, nothing asked
+```
+
+- **The same model, token for token.** The terminal runs the same hand-written
+  kernels as the browser, through Dawn, the WebGPU implementation inside
+  Chrome. A cluster served from a terminal writes the same reply as one
+  served from browser tabs.
+- **What it needs.** Node 18 or newer and a GPU that Dawn can use: Vulkan on
+  Linux, D3D12 on Windows, Metal on macOS.
+- **Restarts are quick.** The part of the model the machine holds is cached
+  on disk and checked against the server on each start, so only what changed
+  is downloaded again.
+
+See [cli/README.md](cli/README.md#lend-your-gpu) for the dashboard, the keys
+and every option.
+
 ## Coding agents
 
 <img src="docs/img/agents.gif" alt="Four computers lend their GPUs to one cluster. Four developers point opencode and Claude Code at it with npx clusterchat connect, and the agents read, edit and run tests at the same time. Ana closes her laptop and every agent keeps going." width="100%" />
 
 **Run a whole team's coding agents on GPUs you already own.** The
-[`clusterchat`](cli/README.md) npm package joins a cluster from your terminal
-as a chat-only peer, with no GPU or browser needed, and serves it to your
-agent as local Anthropic and OpenAI APIs. When someone's machine leaves, every
-agent keeps going.
+[`clusterchat`](cli/README.md) npm package joins a cluster from your terminal,
+with no GPU or browser needed, and serves it to your agent as local Anthropic
+and OpenAI APIs. When someone's machine leaves, every agent keeps going.
 
 ### Connect in one command
 
@@ -236,30 +275,34 @@ npx clusterchat@latest connect '<invite link>'
 
 **Keep the link in quotes**: unquoted, the shell cuts it at `&` and you join a
 different, empty cluster. The invite card on a private cluster's page shows
-this command with the link filled in, and `connect` prints which cluster it
-joined and how many GPUs serve it. Then point your agent at it. `connect`
-prints these lines with the cluster's model filled in:
+this command with the link filled in, and `connect` shows which cluster it
+joined and how many GPUs serve it. On a machine with a usable GPU it also asks
+whether to [lend it](#lend-a-gpu-from-a-terminal); answer no, or pass
+`--no-lend`, to only run agents. Then point your agent at it from another
+terminal. `connect` shows both commands:
 
-**opencode**: write the provider into `opencode.json` in your project (or
-`~/.config/opencode/opencode.json`):
+**opencode**: add the cluster as a provider to `opencode.json` in your
+project, keeping the rest of the file:
 
 ```bash
-npx clusterchat@latest setup opencode > opencode.json
+npx clusterchat@latest setup opencode --write
 ```
 
-**Claude Code**: print the environment variables to start `claude` with:
+**Claude Code**: start `claude` with every model it may pick pointed at the
+cluster's. Its own arguments pass through:
 
 ```bash
-npx clusterchat@latest setup claude-code
+npx clusterchat@latest claude
 ```
 
 Claude Code's system prompt and tools are about 20K tokens, so it needs a
 cluster created with a 32K context. opencode needs less.
 
-**Anything else** that speaks the OpenAI Chat Completions API can use
-`http://127.0.0.1:4747/v1`. It works the same with a self-hosted server: the
-client takes the server from the link. See [cli/README.md](cli/README.md) for
-the options.
+**Anything else** that speaks the Anthropic Messages API or the OpenAI Chat
+Completions API can use `http://127.0.0.1:4747` (OpenAI: `/v1`). It works the
+same with a self-hosted server: the client takes the server from the link.
+`npx clusterchat@latest status` shows what a running `connect` is doing. See
+[cli/README.md](cli/README.md) for the options.
 
 ### Built for a whole team
 
@@ -358,7 +401,7 @@ project's README or the linked source as of October 2026.
 
 | Project | Runs in | Splits one model across machines | Install per machine | Several people at once | When a machine leaves | Published speed (source, hardware) |
 |---|---|---|---|---|---|---|
-| **ClusterChat** | browser tab (WebGPU) | yes, over WebRTC through a relay | none, open a link | yes, each person has their own chat and several replies run at once; coding agents connect through local Anthropic and OpenAI APIs | pieces are held by more than one browser; an interrupted reply is replayed elsewhere | Qwen3.8-27B q8: 19.7 tok/s on two RTX 3090s in one machine, 8.1 tok/s across two machines 28 ms apart over a real internet link ([Speed](#speed)) |
+| **ClusterChat** | browser tab (WebGPU), or a terminal | yes, over WebRTC through a relay | none, open a link; one `npx` command from a terminal | yes, each person has their own chat and several replies run at once; coding agents connect through local Anthropic and OpenAI APIs | pieces are held by more than one browser; an interrupted reply is replayed elsewhere | Qwen3.8-27B q8: 19.7 tok/s on two RTX 3090s in one machine, 8.1 tok/s across two machines 28 ms apart over a real internet link ([Speed](#speed)) |
 | [Pooled](https://github.com/Nehanth/pooled) | browser tab (WebGPU) | yes, over direct WebRTC, relay as a fallback | none, open a link | one shared conversation that everyone in the room sees; requests run one at a time | the host deals the layers out again | Qwen 3.8 27B Q4_0: 20 to 27 tok/s on one GB10; 7.6 to 11.9 on two devices under emulated delay ([README](https://github.com/Nehanth/pooled#performance)) |
 | [Petals](https://github.com/bigscience-workshop/petals) | native Python | yes, layers served by volunteers | pip package, PyTorch | yes, each client runs its own session | clients route around servers that leave | up to 6 tok/s Llama 2 70B ([README](https://github.com/bigscience-workshop/petals)); last commit 2024-08-25 |
 | [exo](https://github.com/exo-explore/exo) | native (MLX); macOS app, Linux on CPU | yes, with RDMA over Thunderbolt 5 on Macs | macOS app or build from source | serves an OpenAI-compatible API | not stated | 31.9 tok/s Qwen3 235B on 4x M3 Ultra ([Jeff Geerling](https://www.jeffgeerling.com/blog/2025/15-tb-vram-on-mac-studio-rdma-over-thunderbolt-5/)) |
@@ -376,8 +419,8 @@ peers are trusted, and its license is AGPL. See [Limitations](#limitations).
 <img src="docs/img/how-it-works.svg" alt="Ana's laptop and Lab PC 3 each hold pieces 1 to 6 of the model. Ben's gaming PC and Mia's desktop each hold pieces 7 to 12. Ben's message runs on Ana's laptop, then his own PC. Mia's runs on Lab PC 3, then her desktop. All four connect to a signaling server and a relay." width="100%" />
 
 The model is cut into positions: the embedding, each transformer block, and
-the head. A browser (a *peer*) holds a contiguous range of positions and
-downloads only those weights. Ranges can overlap, so a peer leaving does not
+the head. A browser, or a terminal running `clusterchat` (a *peer*), holds a
+contiguous range of positions and downloads only those weights. Ranges can overlap, so a peer leaving does not
 break the model.
 
 For each token, the residual stream passes from peer to peer over WebRTC
@@ -467,7 +510,7 @@ npm run test:gpu    # real peers in headless Chrome, needs a GPU
 | [`docs/architecture.md`](docs/architecture.md) | Positions, placement and growth, links, routing, the wire format, sessions, the KV cache, speculative decoding, failure recovery, known gaps |
 | [`docs/model.md`](docs/model.md) | The forward pass and what each kernel computes |
 | [`docs/development.md`](docs/development.md) | Page parameters, dev pages, tests, repo layout |
-| [`cli/README.md`](cli/README.md) | The `clusterchat` client: options, each agent's setup, self-hosting, adding a protocol or tool |
+| [`cli/README.md`](cli/README.md) | The `clusterchat` client: lending a GPU from a terminal, the dashboard, options, each agent's setup, self-hosting, adding a protocol or tool |
 
 ## Research it builds on
 

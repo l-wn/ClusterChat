@@ -82,7 +82,10 @@ export function serve({ root, signalPort, onReport } = {}) {
         const head = { 'content-type': type, 'accept-ranges': 'bytes',
                        'cross-origin-opener-policy': 'same-origin',
                        'cross-origin-embedder-policy': 'require-corp',
-                       'cache-control': 'no-store' };
+                       'cache-control': 'no-store',
+                       // As Caddy's, from size and time, so a client's own
+                       // cache (cli/cache.js) can tell a changed file.
+                       etag: `"${stat.mtimeMs.toString(36)}${stat.size.toString(36)}"` };
 
         if (range) {
             const from = range[1] ? Number(range[1]) : 0;

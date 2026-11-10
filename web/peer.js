@@ -14,7 +14,8 @@
 import { dimsFromManifest } from './model/loader.js';
 import { EngineClient } from './serve-client.js';
 import { positions, coverage, holders, holding, filling, describeRange, storedBytes, costDims,
-         blockBytes, blockWeightBytes, endBytes, mtpBytes } from './split.js';
+         blockBytes, blockWeightBytes, endBytes, mtpBytes,
+         positionBytes as splitPositionBytes, missingBytes as splitMissingBytes } from './split.js';
 import { chatFormat, stopRe } from './prompt.js';
 import { runTurn } from './turn.js';
 import { makeMessage } from './message.js';
@@ -448,25 +449,11 @@ let healthSaid = null;
 const escapeHtml = (s) => s.replace(/[<&]/g, (c) => ({ '<': '&lt;', '&': '&amp;' }[c]));
 
 // Stored bytes of the pieces nobody ready holds, or 0 when unknown.
-function missingBytes(cov) {
-    if (!posBytes) return 0;
-    let n = 0;
-    for (const [lo, hi] of cov.holes) for (let x = lo; x < hi; x++) n += posBytes[x] ?? 0;
-    return n;
-}
+const missingBytes = (cov) => splitMissingBytes(cov, posBytes);
 
-// GPU bytes per position (the embedding, each block, the head): the weights
-// plus each block's chat memory at this cluster's context window, priced as
-// the create page prices the whole model (split.js's modelBytes()).
-function positionBytes(manifest) {
-    if (!storedBytes(manifest)) return null;
-    const d = { ...costDims(manifest), n_pos: manifest.n_pos };
-    const opts = { nMax: engine.ctxMax, ...(engine.net?.sessions && { sessions: engine.net.sessions }),
-                   ...(engine.net?.snaps && { snaps: engine.net.snaps }) };
-    return [endBytes(d, 'embed'),
-        ...Array.from({ length: d.n_layer }, (_, i) => blockBytes(d, { ...opts, index: i })),
-        endBytes(d, 'head') + mtpBytes(d, opts)];
-}
+// GPU bytes per position, at this cluster's context window (split.js).
+const positionBytes = (manifest) => splitPositionBytes(manifest, { nMax: engine.ctxMax,
+    sessions: engine.net?.sessions, snaps: engine.net?.snaps });
 
 function positionWeights(manifest) {
     const s = storedBytes(manifest);

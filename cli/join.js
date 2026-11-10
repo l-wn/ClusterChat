@@ -9,10 +9,12 @@ import { Engine } from '../web/engine.js';
 import { REFUSED } from '../web/net.js';
 import { readInvite, inviteModel, openRoom } from '../web/room.js';
 import { templates } from './plugins.js';
-import { cacheTokenizer } from './cache.js';
+import { cacheTokenizer, cacheWeights } from './cache.js';
 
 globalThis.crypto ??= webcrypto;    // Node 18
 cacheTokenizer();
+// Bytes of weights from the disk cache and from the network, for the screen.
+export const downloads = cacheWeights();
 
 export const DEFAULT_SERVER = 'https://clusterchat.io';
 const LINK_WAIT_MS = 30000;
@@ -48,8 +50,11 @@ function origin(s) {
 //
 // `on(step, detail)` follows along: 'joined' with info, then 'no-gpus', or
 // 'linking' and then 'linked' { seconds } or 'unlinked'. `onEvent` is the
-// Engine's (web/engine.js), for a caller that wants its repairs.
-export async function join(target, { on = () => {}, client = null, onEvent = () => {} } = {}) {
+// Engine's (web/engine.js), for a caller that wants its repairs and, when
+// lending, its progress. `gpu` (cli/gpu.js) lets this peer serve() later;
+// `relayOnly` false lets GPU-to-GPU links go direct (--direct).
+export async function join(target, { on = () => {}, client = null, onEvent = () => {},
+                                     gpu = null, relayOnly = true } = {}) {
     let Polyfill, WebSocket;
     try {
         ({ RTCPeerConnection: Polyfill } = await import('node-datachannel/polyfill'));
@@ -74,8 +79,8 @@ export async function join(target, { on = () => {}, client = null, onEvent = () 
         // The mesh retries a server it cannot reach for as long as it runs,
         // which a page wants and a command line does not.
         ({ manifest } = await Promise.race([
-            engine.connect({ room, relayOnly: true,
-                platform: { server: target.server, WebSocket, RTCPeerConnection, client } }),
+            engine.connect({ room, relayOnly,
+                platform: { server: target.server, WebSocket, RTCPeerConnection, client, gpu } }),
             new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(
                 `could not reach ${target.server}: ${engine.net?.trouble?.replace(/, retrying in .*/, '') ?? 'no answer'}`)), JOIN_WAIT_MS); }),
         ]));
